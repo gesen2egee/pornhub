@@ -19,17 +19,8 @@ if sys.platform == 'win32':
     except Exception:
         pass
 
-def try_auto_upgrade_ytdlp():
-    """當遇到 410 錯誤時自動在背景一鍵升級該電腦的 yt-dlp"""
-    print("[*] 正在自動為您的電腦一鍵升級 yt-dlp 至最新版本...")
-    try:
-        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        print("[+] yt-dlp 升級完成！")
-    except Exception as e:
-        print(f"[!] 自動升級 yt-dlp 失敗: {e}")
-
 def direct_fetch_pornhub_mp4_stream(webpage_url):
-    """備用原生解析器：當 yt-dlp 報 410 錯誤時，直接分析網頁結構擷取最高畫質 MP4 串流 URL"""
+    """備用原生解析器：當 yt-dlp 因版本較舊報 410 錯誤時，直接分析網頁結構擷取最高畫質 MP4 串流 URL"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0',
         'Referer': 'https://cn.pornhub.com/'
@@ -45,13 +36,11 @@ def direct_fetch_pornhub_mp4_stream(webpage_url):
             
         if m:
             json_str = m.group(1)
-            # 解析 quality 網址
             quality_urls = re.findall(r'"quality_(\d+p)"\s*:\s*"([^"]+)"', json_str)
             if not quality_urls:
                 quality_urls = re.findall(r'"videoUrl"\s*:\s*"([^"]+)"', json_str)
                 
             if quality_urls:
-                # 排序選最高畫質
                 best_url = quality_urls[0][1].replace('\\/', '/') if isinstance(quality_urls[0], tuple) else quality_urls[0].replace('\\/', '/')
                 return best_url
     except Exception as e:
@@ -148,10 +137,10 @@ def on_the_fly_stream_download_and_crop(stream_url, http_headers, target_video_f
 def run_download_process(videos_dir="videos", map_json_path="preview_map.json"):
     """
     掃描 videos/ 資料夾中被移入的九宮格圖片，
-    發起單管道即時串流下載，內建 HTTP 410 錯誤防護與自動升級相容機制。
+    發起單管道即時串流下載，若檢測到 410 錯誤提示使用者執行 pip 指令升級。
     """
     print("==================================================")
-    print("  Pornhub 原影片下載器 (帶 410 錯誤自動防護修復)")
+    print("        Pornhub 最高畫質原影片下載器 (run_download)")
     print("==================================================")
     print()
 
@@ -186,7 +175,7 @@ def run_download_process(videos_dir="videos", map_json_path="preview_map.json"):
 
     success_count = 0
     skipped_count = 0
-    upgraded_yt_dlp = False
+    prompted_upgrade = False
 
     for idx, jpg_path in enumerate(jpg_files, 1):
         image_name = os.path.basename(jpg_path)
@@ -232,29 +221,23 @@ def run_download_process(videos_dir="videos", map_json_path="preview_map.json"):
         except Exception as e:
             err_str = str(e)
             if "410" in err_str or "Gone" in err_str:
-                print(f"   [!] 檢測到舊版 410 Gone 錯誤: {err_str}")
-                if not upgraded_yt_dlp:
-                    try_auto_upgrade_ytdlp()
-                    upgraded_yt_dlp = True
-                    # 重新載入升級後的 yt_dlp 重試
-                    try:
-                        import importlib
-                        importlib.reload(yt_dlp)
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            ydl.download([video_url])
-                        download_success = True
-                    except Exception:
-                        pass
+                if not prompted_upgrade:
+                    print("=" * 65)
+                    print("[!] 警告: 本機的 yt-dlp 套件版本過舊，觸發了 HTTP Error 410 錯誤！")
+                    print("[!] 請在控制台 (CMD/PowerShell) 執行以下指令進行升級：")
+                    print("    pip install --upgrade yt-dlp")
+                    print("    或執行: pip install -r requirements.txt --upgrade")
+                    print("=" * 65)
+                    prompted_upgrade = True
                 
-                if not download_success:
-                    print(f"   [FALLBACK] 啟動原生備用解析器繞過 410 錯誤...")
-                    direct_mp4 = direct_fetch_pornhub_mp4_stream(video_url)
-                    if direct_mp4:
-                        print(f"   [+] 成功解析直連 MP4 串流，發起 FFmpeg 極速下載...")
-                        ffmpeg_cmd = ["ffmpeg", "-y", "-i", direct_mp4, "-c", "copy", target_video_file]
-                        res_ff = subprocess.run(ffmpeg_cmd)
-                        if res_ff.returncode == 0:
-                            download_success = True
+                print(f"   [FALLBACK] 嘗試啟動原生備用解析器繞過 410 錯誤...")
+                direct_mp4 = direct_fetch_pornhub_mp4_stream(video_url)
+                if direct_mp4:
+                    print(f"   [+] 成功解析直連 MP4 串流，發起 FFmpeg 極速下載...")
+                    ffmpeg_cmd = ["ffmpeg", "-y", "-i", direct_mp4, "-c", "copy", target_video_file]
+                    res_ff = subprocess.run(ffmpeg_cmd)
+                    if res_ff.returncode == 0:
+                        download_success = True
 
         if download_success:
             print(f"  [OK] 影片下載成功 -> {os.path.basename(target_video_file)}")
