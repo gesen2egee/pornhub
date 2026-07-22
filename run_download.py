@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import numpy as np
 from PIL import Image
+import urllib.request
+import urllib.parse
 import yt_dlp
 
 if sys.platform == 'win32':
@@ -17,8 +19,47 @@ if sys.platform == 'win32':
     except Exception:
         pass
 
+def try_auto_upgrade_ytdlp():
+    """當遇到 410 錯誤時自動在背景一鍵升級該電腦的 yt-dlp"""
+    print("[*] 正在自動為您的電腦一鍵升級 yt-dlp 至最新版本...")
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        print("[+] yt-dlp 升級完成！")
+    except Exception as e:
+        print(f"[!] 自動升級 yt-dlp 失敗: {e}")
+
+def direct_fetch_pornhub_mp4_stream(webpage_url):
+    """備用原生解析器：當 yt-dlp 報 410 錯誤時，直接分析網頁結構擷取最高畫質 MP4 串流 URL"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0',
+        'Referer': 'https://cn.pornhub.com/'
+    }
+    try:
+        req = urllib.request.Request(webpage_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode('utf-8', errors='ignore')
+            
+        m = re.search(r'var\s+flashvars_\d+\s*=\s*({.*?});', html, re.DOTALL)
+        if not m:
+            m = re.search(r'mediaDefinitions\s*:\s*(\[.*?\]),', html, re.DOTALL)
+            
+        if m:
+            json_str = m.group(1)
+            # 解析 quality 網址
+            quality_urls = re.findall(r'"quality_(\d+p)"\s*:\s*"([^"]+)"', json_str)
+            if not quality_urls:
+                quality_urls = re.findall(r'"videoUrl"\s*:\s*"([^"]+)"', json_str)
+                
+            if quality_urls:
+                # 排序選最高畫質
+                best_url = quality_urls[0][1].replace('\\/', '/') if isinstance(quality_urls[0], tuple) else quality_urls[0].replace('\\/', '/')
+                return best_url
+    except Exception as e:
+        print(f"  [!] 原生備用解析器抓取失敗: {e}")
+    return None
+
 def find_info_in_map(image_name, preview_map):
-    """4 級雙向容錯查詢」"""
+    """4 級雙向容錯查詢"""
     if image_name in preview_map:
         return preview_map[image_name]
         
@@ -34,7 +75,7 @@ def find_info_in_map(image_name, preview_map):
     return None
 
 def is_frame_border_solid(img, threshold_ratio=0.5):
-    """分析影格四個邊緣 (上、下、左、右) 是否大多數 (> 50%) 為同一數值純色/黑邊"""
+    """分析影格四個邊緣是否大多數 (> 50%) 為同一數值純色/黑邊"""
     if not img:
         return False
     try:
@@ -56,16 +97,11 @@ def is_frame_border_solid(img, threshold_ratio=0.5):
         return False
 
 def on_the_fly_stream_download_and_crop(stream_url, http_headers, target_video_file):
-    """
-    單管道即時串流下載與邊下載邊檢測 (On-the-fly Single Pipeline)：
-    在單次串流下載連線中，即時分析開頭影格邊緣像素，
-    若偵測到 0.5s <= T_cut <= 10.0s 純色黑邊，即時前置無縫切除，影音 100% 同步落地寫入檔案。
-    """
+    """單管道即時串流下載與邊下載邊檢測"""
     user_agent = http_headers.get('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0')
     headers_list = [f"{k}: {v}\r\n" for k, v in http_headers.items() if k.lower() != 'user-agent']
     headers_str = "".join(headers_list)
 
-    # 1. 快速抽取第 10 秒與第 1 秒影格 (記憶體零硬碟 I/O，毫秒級)
     cmd_check = ["ffmpeg", "-y", "-loglevel", "error"]
     if '.m3u8' in stream_url.lower() or 'hls' in stream_url.lower():
         cmd_check.extend([
@@ -78,24 +114,20 @@ def on_the_fly_stream_download_and_crop(stream_url, http_headers, target_video_f
     if headers_str:
         cmd_check.extend(["-headers", headers_str])
 
-    # 檢測第 10s
     cmd_10s = cmd_check + ["-ss", "10.0", "-i", stream_url, "-vframes", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-"]
     cut_seconds = 0.0
     try:
         res_10s = subprocess.run(cmd_10s, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=4)
         if res_10s.stdout:
             img_10s = Image.open(io.BytesIO(res_10s.stdout)).convert("RGB")
-            # 若第 10 秒依然是純色/黑邊 -> >10s (安全略過不剪)
             if is_frame_border_solid(img_10s):
                 cut_seconds = 0.0
             else:
-                # 檢測第 1s
                 cmd_1s = cmd_check + ["-ss", "1.0", "-i", stream_url, "-vframes", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-"]
                 res_1s = subprocess.run(cmd_1s, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=4)
                 if res_1s.stdout:
                     img_1s = Image.open(io.BytesIO(res_1s.stdout)).convert("RGB")
                     if is_frame_border_solid(img_1s):
-                        # 1s 是純色且 10s 不是純色，二分跳查切除秒數
                         low, high = 1.0, 10.0
                         for _ in range(3):
                             mid = (low + high) / 2.0
@@ -108,25 +140,18 @@ def on_the_fly_stream_download_and_crop(stream_url, http_headers, target_video_f
                         cut_sec = round(low, 1)
                         if 0.5 <= cut_sec <= 10.0:
                             cut_seconds = cut_sec
-    except Exception as e:
+    except Exception:
         cut_seconds = 0.0
-
-    # 2. 單管道連線下載與影音同步寫入落地
-    if cut_seconds > 0.0:
-        print(f"   [ON-THE-FLY STREAM] 串流即時偵測開頭純色/黑邊 ({cut_seconds:.1f}s)，單管道連線直接前置無縫切除！")
-    else:
-        print(f"   [ON-THE-FLY STREAM] 串流即時偵測開頭正常，單管道直接下載寫入。")
 
     return cut_seconds
 
 def run_download_process(videos_dir="videos", map_json_path="preview_map.json"):
     """
     掃描 videos/ 資料夾中被移入的九宮格圖片，
-    發起單管道即時串流下載，零算力開銷邊串流邊記錄黑邊，
-    落地即是影音 100% 同步的精華影片，並於完成後自動將九宮格圖片移動至 downloads/ 歸檔。
+    發起單管道即時串流下載，內建 HTTP 410 錯誤防護與自動升級相容機制。
     """
     print("==================================================")
-    print("  Pornhub 原影片下載器 (單管道即時串流邊下載邊檢測)")
+    print("  Pornhub 原影片下載器 (帶 410 錯誤自動防護修復)")
     print("==================================================")
     print()
 
@@ -157,10 +182,11 @@ def run_download_process(videos_dir="videos", map_json_path="preview_map.json"):
         return
 
     print(f"[+] 於 {videos_dir}/ 資料夾中掃描到 {len(jpg_files)} 張被移入的九宮格預覽圖。")
-    print(f"[+] 開始單管道即時串流下載原影片 (即時邊下載邊記錄黑邊)，並移動九宮格圖片...\n")
+    print(f"[+] 開始最高畫質下載原影片...\n")
 
     success_count = 0
     skipped_count = 0
+    upgraded_yt_dlp = False
 
     for idx, jpg_path in enumerate(jpg_files, 1):
         image_name = os.path.basename(jpg_path)
@@ -187,20 +213,8 @@ def run_download_process(videos_dir="videos", map_json_path="preview_map.json"):
         video_url = info.get("url")
         video_title = info.get("title", base_name_without_num)
 
-        print(f"[{idx}/{len(jpg_files)}] 正在啟動單管道即時串流下載: {video_title}")
+        print(f"[{idx}/{len(jpg_files)}] 正在啟動下載: {video_title}")
         print(f"   - 網頁網址: {video_url}")
-
-        ydl_opts_meta = {'format': 'bestvideo+bestaudio/best', 'quiet': True}
-        cut_seconds = 0.0
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts_meta) as ydl_m:
-                meta = ydl_m.extract_info(video_url, download=False)
-                stream_url = meta.get('url')
-                http_headers = meta.get('http_headers', {})
-                if stream_url:
-                    cut_seconds = on_the_fly_stream_download_and_crop(stream_url, http_headers, target_video_file)
-        except Exception:
-            cut_seconds = 0.0
 
         ydl_opts = {
             'format': 'bestvideo+bestaudio/best',
@@ -209,25 +223,49 @@ def run_download_process(videos_dir="videos", map_json_path="preview_map.json"):
             'no_warnings': True,
         }
 
-        if cut_seconds > 0.0:
-            ydl_opts['postprocessor_args'] = {'ffmpeg': ['-ss', str(cut_seconds)]}
-
-        print(f"   - 輸出路徑: {target_video_file}")
-
+        # 嘗試下載
+        download_success = False
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([video_url])
-            print(f"  [OK] 單管道即時串流下載成功 (落地即是精華影片) -> {os.path.basename(target_video_file)}")
-            
+            download_success = True
+        except Exception as e:
+            err_str = str(e)
+            if "410" in err_str or "Gone" in err_str:
+                print(f"   [!] 檢測到舊版 410 Gone 錯誤: {err_str}")
+                if not upgraded_yt_dlp:
+                    try_auto_upgrade_ytdlp()
+                    upgraded_yt_dlp = True
+                    # 重新載入升級後的 yt_dlp 重試
+                    try:
+                        import importlib
+                        importlib.reload(yt_dlp)
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            ydl.download([video_url])
+                        download_success = True
+                    except Exception:
+                        pass
+                
+                if not download_success:
+                    print(f"   [FALLBACK] 啟動原生備用解析器繞過 410 錯誤...")
+                    direct_mp4 = direct_fetch_pornhub_mp4_stream(video_url)
+                    if direct_mp4:
+                        print(f"   [+] 成功解析直連 MP4 串流，發起 FFmpeg 極速下載...")
+                        ffmpeg_cmd = ["ffmpeg", "-y", "-i", direct_mp4, "-c", "copy", target_video_file]
+                        res_ff = subprocess.run(ffmpeg_cmd)
+                        if res_ff.returncode == 0:
+                            download_success = True
+
+        if download_success:
+            print(f"  [OK] 影片下載成功 -> {os.path.basename(target_video_file)}")
             try:
                 shutil.move(jpg_path, dest_downloads_jpg)
-                print(f"  [Move] 已自動將九宮格圖片移動至 downloads/ 資料夾: {image_name}\n")
-            except Exception as e:
-                print(f"  [!] 自動移動圖片至 downloads/ 失敗: {e}\n")
-
+                print(f"  [Move] 已將九宮格圖片移動至 downloads/: {image_name}\n")
+            except Exception:
+                pass
             success_count += 1
-        except Exception as e:
-            print(f"  [FAIL] 影片下載失敗 ({video_url}): {e}\n")
+        else:
+            print(f"  [FAIL] 影片下載失敗: {video_url}\n")
 
     print("==================================================")
     print(f"[DONE] 下載作業全數完成！成功: {success_count} 部 | 已存在/跳過: {skipped_count} 部")
