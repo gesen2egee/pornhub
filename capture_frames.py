@@ -264,28 +264,29 @@ def extract_video_info(video_url, quality="720p"):
 def capture_single_frame(timestamp, stream_url, http_headers, output_file):
     """執行 ffmpeg 雙重 Seek 截取指定秒數的單張畫面"""
     os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
-    user_agent = http_headers.get('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0')
     
-    headers_list = []
-    for k, v in http_headers.items():
-        if k.lower() != 'user-agent':
-            headers_list.append(f"{k}: {v}\r\n")
-    headers_str = "".join(headers_list)
-    
+    is_local_file = os.path.exists(stream_url) or not (stream_url.startswith("http://") or stream_url.startswith("https://"))
     cmd = ["ffmpeg", "-y", "-loglevel", "error"]
     
-    if '.m3u8' in stream_url.lower() or 'hls' in stream_url.lower():
-        cmd.extend([
-            "-extension_picky", "0",
-            "-allowed_segment_extensions", "ALL,none,*",
-            "-allowed_extensions", "ALL,none,*",
-            "-protocol_whitelist", "file,crypto,stream,httpproxy,http,https,tcp,tls,rtp,hls",
-        ])
+    if not is_local_file:
+        user_agent = http_headers.get('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0')
+        headers_list = []
+        for k, v in http_headers.items():
+            if k.lower() != 'user-agent':
+                headers_list.append(f"{k}: {v}\r\n")
+        headers_str = "".join(headers_list)
         
-    cmd.extend(["-user_agent", user_agent])
-    
-    if headers_str:
-        cmd.extend(["-headers", headers_str])
+        if '.m3u8' in stream_url.lower() or 'hls' in stream_url.lower():
+            cmd.extend([
+                "-extension_picky", "0",
+                "-allowed_segment_extensions", "ALL,none,*",
+                "-allowed_extensions", "ALL,none,*",
+                "-protocol_whitelist", "file,crypto,stream,httpproxy,http,https,tcp,tls,rtp,hls",
+            ])
+            
+        cmd.extend(["-user_agent", user_agent])
+        if headers_str:
+            cmd.extend(["-headers", headers_str])
         
     if timestamp >= 10:
         pre_seek = timestamp - 10
