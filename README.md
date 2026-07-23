@@ -145,6 +145,17 @@ run_confucius4_tts.bat ^
 
 可用語言代碼：`zh`、`en`、`ja`、`ko`、`de`、`fr`、`es`、`id`、`it`、`th`、`pt`、`ru`、`ms`、`vi`。若 Hugging Face 連線受限，可在執行前設定 `HF_ENDPOINT`；預設強制使用 CUDA，只有確定要進行非常慢的 CPU 推理時才加上 `--device cpu`。
 
+若目錄內的影片都有同名繁中 SRT，可批次產生繁中配音版。程式預設讀取 `tasks/demucs-moss-retry/status.jsonl`，將影片對應到先前 Demucs 產生的純人聲 `vocals.wav`；每段字幕使用分離人聲的同時段作為 reference voice，短段落自動擴充前後 context。輸出預設放在 `low_videos/demucs_translated_zh/`，不會覆寫來源：
+
+```bat
+run_confucius4_dub.bat
+
+rem 先測試一支
+run_confucius4_dub.bat --limit 1
+```
+
+配音會按照 SRT 時間軸調整語速，並在繁中語音出現時自動壓低原音。可用 `--force` 重新產生既有輸出、用 `--output-dir` 指定其他輸出目錄，或用 `--reference-manifest` 指定另一份 Demucs `status.jsonl`。
+
 > 請只複製你本人或已取得明確授權的聲音，並向聽眾揭露內容由 AI 合成。
 
 ---

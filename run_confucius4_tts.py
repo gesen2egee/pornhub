@@ -131,13 +131,15 @@ def check_installation(torch_module: Any) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        request = None if args.check else validate_request(args)
         configure_runtime()
         import torch
 
         if args.check:
             return check_installation(torch)
 
-        prompt_wav, output = validate_request(args)
+        assert request is not None
+        prompt_wav, output = request
         device = select_device(torch, args.device)
 
         import torchaudio
