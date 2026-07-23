@@ -8,7 +8,6 @@ import subprocess
 import urllib.request
 import urllib.parse
 import yt_dlp
-import yt_dlp.utils
 
 if sys.platform == 'win32':
     try:
@@ -51,6 +50,46 @@ def direct_fetch_pornhub_mp4_stream(webpage_url):
 from PIL import Image
 
 
+def get_low_video_sample_range(duration):
+    """超過一分鐘取 30–60 秒，否則維持取影片開頭 30 秒。"""
+    try:
+        duration = float(duration)
+    except (TypeError, ValueError):
+        duration = 0
+    return (30, 60) if duration > 60 else (0, 30)
+
+
+def low_video_download_ranges(info_dict, ydl):
+    """依 yt-dlp 取得的影片總長度動態選擇 LOW VIDEO 下載區間。"""
+    start, end = get_low_video_sample_range(info_dict.get("duration"))
+    ydl.to_screen(f"[info] LOW VIDEO 取樣區間：{start}–{end} 秒")
+    yield {"start_time": start, "end_time": end}
+
+
+def probe_stream_duration(stream_url, headers):
+    """供 FFmpeg 備援路徑查詢直連影片長度；失敗時回傳 None。"""
+    command = [
+        "ffprobe",
+        "-v", "error",
+        "-headers", headers,
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        stream_url,
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            return float(result.stdout.strip())
+    except (FileNotFoundError, subprocess.SubprocessError, ValueError):
+        pass
+    return None
+
+
 def is_http_video_url(url):
     """接受可交由 yt-dlp 處理的完整 HTTP/HTTPS 網址。"""
     if not isinstance(url, str):
@@ -86,7 +125,7 @@ def process_single_directory(target_dir, is_low_quality):
     if not jpg_files:
         return
 
-    mode_label = "最低解析度/前30秒極速" if is_low_quality else "最高畫質"
+    mode_label = "最低解析度/動態30秒取樣" if is_low_quality else "最高畫質"
     print(f"[+] 開始為 [{target_dir}/] 依檔名順序讀取圖片內嵌 EXIF 網址並進行 {mode_label} 下載 (共 {len(jpg_files)} 張預覽圖)...\n")
 
     success_count = 0
@@ -164,12 +203,9 @@ def process_single_directory(target_dir, is_low_quality):
         else:
             ydl_opts['writethumbnail'] = False
 
-        # low_videos 模式：只下載前 30 秒 (0-30s) 且不上傳/不覆蓋原九宮格圖片
+        # low_videos 模式：超過 60 秒下載 30-60 秒，否則下載 0-30 秒
         if is_low_quality:
-            try:
-                ydl_opts['download_ranges'] = yt_dlp.utils.download_range_func(None, [(0, 30)])
-            except Exception:
-                pass
+            ydl_opts['download_ranges'] = low_video_download_ranges
 
         download_success = False
         try:
@@ -210,7 +246,16 @@ def process_single_directory(target_dir, is_low_quality):
                     "-y"
                 ]
                 if is_low_quality:
-                    ffmpeg_cmd = ff_base_opts + ["-ss", "0", "-i", direct_mp4, "-t", "30", "-c", "copy", temp_ffmpeg_file]
+                    duration = probe_stream_duration(direct_mp4, ff_headers)
+                    start, end = get_low_video_sample_range(duration)
+                    print(f"   [i] LOW VIDEO 取樣區間：{start}–{end} 秒")
+                    ffmpeg_cmd = ff_base_opts + [
+                        "-ss", str(start),
+                        "-i", direct_mp4,
+                        "-t", str(end - start),
+                        "-c", "copy",
+                        temp_ffmpeg_file,
+                    ]
                 else:
                     ffmpeg_cmd = ff_base_opts + ["-i", direct_mp4, "-c", "copy", temp_ffmpeg_file]
                 res_ff = subprocess.run(ffmpeg_cmd)
@@ -256,7 +301,7 @@ def run_download_process():
     # 【階段一】優先處理 low_videos/ 目錄 (最低畫質)
     if low_jpgs:
         print("==================================================")
-        print(" [階段 1/2] 開始處理 low_videos/ (最低解析度/前30秒極速)")
+        print(" [階段 1/2] 開始處理 low_videos/ (最低解析度/動態30秒取樣)")
         print("==================================================")
         process_single_directory("low_videos", is_low_quality=True)
 
