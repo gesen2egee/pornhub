@@ -58,6 +58,51 @@ pip install -r requirements.txt
 
 ---
 
+## 🎙️ 字幕 ASR：Whisper／MOSS 切換
+
+字幕流程支援兩個 backend：
+
+- `whisper`：預設值，沿用 `whisper/.venv` 的 faster-whisper。
+- `moss`：使用 MOSS-Transcribe-Diarize，同一次推理產生時間戳與 `[S01]`、`[S02]` 等匿名說話者標籤。
+
+### Windows CUDA 安裝 MOSS
+
+MOSS 模式需要 Windows、NVIDIA GPU／Driver、Python 3.12 與 CUDA 相容環境。雙擊或在 CMD 執行：
+
+```bat
+install_moss.bat
+```
+
+安裝器會建立 `moss/.venv`，從官方 CUDA 12.8 wheel index 安裝 PyTorch，固定安裝 MOSS 官方程式碼 commit `9990574e6ac62390a21bcce25a914d66ac92c25e`，並從 ModelScope 下載 `openmoss/MOSS-Transcribe-Diarize` 至 `moss/model-cache`。若 CUDA 不可用，安裝器會停止，不會改用 CPU。
+
+### 使用 MOSS 推理
+
+CMD：
+
+```bat
+set ASR_BACKEND=moss
+run_subtitle.bat --force --limit 1
+```
+
+PowerShell：
+
+```powershell
+$env:ASR_BACKEND = "moss"
+.\run_subtitle.bat --force --limit 1
+```
+
+不設定 `ASR_BACKEND` 時仍使用 Whisper。字幕完成後會沿用既有流程：OpenRouter 翻譯為繁體中文、輸出同名 SRT，再由 FFmpeg 封裝為軟字幕。`OPENROUTER_API_KEY` 預設從 OS 環境變數取得，不寫入專案檔案。
+
+MOSS 可選設定：
+
+- `MOSS_MODEL`：預設 `openmoss/MOSS-Transcribe-Diarize`。
+- `MOSS_DEVICE`：預設 `cuda:0`。
+- `MOSS_DTYPE`：預設 `bfloat16`，也支援 `float16`。
+- `MOSS_MAX_NEW_TOKENS`：預設 `65536`。
+- `MOSS_HOTWORDS`：逗號分隔的專有名詞提示。
+
+---
+
 ## 💡 進階用法：Python 命令行工具
 
 ```bash
