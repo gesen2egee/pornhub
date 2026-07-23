@@ -18,5 +18,6 @@ __pycache__/
 # IDE & 系統暫存
 .vscode/
 .idea/
+.worktrees/
 .DS_Store
 Thumbs.db
