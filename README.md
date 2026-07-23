@@ -111,6 +111,44 @@ MOSS 可選設定：
 
 ---
 
+## 🔊 Confucius4-TTS 語音複製與跨語言推理
+
+本專案整合 [NetEase Youdao Confucius4-TTS](https://github.com/netease-youdao/Confucius4-TTS)，可用一段參考 WAV 複製音色與情緒，再以同一音色合成繁中、英文、日文等 14 種語言。官方基礎環境為 Python 3.10、CUDA 12.6 與 NVIDIA GPU；TTS 使用獨立的 `confucius4_tts/` 環境，不會影響字幕 ASR。
+
+### 一鍵安裝
+
+先安裝 Python 3.10、Git for Windows 與最新版 NVIDIA Driver，再雙擊：
+
+```bat
+install_confucius4_tts.bat
+```
+
+安裝器會建立獨立 `.venv`、安裝 PyTorch 2.7.0 CUDA 12.6，並固定使用官方 commit `186983518e9e8ab9af69cabdda3436a76d6ccdfb`。模型權重會在第一次推理時從 Hugging Face 自動下載到 `confucius4_tts/model-cache/`，需要數 GB 磁碟空間。
+
+安裝後可先檢查環境：
+
+```bat
+run_confucius4_tts.bat --check
+```
+
+### 語音合成
+
+參考音訊必須是 WAV，建議使用 5～15 秒、單一人物、背景安靜且沒有音樂的清晰人聲：
+
+```bat
+run_confucius4_tts.bat ^
+  --prompt-wav "samples\voice.wav" ^
+  --text "這是一段使用參考音色合成的測試語音。" ^
+  --lang zh ^
+  --output "tts_output.wav"
+```
+
+可用語言代碼：`zh`、`en`、`ja`、`ko`、`de`、`fr`、`es`、`id`、`it`、`th`、`pt`、`ru`、`ms`、`vi`。若 Hugging Face 連線受限，可在執行前設定 `HF_ENDPOINT`；預設強制使用 CUDA，只有確定要進行非常慢的 CPU 推理時才加上 `--device cpu`。
+
+> 請只複製你本人或已取得明確授權的聲音，並向聽眾揭露內容由 AI 合成。
+
+---
+
 ## 💡 進階用法：Python 命令行工具
 
 ```bash
