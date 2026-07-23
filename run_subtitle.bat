@@ -11,16 +11,7 @@ if not exist "%PYTHON%" (
     exit /b 2
 )
 
-if not defined OPENROUTER_API_KEY if not defined OPENROUTER_KEY (
-    echo [錯誤] 找不到 OpenRouter API key。
-    echo 請設定環境變數 OPENROUTER_API_KEY 後重新執行。
-    echo PowerShell 範例：$env:OPENROUTER_API_KEY="sk-or-v1-..."
-    echo CMD 範例：setx OPENROUTER_API_KEY "sk-or-v1-..."
-    pause
-    exit /b 2
-)
-
-echo [開始] low_videos、low_video、videos -^> faster-whisper -^> OpenRouter -^> 同名.srt
+echo [開始] faster-whisper -^> OpenRouter -^> 同名.srt -^> ffmpeg 軟字幕 _sub.mp4
 "%PYTHON%" "%ROOT%run_subtitle.py" %*
 set "EXIT_CODE=%ERRORLEVEL%"
 echo [結束] ExitCode=%EXIT_CODE%

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from translate_srt_openrouter import (  # noqa: E402
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm"}
+EMBEDDED_SUFFIX = "_sub"
 
 
 def _find_videos() -> list[Path]:
@@ -42,6 +44,8 @@ def _find_videos() -> list[Path]:
     for directory in existing_dirs:
         for video in sorted(directory.iterdir()):
             if not video.is_file() or video.suffix.lower() not in VIDEO_EXTENSIONS:
+                continue
+            if video.stem.casefold().endswith(EMBEDDED_SUFFIX):
                 continue
             stem_key = video.stem.casefold()
             if stem_key in seen_stems:
@@ -101,21 +105,108 @@ def _transcribe_segments(model, video: Path) -> tuple[list[dict[str, Any]], str]
     return cues, getattr(info, "language", "unknown")
 
 
-def process_video(video: Path, model, api_key: str, model_name: str) -> Path:
+def _embedded_video_path(video: Path) -> Path:
+    return VIDEOS / f"{video.stem}{EMBEDDED_SUFFIX}.mp4"
+
+
+def _embed_soft_subtitle(
+    video: Path, subtitle: Path, output_video: Path, force: bool
+) -> Path:
+    if output_video.exists() and not force:
+        print(f"  軟字幕影片已存在，略過：{output_video}", flush=True)
+        return output_video
+
+    ffmpeg = os.getenv("FFMPEG_EXE", "ffmpeg")
+    temporary_output = output_video.with_name(
+        f".{output_video.stem}.tmp{output_video.suffix}"
+    )
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(video),
+        "-f",
+        "srt",
+        "-i",
+        str(subtitle),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-map",
+        "1:0",
+        "-map_metadata",
+        "0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "copy",
+        "-c:s",
+        "mov_text",
+        "-disposition:s:0",
+        "default",
+        "-metadata:s:s:0",
+        "language=zho",
+        "-metadata:s:s:0",
+        "title=繁體中文字幕",
+        "-movflags",
+        "+faststart",
+        str(temporary_output),
+    ]
+    print("  3/3 ffmpeg 軟字幕內嵌（不重新編碼）", flush=True)
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "找不到 ffmpeg。請先把 ffmpeg 加入 PATH，或設定 FFMPEG_EXE。"
+        ) from exc
+
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"ffmpeg 封裝失敗：{details[-1000:]}")
+    temporary_output.replace(output_video)
+    print(f"完成：{output_video}", flush=True)
+    return output_video
+
+
+def process_video(
+    video: Path,
+    model,
+    api_key: str | None,
+    model_name: str,
+    force: bool,
+) -> Path:
     output_srt = VIDEOS / f"{video.stem}.srt"
+    output_video = _embedded_video_path(video)
     print(f"\n處理：{video.name}", flush=True)
-    print("  1/2 faster-whisper VAD 與自然 segment 辨識", flush=True)
-    cues, language = _transcribe_segments(model, video)
-    if not cues:
-        raise RuntimeError("Whisper 沒有產生有效字幕段落。")
-    print(f"  語言：{language}；字幕段落：{len(cues)}", flush=True)
-    print("  2/2 OpenRouter 翻譯", flush=True)
-    translated = translate_cues(cues, api_key, model_name)
-    temporary_output = output_srt.with_name(output_srt.name + ".tmp")
-    temporary_output.write_text(format_srt(translated), encoding="utf-8-sig")
-    temporary_output.replace(output_srt)
-    print(f"完成：{output_srt}", flush=True)
-    return output_srt
+    if output_srt.exists() and not force:
+        print(f"  1/3 同名 SRT 已存在，略過 Whisper 與翻譯：{output_srt}", flush=True)
+    else:
+        if model is None or not api_key:
+            raise RuntimeError("缺少 Whisper 模型或 OpenRouter API key。")
+        print("  1/3 faster-whisper VAD 與自然 segment 辨識", flush=True)
+        cues, language = _transcribe_segments(model, video)
+        if not cues:
+            raise RuntimeError("Whisper 沒有產生有效字幕段落。")
+        print(f"  語言：{language}；字幕段落：{len(cues)}", flush=True)
+        print("  2/3 OpenRouter 翻譯", flush=True)
+        translated = translate_cues(cues, api_key, model_name)
+        temporary_output = output_srt.with_name(output_srt.name + ".tmp")
+        temporary_output.write_text(format_srt(translated), encoding="utf-8-sig")
+        temporary_output.replace(output_srt)
+        print(f"完成：{output_srt}", flush=True)
+
+    return _embed_soft_subtitle(video, output_srt, output_video, force)
 
 
 def main() -> int:
@@ -132,34 +223,44 @@ def main() -> int:
     pending = [
         video
         for video in videos
-        if args.force or not (VIDEOS / f"{video.stem}.srt").exists()
+        if (
+            args.force
+            or not (VIDEOS / f"{video.stem}.srt").exists()
+            or not _embedded_video_path(video).exists()
+        )
     ]
     skipped = len(videos) - len(pending)
     if args.limit > 0:
         pending = pending[: args.limit]
     print(
-        f"來源影片：{len(videos)} 部；略過既有字幕：{skipped} 部；待處理：{len(pending)} 部",
+        f"來源影片：{len(videos)} 部；略過已完成軟字幕影片：{skipped} 部；待處理：{len(pending)} 部",
         flush=True,
     )
     if args.dry_run:
         for video in pending:
-            print(f"{video} -> {VIDEOS / (video.stem + '.srt')}")
+            print(
+                f"{video} -> {VIDEOS / (video.stem + '.srt')} + "
+                f"{_embedded_video_path(video)}"
+            )
         return 0
     if not pending:
         print("沒有需要處理的影片。")
         return 0
 
+    needs_asr = args.force or any(
+        not (VIDEOS / f"{video.stem}.srt").exists() for video in pending
+    )
     api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY")
-    if not api_key:
+    if needs_asr and not api_key:
         print("錯誤：找不到 OPENROUTER_API_KEY 環境變數。", file=sys.stderr)
         return 2
 
-    model = _load_whisper_model()
+    model = _load_whisper_model() if needs_asr else None
     model_name = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
     failures = 0
     for video in pending:
         try:
-            process_video(video, model, api_key, model_name)
+            process_video(video, model, api_key, model_name, args.force)
         except Exception as exc:
             failures += 1
             print(f"失敗：{video.name}：{exc}", file=sys.stderr, flush=True)
