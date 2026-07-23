@@ -60,7 +60,9 @@ pip install -r requirements.txt
 
 ## 🎙️ 字幕 ASR：MOSS
 
-字幕流程固定使用 MOSS-Transcribe-Diarize，同一次推理產生時間戳；翻譯輸出會移除 `[S01]`、`[S02]` 等匿名說話者標籤。
+字幕流程固定使用 MOSS-Transcribe-Diarize，同一次推理產生時間戳；繁中翻譯會保留 `[S01]`、`[S02]` 等匿名說話者標籤與原時間軸。
+
+九宮格與影片統一使用 `WEB_META_V1`。新九宮格會在 URL 之外寫入完整網頁 metadata；舊式只有 URL 的九宮格會在下載或偵測到影片已存在時自動補齊。字幕完成後，MP4 會另外封存完整 `ORIGINAL_SRT` 與 `TRANSLATED_SRT`。可用 `python video_meta.py show 檔案.mp4` 查看，或用 `python video_meta.py export 檔案.mp4 --out-dir 輸出資料夾` 匯出。
 
 ### Windows CUDA 安裝 MOSS
 

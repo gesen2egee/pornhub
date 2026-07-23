@@ -10,6 +10,7 @@ import urllib.parse
 import shutil
 import datetime
 import yt_dlp
+import video_meta
 from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageStat
 
 if sys.platform == 'win32':
@@ -238,6 +239,7 @@ def extract_video_info(video_url, quality="720p"):
     print(f"[*] 正在解析影片資訊 ({quality} 畫質): {video_url} ...")
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
+    info.setdefault('webpage_url', video_url)
         
     duration = info.get('duration')
     title = info.get('title', 'video_frames')
@@ -268,7 +270,8 @@ def extract_video_info(video_url, quality="720p"):
         'duration': duration,
         'stream_url': stream_url,
         'http_headers': http_headers,
-        'diagnostic_info': diagnostic_info
+        'diagnostic_info': diagnostic_info,
+        'web_meta': video_meta.build_web_meta(info),
     }
 
 def capture_single_frame(timestamp, stream_url, http_headers, output_file):
@@ -345,7 +348,7 @@ def check_images_has_duplicates(pil_images, threshold=2.5):
                 
     return False, -1, -1, 0, 0, 0.0
 
-def create_3x3_grid_image(image_data_list, title, duration, video_url, stream_url, diag_info, output_file, output_root="previews"):
+def create_3x3_grid_image(image_data_list, title, duration, video_url, stream_url, diag_info, output_file, output_root="previews", web_meta=None):
     """
     將 9 張截圖圖片合成為 3x3 九宮格圖片，並標註時間標籤（超大綠色標籤 + 3px 黑色邊框、右上角）
     """
@@ -453,6 +456,8 @@ def create_3x3_grid_image(image_data_list, title, duration, video_url, stream_ur
     exif = grid_img.getexif()
     exif[0x010e] = video_url  # 將影片網址寫入 JPG 圖片 EXIF Metadata (ImageDescription)
     grid_img.save(output_file, quality=95, exif=exif)
+    if web_meta is not None:
+        video_meta.write_grid_jpg_web_meta(output_file, web_meta, url=video_url)
 
     succ_log_text = (
         f"[SUCCESS] 3x3 九宮格圖片生成成功\n"
@@ -531,7 +536,8 @@ def process_single_video(video_url, args, index=1, total=1):
 
     print(f"\n[*] 正在進行重複圖片檢測與 3x3 九宮格合成 ...")
     success = create_3x3_grid_image(
-        captured_image_data, title, duration, video_url, stream_url, diag_info, final_output_file, output_root=args.output
+        captured_image_data, title, duration, video_url, stream_url, diag_info,
+        final_output_file, output_root=args.output, web_meta=info.get('web_meta')
     )
 
     shutil.rmtree(temp_dir, ignore_errors=True)

@@ -179,16 +179,26 @@ def translate_cues(
     model: str = DEFAULT_MODEL,
     batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> list[dict[str, Any]]:
-    translated_cues = strip_speaker_labels(cues)
+    translated_cues: list[dict[str, Any]] = []
+    speaker_prefixes: dict[int, str] = {}
+    for source in cues:
+        cue = dict(source)
+        text = str(cue.get("text", ""))
+        match = SPEAKER_LABEL_PATTERN.match(text)
+        speaker_prefixes[int(cue["id"])] = match.group(0).strip() if match else ""
+        cue["text"] = SPEAKER_LABEL_PATTERN.sub("", text).strip()
+        translated_cues.append(cue)
     with requests.Session() as session:
         for start in range(0, len(translated_cues), batch_size):
             batch = translated_cues[start : start + batch_size]
             translations = _translate_batch(batch, api_key, model, session)
             for cue in translated_cues[start : start + len(batch)]:
-                cue["text"] = SPEAKER_LABEL_PATTERN.sub(
+                body = SPEAKER_LABEL_PATTERN.sub(
                     "",
                     translations[int(cue["id"])],
                 ).strip()
+                prefix = speaker_prefixes[int(cue["id"])]
+                cue["text"] = f"{prefix} {body}".strip()
             print(
                 f"OpenRouter 翻譯字幕 {start + 1}-{start + len(batch)}/{len(cues)}",
                 flush=True,

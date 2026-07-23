@@ -2,3 +2,5 @@ yt-dlp>=2025.01.15
 Pillow
 numpy
 curl_cffi
+mutagen
+requests

@@ -36,6 +36,12 @@ def test_process_video_uses_selected_backend(tmp_path, monkeypatch):
         "_embed_soft_subtitle",
         lambda video, subtitle, output, force, **kwargs: output,
     )
+    meta_calls = []
+    monkeypatch.setattr(
+        run_subtitle.video_meta,
+        "merge_write_mp4_meta",
+        lambda path, **kwargs: meta_calls.append((path, kwargs)),
+    )
 
     output = run_subtitle.process_video(
         video,
@@ -49,8 +55,11 @@ def test_process_video_uses_selected_backend(tmp_path, monkeypatch):
     assert output == video
     assert (
         video.with_suffix(".srt").read_text(encoding="utf-8-sig").strip()
-        == "1\n00:00:00,000 --> 00:00:01,000\nHi"
+        == "1\n00:00:00,000 --> 00:00:01,000\n[S01] Hi"
     )
+    assert "[S01] Hi" in meta_calls[0][1]["original_srt"]
+    assert "[S01] Hi" in meta_calls[0][1]["translated_srt"]
+    assert "base_comment" in meta_calls[0][1]
 
 
 def test_process_video_skips_backend_when_srt_exists(tmp_path, monkeypatch):

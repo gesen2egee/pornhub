@@ -22,9 +22,9 @@ from audio_enhance_stage import (  # noqa: E402
 from translate_srt_openrouter import (  # noqa: E402
     DEFAULT_MODEL,
     format_srt,
-    strip_speaker_labels,
     translate_cues,
 )
+import video_meta  # noqa: E402
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm"}
@@ -278,12 +278,20 @@ def process_video(
     output_srt = _subtitle_path(video)
     output_video = video
     media_input = video if media_input is None else media_input
+    existing_meta: dict = {}
+    try:
+        existing_meta = video_meta.read_mp4_meta(video)
+    except Exception:
+        pass
+    original_srt: str | None = existing_meta.get("original_srt")
+    translated_srt: str | None = None
     print(f"\n處理：{video.name}", flush=True)
     if output_srt.exists() and not force:
         print(
             f"  1/3 同名 SRT 已存在，略過 ASR 與翻譯：{output_srt}",
             flush=True,
         )
+        translated_srt = output_srt.read_text(encoding="utf-8-sig")
     else:
         if backend is None or not api_key:
             raise RuntimeError("缺少 ASR backend 或 OpenRouter API key。")
@@ -293,29 +301,45 @@ def process_video(
             raise RuntimeError("ASR 沒有產生有效字幕段落。")
         print(f"  語言：{language}；字幕段落：{len(cues)}", flush=True)
         print("  2/3 OpenRouter 翻譯", flush=True)
-        translated = strip_speaker_labels(
-            translate_cues(cues, api_key, model_name)
-        )
+        original_srt = format_srt(cues)
+        translated = translate_cues(cues, api_key, model_name)
+        translated_srt = format_srt(translated)
         temporary_output = output_srt.with_name(output_srt.name + ".tmp")
-        temporary_output.write_text(format_srt(translated), encoding="utf-8-sig")
+        temporary_output.write_text(translated_srt, encoding="utf-8-sig")
         temporary_output.replace(output_srt)
         print(f"完成：{output_srt}", flush=True)
 
     if _uses_hard_subtitle(video):
-        return _burn_hard_subtitle(
+        result = _burn_hard_subtitle(
             media_input,
             output_srt,
             output_video,
             force,
             mark_audio_enhanced=audio_enhanced,
         )
-    return _embed_soft_subtitle(
-        media_input,
-        output_srt,
-        output_video,
-        force,
-        mark_audio_enhanced=audio_enhanced,
-    )
+    else:
+        result = _embed_soft_subtitle(
+            media_input,
+            output_srt,
+            output_video,
+            force,
+            mark_audio_enhanced=audio_enhanced,
+        )
+    try:
+        base_comment = existing_meta.get("raw_comment") or ""
+        if audio_enhanced and ENHANCE_MARKER not in base_comment:
+            base_comment = f"{ENHANCE_MARKER}\n{base_comment}".rstrip()
+        video_meta.merge_write_mp4_meta(
+            result,
+            web_meta=existing_meta.get("web_meta"),
+            original_srt=original_srt,
+            translated_srt=translated_srt,
+            base_comment=base_comment,
+        )
+        print("  [META] 已寫入 MOSS 原文與繁中字幕", flush=True)
+    except Exception as exc:
+        print(f"  [!] 寫入字幕 metadata 失敗：{exc}", flush=True)
+    return result
 
 
 def main() -> int:

@@ -8,6 +8,7 @@ import subprocess
 import urllib.request
 import urllib.parse
 import yt_dlp
+import video_meta
 
 if sys.platform == 'win32':
     try:
@@ -118,6 +119,29 @@ def get_video_url_from_image(jpg_path):
         pass
     return None
 
+
+def upgrade_media_web_meta(jpg_path, mp4_path, video_url, info=None):
+    """補齊影片與九宮格 WEB_META；失敗不影響下載結果。"""
+    try:
+        if info is None:
+            with yt_dlp.YoutubeDL({
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+            }) as ydl:
+                info = ydl.extract_info(video_url, download=False)
+        info = dict(info or {})
+        info.setdefault("webpage_url", video_url)
+        web_meta = video_meta.build_web_meta(info)
+        if os.path.exists(mp4_path):
+            video_meta.merge_write_mp4_meta(mp4_path, web_meta=web_meta)
+        was_legacy = video_meta.is_legacy_grid_jpg(jpg_path)
+        video_meta.write_grid_jpg_web_meta(jpg_path, web_meta, url=video_url)
+        label = "舊格式→已升級" if was_legacy else "已同步"
+        print(f"   [META] 九宮格 {label} WEB_META，影片 metadata 已補齊")
+    except Exception as exc:
+        print(f"   [!] 補齊 WEB_META 失敗（不影響影片）：{exc}")
+
 def process_single_directory(target_dir, is_low_quality):
     """處理單一目錄 (low_videos/ 或 videos/) 中 JPG 圖片內嵌 EXIF 網址的下載邏輯"""
     # 從名字為順序開始下載 (字母/數字自然排序)
@@ -147,9 +171,12 @@ def process_single_directory(target_dir, is_low_quality):
         target_video_file = os.path.join(target_dir, video_file_basename)
         dest_downloads_jpg = os.path.join("downloads", image_name)
         os.makedirs("downloads", exist_ok=True)
+        video_url = get_video_url_from_image(jpg_path)
 
         if os.path.exists(target_video_file):
             print(f"[{idx}/{len(jpg_files)}] [EXISTS] 影片已存在: {os.path.basename(target_video_file)}")
+            if video_url:
+                upgrade_media_web_meta(jpg_path, target_video_file, video_url)
             if not is_low_quality:
                 try:
                     shutil.move(jpg_path, dest_downloads_jpg)
@@ -161,7 +188,6 @@ def process_single_directory(target_dir, is_low_quality):
             skipped_count += 1
             continue
 
-        video_url = get_video_url_from_image(jpg_path)
         video_title = base_name_without_num
 
         if not video_url:
@@ -265,6 +291,7 @@ def process_single_directory(target_dir, is_low_quality):
 
         if download_success:
             print(f"  [OK] 影片下載成功 -> {os.path.basename(target_video_file)}")
+            upgrade_media_web_meta(jpg_path, target_video_file, video_url)
             if not is_low_quality:
                 try:
                     shutil.move(jpg_path, dest_downloads_jpg)
