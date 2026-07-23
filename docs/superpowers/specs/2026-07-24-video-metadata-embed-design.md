@@ -12,10 +12,11 @@
 
 1. 每部下載成功的 MP4 都帶有**可再讀取**的網頁 meta（標題、上傳者、標籤、分類、views…）。
 2. 字幕完成後，同一支 MP4 的 metadata 內另存：
-   - **原文 SRT**（MOSS，含 `[S01]` / `[S02]` …）
-   - **翻譯 SRT**（繁中，**同樣保留** `[S01]` / `[S02]` …）
-3. Meta 用途僅為**封存與之後程式讀回**，不當播放器字幕軌。
-4. **不影響**現有圖片 EXIF → `run_download` 下載流程。
+   - **原文 SRT**（MOSS，含 `[S01]` / `[S02]` …與完整時間軸）
+   - **翻譯 SRT**（繁中，**同樣保留** `[S01]` / `[S02]` …與**相同** cue 時間軸）
+3. 影片層級時間一併寫入 WEB_META：`duration`、`duration_string`、`upload_date`、`timestamp`、`meta_written_at`。
+4. Meta 用途僅為**封存與之後程式讀回**，不當播放器字幕軌。
+5. **不影響**現有圖片 EXIF → `run_download` 下載流程。
 
 ### 非目標
 
@@ -77,7 +78,7 @@
 |-----|------|
 | `title`（`©nam`） | yt-dlp `title` |
 | `artist`（`©ART`） | `uploader` 或 `cast` 第一位（有則寫） |
-| `date`（`©day`） | `upload_date`（YYYY-MM-DD 或 YYYYMMDD） |
+| `date`（`©day`） | `upload_date`（優先 `YYYY-MM-DD`，否則 `YYYYMMDD`） |
 
 ### 4.2 `comment`（`©cmt`）正文：分區純文字
 
@@ -87,9 +88,9 @@
 ===WEB_META_V1===
 {...單行或緊湊 JSON...}
 ===ORIGINAL_SRT===
-（完整 SRT 正文，含 [S01] 等）
+（完整 SRT：序號 + 時間軸 + 正文，含 [S01] 等）
 ===TRANSLATED_SRT===
-（完整 SRT 正文，含 [S01] 等）
+（完整 SRT：序號 + **相同時間軸** + 譯文，含 [S01] 等）
 ```
 
 規則：
@@ -99,6 +100,7 @@
 3. 下載階段：只寫／更新 `WEB_META_V1`；若 comment 已有字幕區段則保留。
 4. 字幕階段：更新 `ORIGINAL_SRT` 與 `TRANSLATED_SRT`；保留 `WEB_META_V1`。
 5. 若某階段尚未有資料，可省略該區段（讀取時當空）。
+6. **時間必存（見 §5）：** 影片層級時間在 WEB_META；字幕 cue 時間軸在完整 SRT 內，翻譯不得改動。
 
 ### 4.3 `WEB_META_V1` 欄位（schema）
 
@@ -118,49 +120,79 @@
   "like_count": 0,
   "comment_count": 0,
   "average_rating": null,
-  "duration": 0,
-  "upload_date": "YYYYMMDD",
+  "duration": 1531,
+  "duration_string": "25:31",
+  "upload_date": "20180512",
+  "timestamp": 1526094205,
   "thumbnail": "https://…",
   "webpage_url": "https://…",
-  "age_limit": 18
+  "age_limit": 18,
+  "meta_written_at": "2026-07-24T12:34:56+00:00"
 }
 ```
+
+**時間相關欄位（必含 key，缺值用 `null`）：**
+
+| 欄位 | 意義 | 來源 |
+|------|------|------|
+| `duration` | 片長（秒，整數或數字） | yt-dlp `duration` |
+| `duration_string` | 可讀片長 | yt-dlp 或由 `duration` 格式化 |
+| `upload_date` | 上傳日 `YYYYMMDD` | yt-dlp `upload_date` |
+| `timestamp` | 上傳 Unix 秒 | yt-dlp `timestamp` |
+| `meta_written_at` | 本工具寫入 WEB_META 的 UTC ISO8601 | 本機 `datetime.now(timezone.utc)` |
 
 - **缺值約定（固定）：** 純量缺 → `null`；陣列缺 → `[]`。不省略 key，方便測試與讀取。
 - 不存串流 URL、cookies、formats 等下載憑證。
 
 ---
 
-## 5. 發言者標籤 `[S01]` 保留策略
+## 5. 發言者標籤與時間軸保留策略
 
-**需求：** 原文與翻譯「前後」都保留 `[Sxx]`。
+**需求：**
+
+1. 原文與翻譯「前後」都保留 `[Sxx]`。
+2. **時間也要：** 影片上傳／片長進 WEB_META；每條字幕的 SRT 時間軸（`HH:MM:SS,mmm --> HH:MM:SS,mmm`）原文與翻譯**完全一致**，不得在翻譯或寫 meta 時丟棄或改寫。
 
 ### 5.1 現況問題
 
-`translate_cues` 翻譯前會 `strip_speaker_labels`，回寫時再次 strip，導致繁中 SRT 與畫面上都沒有發言者。
+`translate_cues` 翻譯前會 `strip_speaker_labels`，回寫時再次 strip，導致繁中 SRT 與畫面上都沒有發言者。時間軸目前在 cue 的 `time` 欄位，翻譯路徑通常不動，但須在規格中**明確保證**並寫入完整 SRT（含時間行）。
 
 ### 5.2 目標行為
 
-1. **原文 cues／ORIGINAL_SRT**：維持 ASR 輸出，例如 `[S01] Hello`。
-2. **翻譯 cues／TRANSLATED_SRT／同名 .srt／硬字幕燒錄文字**：例如 `[S01] 你好`（標籤保留，只翻譯正文）。
+1. **原文 cues／ORIGINAL_SRT**：維持 ASR 輸出，例如：
+   ```text
+   1
+   00:00:00,480 --> 00:00:01,660
+   [S01] Hello
+   ```
+2. **翻譯 cues／TRANSLATED_SRT／同名 .srt／硬字幕燒錄文字**：
+   ```text
+   1
+   00:00:00,480 --> 00:00:01,660
+   [S01] 你好
+   ```
+   - 標籤保留，只翻譯正文。
+   - **`id` 與 `time` 與原文同一 cue 完全相同。**
 3. Meta 兩區與磁碟 `.srt` 一致，避免「檔案一套、meta 一套」。
+4. WEB_META 必須帶上 §4.3 的時間欄位（有則填值，無則 `null`）。
 
 ### 5.3 實作方式（建議）
 
 在 `translate_srt_openrouter.py`：
 
-1. 翻譯前：從每條 `text` **分離**前綴 `^\s*\[S\d+\]\s*` 與正文。
-2. 只把**正文**送進 OpenRouter（減少模型改壞標籤）。
-3. 翻譯後：用**原前綴**接回譯文：`f"{prefix}{translated_body}"`。
+1. 翻譯前：從每條 `text` **分離**前綴 `^\s*\[S\d+\]\s*` 與正文；**不要改** `id` / `time`。
+2. 只把**正文**送進 OpenRouter（減少模型改壞標籤）；payload **不含**時間字串（避免模型改時間）。
+3. 翻譯後：用**原前綴**接回譯文：`f"{prefix}{translated_body}"`；`time` 原樣拷貝。
 4. 若模型仍回傳標籤，再 strip 譯文上的重複標籤後接回原前綴，避免 `[S01] [S01] …`。
 5. **移除** `run_subtitle.py` 對翻譯結果的 `strip_speaker_labels` 呼叫。
 6. `strip_speaker_labels` 可保留給測試或其它用途，但預設翻譯路徑不再使用。
+7. `format_srt` 寫出完整區塊（序號 + 時間行 + 文本）；寫入 meta 的 SRT 必須由此產生，禁止只存純文字行。
 
 System prompt 可補一句：正文翻譯結果不要自行加 `[Sxx]` 前綴（實際以前綴重貼為準）。
 
 ### 5.4 相容
 
-- Whisper 無發言者時：前綴為空，行為與現在幾乎相同。
+- Whisper 無發言者時：前綴為空，行為與現在幾乎相同；時間軸仍完整保留。
 - 既有已去掉標籤的 `.srt`：不強制回填；`--force` 重跑 ASR+翻譯才會帶標籤。
 
 ---
@@ -231,11 +263,13 @@ python video_meta.py export path.mp4 --out-dir dir/
 
 1. **單元：`video_meta` 分區 parse/merge**  
    - 只 WEB、只字幕、兩者皆有、未知區段保留。
-2. **單元：發言者保留**  
-   - `[S01] Hello` → 譯文以 `[S01] ` 開頭；無標籤句子不受影響；避免雙重前綴。
+2. **單元：發言者與時間軸保留**  
+   - `[S01] Hello` → 譯文以 `[S01] ` 開頭；無標籤句子不受影響；避免雙重前綴。  
+   - 翻譯前後 `cue["time"]` 字串 identical；`format_srt` 含 `-->` 時間行。  
+   - `build_web_meta` 含 `duration` / `duration_string` / `upload_date` / `timestamp` / `meta_written_at` keys。
 3. **整合（可用暫存小 MP4）：**  
-   - 寫 WEB_META → ffprobe/mutagen 讀回欄位一致。  
-   - 再寫雙 SRT → WEB 仍在、兩段 SRT exact。  
+   - 寫 WEB_META → ffprobe/mutagen 讀回欄位一致（含 date tag 與 JSON 時間欄）。  
+   - 再寫雙 SRT → WEB 仍在、兩段 SRT exact（含時間軸）。  
 4. **回歸：**  
    - 無 EXIF 的 JPG 仍 skip；有 EXIF 下載路徑不因 meta 失敗而 FAIL。  
    - `run_subtitle` 軟字幕仍成功。  
@@ -277,4 +311,5 @@ python video_meta.py export path.mp4 --out-dir dir/
 | 寫入工具 | mutagen | 避開 Windows CLI 長度限制；大段多行可靠 |
 | EP meta | yt-dlp only | 第一版夠用；缺欄 null |
 | 發言者 | 原文＋翻譯都保留 | 使用者明確要求「前後都要保留 [S01]」 |
+| 時間 | 影片層級 + cue 時間軸都存 | 使用者要求「時間也要」；翻譯不得改 SRT 時間行 |
 | meta 失敗 | 不阻斷主流程 | 下載／字幕優先 |
