@@ -38,21 +38,27 @@ def _find_videos() -> list[Path]:
     configured_dir = os.getenv("LOW_VIDEO_DIR")
     if configured_dir:
         candidates.append(Path(configured_dir))
-    candidates.extend([ROOT / "low_videos", ROOT / "low_video"])
+    candidates.extend([ROOT / "low_videos", ROOT / "low_video", VIDEOS])
     existing_dirs = [path for path in candidates if path.exists()]
     if not existing_dirs:
         raise FileNotFoundError(
             f"找不到輸入資料夾，已檢查：{', '.join(map(str, candidates))}"
         )
+    sources: list[Path] = []
+    seen_stems: set[str] = set()
     for directory in existing_dirs:
         videos = sorted(
             path
             for path in directory.iterdir()
             if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
         )
-        if videos:
-            return videos
-    return []
+        for video in videos:
+            stem_key = video.stem.casefold()
+            if stem_key in seen_stems:
+                continue
+            seen_stems.add(stem_key)
+            sources.append(video)
+    return sources
 
 
 def _extract_audio(video: Path, audio: Path) -> None:
@@ -146,16 +152,20 @@ def main() -> int:
 
     videos = _find_videos()
     if not videos:
-        print("輸入資料夾目前沒有可處理的影片（支援 mp4/mkv/mov/webm）。")
+        print("low_videos、low_video、videos 都沒有可處理的影片（支援 mp4/mkv/mov/webm）。")
         return 0 if args.dry_run else 1
     pending = [
         video
         for video in videos
         if args.force or not (VIDEOS / f"{video.stem}.srt").exists()
     ]
+    skipped = len(videos) - len(pending)
     if args.limit > 0:
         pending = pending[: args.limit]
-    print(f"輸入影片：{len(videos)} 部；待處理：{len(pending)} 部", flush=True)
+    print(
+        f"來源影片：{len(videos)} 部；略過既有字幕：{skipped} 部；待處理：{len(pending)} 部",
+        flush=True,
+    )
     if args.dry_run:
         for video in pending:
             print(f"{video} -> {VIDEOS / (video.stem + '.srt')}")

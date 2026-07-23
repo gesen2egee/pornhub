@@ -7,12 +7,16 @@ set "PYTHON=%ROOT%qwen-asr\.venv\Scripts\python.exe"
 
 if not exist "%PYTHON%" (
     echo [錯誤] 找不到 Qwen3-ASR VENV：%PYTHON%
+    pause
     exit /b 2
 )
 
 if not defined OPENROUTER_API_KEY if not defined OPENROUTER_KEY (
-    echo [錯誤] 請先設定 OPENROUTER_API_KEY 環境變數。
-    echo 例如：set OPENROUTER_API_KEY=sk-or-v1-...
+    echo [錯誤] 找不到 OpenRouter API key。
+    echo 請設定使用者或系統環境變數：OPENROUTER_API_KEY
+    echo PowerShell 範例：$env:OPENROUTER_API_KEY="sk-or-v1-..."
+    echo CMD 範例：setx OPENROUTER_API_KEY "sk-or-v1-..."
+    pause
     exit /b 2
 )
 
