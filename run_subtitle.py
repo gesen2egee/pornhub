@@ -1,4 +1,4 @@
-"""使用可切換的 ASR backend 產生、翻譯並內嵌字幕。"""
+"""使用 MOSS 產生、翻譯並內嵌字幕。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent
 VIDEOS = ROOT / "videos"
 
 sys.path.insert(0, str(ROOT))
-from asr_backends import create_backend, resolve_backend  # noqa: E402
+from asr_backends import create_backend  # noqa: E402
 from audio_enhance_stage import (  # noqa: E402
     ENHANCE_MARKER,
     auto_enhance_enabled,
@@ -337,12 +337,6 @@ def main() -> int:
     if args.low_only:
         os.environ.setdefault("MOSS_MAX_NEW_TOKENS", "1024")
 
-    try:
-        backend_name = resolve_backend()
-    except ValueError as exc:
-        print(f"錯誤：{exc}", file=sys.stderr)
-        return 2
-
     videos = _find_videos(low_only=args.low_only)
     if not videos:
         print("low_videos、low_video、videos 都沒有可處理的影片。")
@@ -409,7 +403,7 @@ def main() -> int:
     try:
         backend = create_backend().load() if needs_asr else None
         if needs_asr:
-            print(f"使用 ASR backend：{backend_name}", flush=True)
+            print("使用 ASR：MOSS-Transcribe-Diarize", flush=True)
         model_name = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
         for video in pending:
             media = prepared_media.get(video)

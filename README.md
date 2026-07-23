@@ -58,12 +58,9 @@ pip install -r requirements.txt
 
 ---
 
-## 🎙️ 字幕 ASR：Whisper／MOSS 切換
+## 🎙️ 字幕 ASR：MOSS
 
-字幕流程支援兩個 backend：
-
-- `moss`：預設值，使用 MOSS-Transcribe-Diarize，同一次推理產生時間戳；翻譯輸出會移除 `[S01]`、`[S02]` 等匿名說話者標籤。
-- `whisper`：可選，沿用 `whisper/.venv` 的 faster-whisper。
+字幕流程固定使用 MOSS-Transcribe-Diarize，同一次推理產生時間戳；翻譯輸出會移除 `[S01]`、`[S02]` 等匿名說話者標籤。
 
 ### Windows CUDA 安裝 MOSS
 
@@ -80,18 +77,16 @@ install_moss.bat
 CMD：
 
 ```bat
-set ASR_BACKEND=moss
 run_subtitle.bat --force --limit 1
 ```
 
 PowerShell：
 
 ```powershell
-$env:ASR_BACKEND = "moss"
 .\run_subtitle.bat --force --limit 1
 ```
 
-不設定 `ASR_BACKEND` 時使用 MOSS。字幕完成後由 OpenRouter 翻譯為繁體中文並輸出同名 SRT；`low_videos/` 會由 FFmpeg 把繁中字幕直接燒入影片，一般 `videos/` 則維持不重新編碼的軟字幕。只處理全部低畫質影片可執行：
+字幕完成後由 OpenRouter 翻譯為繁體中文並輸出同名 SRT；`low_videos/` 會由 FFmpeg 把繁中字幕直接燒入影片，一般 `videos/` 則維持不重新編碼的軟字幕。只處理全部低畫質影片可執行：
 
 低畫質硬字幕預設會比畫面底部提高約半個字體高度，降低被播放器進度條遮住的機會。
 
@@ -101,7 +96,7 @@ run_subtitle.bat --low-only
 
 ### 字幕前自動音訊增強
 
-字幕流程預設會在載入 MOSS／Whisper 前完成音訊判斷：
+字幕流程預設會在載入 MOSS 前完成音訊判斷：
 
 1. 避開固定片頭，從影片 25%、50%、75% 各取 4 秒。
 2. 使用響度、峰均比、穩定度與 AudioSet AST 音樂分類結果判斷。

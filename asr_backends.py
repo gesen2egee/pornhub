@@ -1,4 +1,4 @@
-"""Whisper 與 MOSS 的統一 ASR backend 介面。"""
+"""MOSS-Transcribe-Diarize ASR 介面。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent
-WHISPER_CACHE = ROOT / "whisper" / "model-cache"
 MOSS_CACHE = ROOT / "moss" / "model-cache"
 DEFAULT_MOSS_MODEL = "openmoss/MOSS-Transcribe-Diarize"
 DEFAULT_MOSS_PROMPT = (
@@ -17,16 +16,6 @@ DEFAULT_MOSS_PROMPT = (
     "（[S01]、[S02]、[S03]…）開頭，正文為對應的語音內容，"
     "並在段末標註結束時間戳，以清晰標明該段語音範圍。"
 )
-
-
-def resolve_backend(environment: Mapping[str, str] | None = None) -> str:
-    """解析 ASR backend；未設定時預設使用 MOSS。"""
-    environment = os.environ if environment is None else environment
-    backend = environment.get("ASR_BACKEND", "moss").strip().lower() or "moss"
-    if backend not in {"whisper", "moss"}:
-        raise ValueError("ASR_BACKEND 只允許 whisper、moss。")
-    return backend
-
 
 def srt_time(seconds: float) -> str:
     """把秒數轉成 SRT 時間格式。"""
@@ -78,59 +67,6 @@ def build_moss_prompt(environment: Mapping[str, str] | None = None) -> str:
     return f"{DEFAULT_MOSS_PROMPT}熱詞提示：{', '.join(hotwords)}"
 
 
-class WhisperBackend:
-    """保留既有 faster-whisper 推理參數的 adapter。"""
-
-    name = "whisper"
-    display_name = "faster-whisper"
-
-    def __init__(self) -> None:
-        self.model: Any | None = None
-
-    def load(self) -> "WhisperBackend":
-        from faster_whisper import WhisperModel
-
-        model_name = os.getenv("WHISPER_MODEL", "large-v3")
-        device = os.getenv("WHISPER_DEVICE", "cuda")
-        compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "float16")
-        print(
-            f"載入 Whisper：{model_name}，device={device}，"
-            f"compute_type={compute_type}",
-            flush=True,
-        )
-        self.model = WhisperModel(
-            model_name,
-            device=device,
-            compute_type=compute_type,
-            download_root=str(WHISPER_CACHE),
-        )
-        return self
-
-    def transcribe(self, video: Path) -> tuple[list[dict[str, Any]], str]:
-        if self.model is None:
-            raise RuntimeError("Whisper backend 尚未載入。")
-        language = os.getenv("WHISPER_LANGUAGE") or None
-        options: dict[str, Any] = {"beam_size": 5, "vad_filter": True}
-        if language:
-            options["language"] = language
-        segments, info = self.model.transcribe(str(video), **options)
-        cues: list[dict[str, Any]] = []
-        for index, segment in enumerate(segments, start=1):
-            text = segment.text.strip()
-            if not text:
-                continue
-            cues.append(
-                {
-                    "id": index,
-                    "time": (
-                        f"{srt_time(segment.start)} --> {srt_time(segment.end)}"
-                    ),
-                    "text": text,
-                }
-            )
-        return cues, getattr(info, "language", "unknown")
-
-
 class MossBackend:
     """以 ModelScope snapshot 執行 MOSS-Transcribe-Diarize。"""
 
@@ -154,7 +90,7 @@ class MossBackend:
             self._torch = torch
         if not self._torch.cuda.is_available():
             raise RuntimeError(
-                "MOSS backend 需要 NVIDIA CUDA，不會自動退回 CPU 或 Whisper。"
+                "MOSS 需要 NVIDIA CUDA，不會自動退回 CPU。"
             )
 
         from modelscope import snapshot_download
@@ -225,11 +161,6 @@ class MossBackend:
         return moss_segments_to_cues(segments), "multilingual"
 
 
-def create_backend(
-    environment: Mapping[str, str] | None = None,
-) -> WhisperBackend | MossBackend:
-    """建立但不載入 backend，讓 dry-run 不觸發模型依賴。"""
-    backend = resolve_backend(environment)
-    if backend == "moss":
-        return MossBackend()
-    return WhisperBackend()
+def create_backend() -> MossBackend:
+    """建立但不載入 MOSS，讓 dry-run 不觸發模型依賴。"""
+    return MossBackend()

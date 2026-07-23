@@ -1,5 +1,0 @@
-# Whisper Python VENV
-.venv/
-
-# faster-whisper 模型快取
-model-cache/

@@ -4,25 +4,10 @@ import pytest
 
 from asr_backends import (
     MossBackend,
-    WhisperBackend,
     build_moss_prompt,
     create_backend,
     moss_segments_to_cues,
-    resolve_backend,
 )
-
-
-def test_resolve_backend_defaults_to_moss():
-    assert resolve_backend({}) == "moss"
-
-
-def test_resolve_backend_accepts_moss_case_insensitively():
-    assert resolve_backend({"ASR_BACKEND": " MOSS "}) == "moss"
-
-
-def test_resolve_backend_rejects_unknown_value():
-    with pytest.raises(ValueError, match="whisper、moss"):
-        resolve_backend({"ASR_BACKEND": "other"})
 
 
 def test_moss_segments_to_cues_preserves_speaker():
@@ -63,14 +48,8 @@ def test_moss_segments_to_cues_rejects_empty_transcript():
         moss_segments_to_cues([])
 
 
-def test_create_backend_defaults_to_moss(monkeypatch):
-    monkeypatch.delenv("ASR_BACKEND", raising=False)
+def test_create_backend_returns_moss():
     assert isinstance(create_backend(), MossBackend)
-
-
-def test_create_backend_selects_whisper(monkeypatch):
-    monkeypatch.setenv("ASR_BACKEND", "whisper")
-    assert isinstance(create_backend(), WhisperBackend)
 
 
 def test_moss_backend_refuses_cpu():
