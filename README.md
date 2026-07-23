@@ -93,6 +93,8 @@ $env:ASR_BACKEND = "moss"
 
 不設定 `ASR_BACKEND` 時使用 MOSS。字幕完成後由 OpenRouter 翻譯為繁體中文並輸出同名 SRT；`low_videos/` 會由 FFmpeg 把繁中字幕直接燒入影片，一般 `videos/` 則維持不重新編碼的軟字幕。只處理全部低畫質影片可執行：
 
+低畫質硬字幕預設會比畫面底部提高約半個字體高度，降低被播放器進度條遮住的機會。
+
 ```bat
 run_subtitle.bat --low-only
 ```

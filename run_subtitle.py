@@ -124,7 +124,7 @@ def _burn_hard_subtitle(
     subtitle_filter = (
         f"subtitles=filename='{subtitle_name}':"
         "force_style='FontName=Microsoft JhengHei,FontSize=18,"
-        "Outline=2,Shadow=1,MarginV=18,Alignment=2'"
+        "Outline=2,Shadow=1,MarginV=28,Alignment=2'"
     )
     command = [
         ffmpeg,
