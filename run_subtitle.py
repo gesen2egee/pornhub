@@ -17,6 +17,7 @@ from asr_backends import create_backend, resolve_backend  # noqa: E402
 from translate_srt_openrouter import (  # noqa: E402
     DEFAULT_MODEL,
     format_srt,
+    strip_speaker_labels,
     translate_cues,
 )
 
@@ -272,7 +273,9 @@ def process_video(
             raise RuntimeError("ASR 沒有產生有效字幕段落。")
         print(f"  語言：{language}；字幕段落：{len(cues)}", flush=True)
         print("  2/3 OpenRouter 翻譯", flush=True)
-        translated = translate_cues(cues, api_key, model_name)
+        translated = strip_speaker_labels(
+            translate_cues(cues, api_key, model_name)
+        )
         temporary_output = output_srt.with_name(output_srt.name + ".tmp")
         temporary_output.write_text(format_srt(translated), encoding="utf-8-sig")
         temporary_output.replace(output_srt)

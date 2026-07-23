@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,22 @@ import requests
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "x-ai/grok-4.5"
 DEFAULT_BATCH_SIZE = 60
+SPEAKER_LABEL_PATTERN = re.compile(r"^\s*\[S\d+\]\s*", re.IGNORECASE)
+
+
+def strip_speaker_labels(
+    cues: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """移除 MOSS 匿名說話者標籤，只保留字幕正文。"""
+    cleaned: list[dict[str, Any]] = []
+    for cue in cues:
+        item = dict(cue)
+        item["text"] = SPEAKER_LABEL_PATTERN.sub(
+            "",
+            str(item.get("text", "")),
+        ).strip()
+        cleaned.append(item)
+    return cleaned
 
 
 def parse_srt(content: str) -> list[dict[str, Any]]:
@@ -90,6 +107,9 @@ def _translate_batch(
                     "你是字幕校正與翻譯專家。每個 text 可能是 Whisper 聽寫結果，"
                     "請先依上下文校正錯字、漏字、同音誤聽、專有名詞與標點，"
                     "再翻譯成自然、準確、口語流暢的台灣繁體中文。"
+                    "人名、角色名、暱稱與稱呼盡量翻成自然合適的繁體中文；"
+                    "有公認中文譯名時優先使用，沒有公認譯名時採自然音譯，"
+                    "只有品牌、帳號或無法合理翻譯的專有名稱才保留原文。"
                     "翻譯結果只保留繁體中文，不要輸出校正原文。"
                     "保留原意、語氣、成人內容與說話者情緒，不要摘要、解釋或審查；"
                     "原文不確定時不要自行捏造內容。"
@@ -159,13 +179,16 @@ def translate_cues(
     model: str = DEFAULT_MODEL,
     batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> list[dict[str, Any]]:
-    translated_cues = [dict(cue) for cue in cues]
+    translated_cues = strip_speaker_labels(cues)
     with requests.Session() as session:
-        for start in range(0, len(cues), batch_size):
-            batch = cues[start : start + batch_size]
+        for start in range(0, len(translated_cues), batch_size):
+            batch = translated_cues[start : start + batch_size]
             translations = _translate_batch(batch, api_key, model, session)
             for cue in translated_cues[start : start + len(batch)]:
-                cue["text"] = translations[int(cue["id"])]
+                cue["text"] = SPEAKER_LABEL_PATTERN.sub(
+                    "",
+                    translations[int(cue["id"])],
+                ).strip()
             print(
                 f"OpenRouter 翻譯字幕 {start + 1}-{start + len(batch)}/{len(cues)}",
                 flush=True,

@@ -47,8 +47,9 @@ def test_process_video_uses_selected_backend(tmp_path, monkeypatch):
 
     assert backend.videos == [video]
     assert output == video
-    assert "[S01] Hi" in video.with_suffix(".srt").read_text(
-        encoding="utf-8-sig"
+    assert (
+        video.with_suffix(".srt").read_text(encoding="utf-8-sig").strip()
+        == "1\n00:00:00,000 --> 00:00:01,000\nHi"
     )
 
 

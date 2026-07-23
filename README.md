@@ -62,7 +62,7 @@ pip install -r requirements.txt
 
 字幕流程支援兩個 backend：
 
-- `moss`：預設值，使用 MOSS-Transcribe-Diarize，同一次推理產生時間戳與 `[S01]`、`[S02]` 等匿名說話者標籤。
+- `moss`：預設值，使用 MOSS-Transcribe-Diarize，同一次推理產生時間戳；翻譯輸出會移除 `[S01]`、`[S02]` 等匿名說話者標籤。
 - `whisper`：可選，沿用 `whisper/.venv` 的 faster-whisper。
 
 ### Windows CUDA 安裝 MOSS
