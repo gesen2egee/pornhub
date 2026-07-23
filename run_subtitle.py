@@ -24,7 +24,6 @@ from translate_srt_openrouter import (  # noqa: E402
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm"}
-EMBEDDED_SUFFIX = "_sub"
 
 
 def _find_videos() -> list[Path]:
@@ -44,8 +43,6 @@ def _find_videos() -> list[Path]:
     for directory in existing_dirs:
         for video in sorted(directory.iterdir()):
             if not video.is_file() or video.suffix.lower() not in VIDEO_EXTENSIONS:
-                continue
-            if video.stem.casefold().endswith(EMBEDDED_SUFFIX):
                 continue
             stem_key = video.stem.casefold()
             if stem_key in seen_stems:
@@ -105,21 +102,48 @@ def _transcribe_segments(model, video: Path) -> tuple[list[dict[str, Any]], str]
     return cues, getattr(info, "language", "unknown")
 
 
-def _embedded_video_path(video: Path) -> Path:
-    return VIDEOS / f"{video.stem}{EMBEDDED_SUFFIX}.mp4"
+def _has_soft_subtitle(video: Path) -> bool:
+    ffprobe = os.getenv("FFPROBE_EXE", "ffprobe")
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "s:0",
+        "-show_entries",
+        "stream=codec_name",
+        "-of",
+        "csv=p=0",
+        video.name,
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            cwd=str(video.parent),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError:
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def _subtitle_path(video: Path) -> Path:
+    return video.with_suffix(".srt")
 
 
 def _embed_soft_subtitle(
     video: Path, subtitle: Path, output_video: Path, force: bool
 ) -> Path:
-    if output_video.exists() and not force:
-        print(f"  軟字幕影片已存在，略過：{output_video}", flush=True)
-        return output_video
-
     ffmpeg = os.getenv("FFMPEG_EXE", "ffmpeg")
     temporary_output = output_video.with_name(
         f".{output_video.stem}.tmp{output_video.suffix}"
     )
+    is_mp4_container = output_video.suffix.lower() in {".mp4", ".mov"}
+    subtitle_codec = "mov_text" if is_mp4_container else "srt"
     command = [
         ffmpeg,
         "-hide_banner",
@@ -127,11 +151,11 @@ def _embed_soft_subtitle(
         "error",
         "-y",
         "-i",
-        str(video),
+        video.name,
         "-f",
         "srt",
         "-i",
-        str(subtitle),
+        subtitle.name,
         "-map",
         "0:v:0",
         "-map",
@@ -145,22 +169,23 @@ def _embed_soft_subtitle(
         "-c:a",
         "copy",
         "-c:s",
-        "mov_text",
+        subtitle_codec,
         "-disposition:s:0",
         "default",
         "-metadata:s:s:0",
         "language=zho",
         "-metadata:s:s:0",
         "title=繁體中文字幕",
-        "-movflags",
-        "+faststart",
-        str(temporary_output),
+        temporary_output.name,
     ]
+    if is_mp4_container:
+        command[-1:-1] = ["-movflags", "+faststart"]
     print("  3/3 ffmpeg 軟字幕內嵌（不重新編碼）", flush=True)
     try:
         result = subprocess.run(
             command,
             check=False,
+            cwd=str(video.parent),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -175,7 +200,7 @@ def _embed_soft_subtitle(
         details = (result.stderr or result.stdout).strip()
         raise RuntimeError(f"ffmpeg 封裝失敗：{details[-1000:]}")
     temporary_output.replace(output_video)
-    print(f"完成：{output_video}", flush=True)
+    print(f"完成並覆蓋原始影片：{output_video}", flush=True)
     return output_video
 
 
@@ -186,8 +211,8 @@ def process_video(
     model_name: str,
     force: bool,
 ) -> Path:
-    output_srt = VIDEOS / f"{video.stem}.srt"
-    output_video = _embedded_video_path(video)
+    output_srt = _subtitle_path(video)
+    output_video = video
     print(f"\n處理：{video.name}", flush=True)
     if output_srt.exists() and not force:
         print(f"  1/3 同名 SRT 已存在，略過 Whisper 與翻譯：{output_srt}", flush=True)
@@ -211,7 +236,11 @@ def process_video(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--force", action="store_true", help="覆寫已存在的同名 SRT")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="重新產生 SRT，並重新封裝後覆蓋原始影片",
+    )
     parser.add_argument("--limit", type=int, default=0, help="只處理前 N 部影片，0 表示全部")
     parser.add_argument("--dry-run", action="store_true", help="只列出待處理影片，不呼叫模型/API")
     args = parser.parse_args()
@@ -225,22 +254,22 @@ def main() -> int:
         for video in videos
         if (
             args.force
-            or not (VIDEOS / f"{video.stem}.srt").exists()
-            or not _embedded_video_path(video).exists()
+            or not _subtitle_path(video).exists()
+            or not _has_soft_subtitle(video)
         )
     ]
     skipped = len(videos) - len(pending)
     if args.limit > 0:
         pending = pending[: args.limit]
     print(
-        f"來源影片：{len(videos)} 部；略過已完成軟字幕影片：{skipped} 部；待處理：{len(pending)} 部",
+        f"來源影片：{len(videos)} 部；略過已有 SRT 與軟字幕影片：{skipped} 部；待處理：{len(pending)} 部",
         flush=True,
     )
     if args.dry_run:
         for video in pending:
             print(
-                f"{video} -> {VIDEOS / (video.stem + '.srt')} + "
-                f"{_embedded_video_path(video)}"
+                f"{video} -> {_subtitle_path(video)} + "
+                f"覆蓋原始影片"
             )
         return 0
     if not pending:
@@ -248,7 +277,7 @@ def main() -> int:
         return 0
 
     needs_asr = args.force or any(
-        not (VIDEOS / f"{video.stem}.srt").exists() for video in pending
+        not _subtitle_path(video).exists() for video in pending
     )
     api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY")
     if needs_asr and not api_key:

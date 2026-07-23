@@ -11,7 +11,7 @@ if not exist "%PYTHON%" (
     exit /b 2
 )
 
-echo [開始] faster-whisper -^> OpenRouter -^> 同名.srt -^> ffmpeg 軟字幕 _sub.mp4
+echo [開始] faster-whisper -^> OpenRouter -^> 同目錄同名.srt -^> 覆蓋原始影片
 "%PYTHON%" "%ROOT%run_subtitle.py" %*
 set "EXIT_CODE=%ERRORLEVEL%"
 echo [結束] ExitCode=%EXIT_CODE%
