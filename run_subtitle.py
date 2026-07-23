@@ -204,6 +204,7 @@ def process_video(
     existing_meta = _read_video_meta(video)
     original_srt: str | None = existing_meta.get("original_srt")
     translated_srt: str | None = None
+    subtitle_outcome = "translated"
     burn_srt: Path | None = None
     remove_burn_srt = False
     print(f"\n處理：{video.name}", flush=True)
@@ -220,6 +221,7 @@ def process_video(
             flush=True,
         )
         translated_srt = legacy_srt.read_text(encoding="utf-8-sig")
+        subtitle_outcome = "legacy_srt"
     else:
         if backend is None or not api_key:
             raise RuntimeError("缺少 ASR backend 或 OpenRouter API key。")
@@ -234,6 +236,7 @@ def process_video(
                 translated_srt = format_srt(translated)
             except Exception as exc:
                 translated_srt = ""
+                subtitle_outcome = "translation_failed"
                 print(
                     "  [!] 翻譯失敗，保留未硬編碼影片；"
                     f"翻譯 Meta 寫空並視為完成：{exc}",
@@ -241,6 +244,7 @@ def process_video(
                 )
         else:
             translated_srt = ""
+            subtitle_outcome = "empty"
             print("  2/3 無字幕，將空字幕狀態寫入影片 Meta", flush=True)
 
     if translated_srt and translated_srt.strip():
@@ -267,6 +271,10 @@ def process_video(
                 web_meta=existing_meta.get("web_meta"),
                 original_srt=original_srt,
                 translated_srt=translated_srt,
+                subtitle_status=video_meta.build_subtitle_status(
+                    subtitle_outcome,
+                    audio_enhanced=audio_enhanced,
+                ),
                 base_comment=base_comment,
             )
             print("  [META] 已寫入 MOSS 原文與繁中字幕", flush=True)

@@ -16,7 +16,11 @@ from typing import Any
 
 import run_subtitle
 from asr_backends import create_backend
-from audio_enhance_stage import auto_enhance_enabled, prepare_audio_media
+from audio_enhance_stage import (
+    ENHANCE_MARKER,
+    auto_enhance_enabled,
+    prepare_audio_media,
+)
 from translate_srt_openrouter import DEFAULT_MODEL
 
 try:
@@ -112,6 +116,44 @@ class SubtitleRuntime:
             print("[字幕管線] MOSS 已載入，後續影片共用同一模型", flush=True)
         return self.backend
 
+    @staticmethod
+    def _finalize_failed_subtitle(
+        video: Path,
+        media,
+        original_meta: dict[str, Any],
+        error: Exception,
+    ) -> None:
+        """字幕失敗仍產出原片；若已增強則產出增強片並寫明狀態。"""
+        enhanced_used = bool(
+            media
+            and media.enhanced
+            and media.media_input.exists()
+        )
+        base_comment = original_meta.get("raw_comment") or ""
+        if enhanced_used and ENHANCE_MARKER not in base_comment:
+            base_comment = f"{ENHANCE_MARKER}\n{base_comment}".rstrip()
+        if enhanced_used:
+            os.replace(media.media_input, video)
+            media.media_input = media.source
+            print("  [保留] 字幕失敗，改採已完成的音訊增強影片", flush=True)
+        try:
+            run_subtitle.video_meta.merge_write_mp4_meta(
+                video,
+                web_meta=original_meta.get("web_meta"),
+                original_srt="",
+                translated_srt="",
+                subtitle_status=(
+                    run_subtitle.video_meta.build_subtitle_status(
+                        "failed",
+                        audio_enhanced=enhanced_used,
+                        error=str(error),
+                    )
+                ),
+                base_comment=base_comment,
+            )
+        except Exception as exc:
+            print(f"  [!] 字幕失敗狀態 Meta 寫入失敗：{exc}", flush=True)
+
     def process(self, job: dict[str, Any]) -> None:
         video = Path(job["video"]).resolve()
         final_video = Path(job["final_video"]).resolve()
@@ -136,6 +178,7 @@ class SubtitleRuntime:
 
         prepared = {}
         media = None
+        original_meta = run_subtitle._read_video_meta(video)
         try:
             if self.use_audio_enhance:
                 print("[字幕管線] 自動判斷音訊是否需要增強", flush=True)
@@ -150,16 +193,27 @@ class SubtitleRuntime:
                 media_input=media.media_input if media else video,
                 audio_enhanced=media.enhanced if media else False,
             )
+            subtitle_meta = run_subtitle._read_video_meta(video)
+            if not (
+                subtitle_meta.get("original_srt_present")
+                and subtitle_meta.get("translated_srt_present")
+            ):
+                raise RuntimeError("字幕流程結束但影片內沒有完整雙字幕 Meta。")
+        except Exception as exc:
+            print(
+                f"  [保留] 字幕處理失敗，影片仍視為流程完成：{exc}",
+                flush=True,
+            )
+            self._finalize_failed_subtitle(
+                video,
+                media,
+                original_meta,
+                exc,
+            )
         finally:
             for item in prepared.values():
                 item.cleanup()
 
-        subtitle_meta = run_subtitle._read_video_meta(video)
-        if not (
-            subtitle_meta.get("original_srt_present")
-            and subtitle_meta.get("translated_srt_present")
-        ):
-            raise RuntimeError("字幕流程結束但影片內沒有完整雙字幕 Meta。")
         finalize_video(video, final_video)
         finish_grid(grid, archive_dir, should_archive_grid)
 

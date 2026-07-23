@@ -49,8 +49,6 @@ def moss_segments_to_cues(segments: list[Any]) -> list[dict[str, Any]]:
                 "text": f"{speaker} {text}",
             }
         )
-    if not cues:
-        raise RuntimeError("MOSS 沒有產生有效字幕段落。")
     return cues
 
 

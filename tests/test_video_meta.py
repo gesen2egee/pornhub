@@ -62,6 +62,22 @@ def test_empty_subtitle_sections_are_still_present():
     assert sections["TRANSLATED_SRT"] == ""
 
 
+def test_subtitle_status_has_fixed_schema():
+    status = video_meta.build_subtitle_status(
+        "failed",
+        audio_enhanced=True,
+        error="no audio",
+    )
+    merged = video_meta.merge_comment(None, subtitle_status=status)
+    _, sections = video_meta.parse_sections(merged)
+    stored = json.loads(sections["SUBTITLE_STATUS_V1"])
+    assert stored["schema"] == "subtitle_status_v1"
+    assert stored["outcome"] == "failed"
+    assert stored["audio_enhanced"] is True
+    assert stored["error"] == "no audio"
+    assert stored["processed_at"]
+
+
 def test_legacy_grid_round_trip(tmp_path):
     path = tmp_path / "grid.jpg"
     image = Image.new("RGB", (16, 16), "black")

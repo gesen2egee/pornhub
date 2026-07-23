@@ -51,6 +51,7 @@ def test_existing_video_is_queued_without_moving_grid(tmp_path, monkeypatch):
         "has_completed_subtitle",
         lambda path: True,
     )
+    monkeypatch.setattr(run_download, "has_video_stream", lambda path: True)
 
     class Worker:
         calls = []
@@ -98,6 +99,7 @@ def test_incomplete_existing_video_moves_to_temp_before_queue(
         "has_completed_subtitle",
         lambda path: False,
     )
+    monkeypatch.setattr(run_download, "has_video_stream", lambda path: True)
 
     class Worker:
         calls = []
@@ -119,3 +121,29 @@ def test_incomplete_existing_video_moves_to_temp_before_queue(
     args, _ = worker.calls[0]
     assert Path(args[0]).resolve() == staged
     assert Path(args[1]).resolve() == final_video
+
+
+def test_invalid_empty_mp4_is_removed_for_redownload(tmp_path, monkeypatch):
+    video = tmp_path / "empty.mp4"
+    video.write_bytes(b"metadata-only")
+    monkeypatch.setattr(
+        run_download,
+        "has_video_stream",
+        lambda path: False,
+    )
+
+    assert run_download.remove_invalid_video(video, "測試影片")
+    assert not video.exists()
+
+
+def test_probe_unavailable_does_not_delete_video(tmp_path, monkeypatch):
+    video = tmp_path / "unknown.mp4"
+    video.write_bytes(b"keep")
+    monkeypatch.setattr(
+        run_download,
+        "has_video_stream",
+        lambda path: None,
+    )
+
+    assert not run_download.remove_invalid_video(video, "測試影片")
+    assert video.exists()

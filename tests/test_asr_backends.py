@@ -43,9 +43,8 @@ def test_moss_segments_to_cues_rejects_invalid_segment(segment):
         moss_segments_to_cues([segment])
 
 
-def test_moss_segments_to_cues_rejects_empty_transcript():
-    with pytest.raises(RuntimeError, match="有效字幕"):
-        moss_segments_to_cues([])
+def test_moss_segments_to_cues_accepts_empty_transcript():
+    assert moss_segments_to_cues([]) == []
 
 
 def test_create_backend_returns_moss():

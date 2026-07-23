@@ -1,12 +1,11 @@
 from pathlib import Path
 
-import pytest
-
 import subtitle_worker
 
 
 class FakeMedia:
     def __init__(self, video: Path):
+        self.source = video
         self.media_input = video
         self.enhanced = False
         self.cleaned = False
@@ -77,7 +76,7 @@ def test_grid_moves_only_after_full_subtitle_meta(tmp_path, monkeypatch):
     assert media.cleaned
 
 
-def test_grid_stays_when_subtitle_meta_is_missing(tmp_path, monkeypatch):
+def test_subtitle_failure_finalizes_original_video(tmp_path, monkeypatch):
     video = tmp_path / "sample.mp4"
     final_video = tmp_path / "videos" / "sample.mp4"
     grid = tmp_path / "sample.jpg"
@@ -99,19 +98,30 @@ def test_grid_stays_when_subtitle_meta_is_missing(tmp_path, monkeypatch):
         "process_video",
         lambda *args, **kwargs: video,
     )
+    meta_calls = []
+    monkeypatch.setattr(
+        subtitle_worker.run_subtitle.video_meta,
+        "merge_write_mp4_meta",
+        lambda path, **kwargs: meta_calls.append(kwargs),
+    )
 
-    with pytest.raises(RuntimeError, match="沒有完整雙字幕 Meta"):
-        make_runtime().process({
-            "video": str(video),
-            "final_video": str(final_video),
-            "grid": str(grid),
-            "archive_dir": str(tmp_path / "downloaded"),
-            "archive_grid": True,
-        })
+    archive = tmp_path / "downloaded"
+    make_runtime().process({
+        "video": str(video),
+        "final_video": str(final_video),
+        "grid": str(grid),
+        "archive_dir": str(archive),
+        "archive_grid": True,
+    })
 
-    assert video.exists()
-    assert not final_video.exists()
-    assert grid.exists()
+    assert not video.exists()
+    assert final_video.read_bytes() == b"video"
+    assert not grid.exists()
+    assert (archive / grid.name).exists()
+    assert meta_calls[0]["original_srt"] == ""
+    assert meta_calls[0]["translated_srt"] == ""
+    assert meta_calls[0]["subtitle_status"]["outcome"] == "failed"
+    assert meta_calls[0]["subtitle_status"]["audio_enhanced"] is False
 
 
 def test_low_video_finalizes_but_keeps_grid(tmp_path, monkeypatch):
@@ -142,6 +152,64 @@ def test_low_video_finalizes_but_keeps_grid(tmp_path, monkeypatch):
     assert not video.exists()
     assert final_video.exists()
     assert grid.exists()
+
+
+def test_subtitle_failure_finalizes_enhanced_video(tmp_path, monkeypatch):
+    video = tmp_path / "temp" / "sample.mp4"
+    enhanced = tmp_path / "temp" / ".sample.audio-enhance.tmp.mp4"
+    final_video = tmp_path / "videos" / "sample.mp4"
+    grid = tmp_path / "videos" / "sample.jpg"
+    video.parent.mkdir()
+    grid.parent.mkdir()
+    video.write_bytes(b"original")
+    enhanced.write_bytes(b"enhanced")
+    grid.write_bytes(b"grid")
+    media = FakeMedia(video)
+    media.media_input = enhanced
+    media.enhanced = True
+    monkeypatch.setattr(
+        subtitle_worker.run_subtitle,
+        "_subtitle_complete",
+        lambda path: False,
+    )
+    monkeypatch.setattr(
+        subtitle_worker.run_subtitle,
+        "_read_video_meta",
+        lambda path: {"raw_comment": "", "web_meta": {"title": "T"}},
+    )
+    monkeypatch.setattr(
+        subtitle_worker,
+        "prepare_audio_media",
+        lambda videos: {video.resolve(): media},
+    )
+    monkeypatch.setattr(
+        subtitle_worker.run_subtitle,
+        "process_video",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("ASR failed")
+        ),
+    )
+    meta_calls = []
+    monkeypatch.setattr(
+        subtitle_worker.run_subtitle.video_meta,
+        "merge_write_mp4_meta",
+        lambda path, **kwargs: meta_calls.append(kwargs),
+    )
+
+    make_runtime().process({
+        "video": str(video),
+        "final_video": str(final_video),
+        "grid": str(grid),
+        "archive_dir": str(tmp_path / "downloaded"),
+        "archive_grid": True,
+    })
+
+    assert final_video.read_bytes() == b"enhanced"
+    assert not video.exists()
+    assert not enhanced.exists()
+    assert media.cleaned
+    assert meta_calls[0]["subtitle_status"]["outcome"] == "failed"
+    assert meta_calls[0]["subtitle_status"]["audio_enhanced"] is True
 
 
 def test_low_job_has_shorter_bounded_timeout(monkeypatch):

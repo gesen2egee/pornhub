@@ -67,6 +67,40 @@ def positive_env_seconds(name, default):
     return max(1, value)
 
 
+def has_video_stream(path):
+    """只有 ffprobe 確認含可播放 video stream 才算下載成功。"""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_type",
+                "-of", "default=nw=1:nk=1",
+                os.path.abspath(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    return result.returncode == 0 and "video" in result.stdout.split()
+
+
+def remove_invalid_video(path, label):
+    """移除沒有 video stream 的空殼，讓該九宮格重新下載。"""
+    stream_state = has_video_stream(path) if os.path.exists(path) else None
+    if stream_state is not False:
+        return False
+    try:
+        os.remove(path)
+        print(f"   [INVALID] {label} 沒有 video stream，已移除並重新下載")
+    except OSError as exc:
+        print(f"   [!] 無法移除無效的 {label}：{exc}")
+    return True
+
+
 class SubtitleWorker:
     """以獨立 MOSS 程序處理字幕，下載主流程可持續抓下一支。"""
 
@@ -270,6 +304,8 @@ def process_single_directory(target_dir, is_low_quality, subtitle_worker):
         )
         os.makedirs("downloaded", exist_ok=True)
         video_url = get_video_url_from_image(jpg_path)
+        remove_invalid_video(staged_video_file, "暫存影片")
+        remove_invalid_video(final_video_file, "正式影片")
 
         if os.path.exists(staged_video_file):
             if os.path.exists(final_video_file):
@@ -390,9 +426,16 @@ def process_single_directory(target_dir, is_low_quality, subtitle_worker):
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([video_url])
-            download_success = os.path.exists(staged_video_file)
+            download_success = (
+                os.path.exists(staged_video_file)
+                and has_video_stream(staged_video_file) is True
+            )
             if not download_success:
-                print("   [!] yt-dlp 結束但找不到預期的暫存 MP4。")
+                print(
+                    "   [!] yt-dlp 結束但暫存 MP4 不存在或沒有 video stream。"
+                )
+                remove_invalid_video(staged_video_file, "yt-dlp 暫存影片")
+                raise RuntimeError("yt-dlp 未產生有效 video stream")
         except Exception as e:
             err_str = str(e)
             print(f"   [!] yt-dlp 下載過程觸發異常: {e}")
@@ -452,9 +495,15 @@ def process_single_directory(target_dir, is_low_quality, subtitle_worker):
                     if (
                         res_ff.returncode == 0
                         and os.path.exists(temp_ffmpeg_file)
+                        and has_video_stream(temp_ffmpeg_file) is True
                     ):
                         shutil.move(temp_ffmpeg_file, staged_video_file)
                         download_success = True
+                    elif os.path.exists(temp_ffmpeg_file):
+                        remove_invalid_video(
+                            temp_ffmpeg_file,
+                            "FFmpeg 暫存影片",
+                        )
                 except subprocess.TimeoutExpired:
                     print(
                         "   [!] FFmpeg 單支下載超時，保留暫存並繼續下一支。"

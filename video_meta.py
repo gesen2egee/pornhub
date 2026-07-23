@@ -15,6 +15,7 @@ from PIL import Image
 WEB_SECTION = "WEB_META_V1"
 ORIGINAL_SECTION = "ORIGINAL_SRT"
 TRANSLATED_SECTION = "TRANSLATED_SRT"
+SUBTITLE_STATUS_SECTION = "SUBTITLE_STATUS_V1"
 SECTION_PATTERN = re.compile(r"(?m)^===([A-Z0-9_]+)===\s*\n?")
 WEB_FIELDS = (
     "extractor", "id", "title", "description", "uploader", "uploader_id",
@@ -74,7 +75,12 @@ def parse_sections(comment: str | None) -> tuple[str, dict[str, str]]:
 
 def serialize_sections(prefix: str, sections: dict[str, str]) -> str:
     chunks = [prefix.strip()] if prefix.strip() else []
-    preferred = (WEB_SECTION, ORIGINAL_SECTION, TRANSLATED_SECTION)
+    preferred = (
+        WEB_SECTION,
+        SUBTITLE_STATUS_SECTION,
+        ORIGINAL_SECTION,
+        TRANSLATED_SECTION,
+    )
     names = [name for name in preferred if name in sections]
     names.extend(name for name in sections if name not in preferred)
     chunks.extend(
@@ -87,12 +93,17 @@ def serialize_sections(prefix: str, sections: dict[str, str]) -> str:
 def merge_comment(
     comment: str | None, *, web_meta: dict[str, Any] | None = None,
     original_srt: str | None = None, translated_srt: str | None = None,
+    subtitle_status: dict[str, Any] | None = None,
 ) -> str:
     """只更新非 None 區段，並保留未知區段與既有一般 comment。"""
     prefix, sections = parse_sections(comment)
     if web_meta is not None:
         sections[WEB_SECTION] = json.dumps(
             web_meta, ensure_ascii=False, separators=(",", ":")
+        )
+    if subtitle_status is not None:
+        sections[SUBTITLE_STATUS_SECTION] = json.dumps(
+            subtitle_status, ensure_ascii=False, separators=(",", ":")
         )
     if original_srt is not None:
         sections[ORIGINAL_SECTION] = original_srt.rstrip()
@@ -109,6 +120,33 @@ def _web_from_sections(sections: dict[str, str]) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _json_section(
+    sections: dict[str, str],
+    name: str,
+) -> dict[str, Any] | None:
+    try:
+        value = json.loads(sections.get(name, ""))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def build_subtitle_status(
+    outcome: str,
+    *,
+    audio_enhanced: bool = False,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """建立固定字幕結果 schema，區分空字幕與處理失敗。"""
+    return {
+        "schema": "subtitle_status_v1",
+        "outcome": outcome,
+        "audio_enhanced": bool(audio_enhanced),
+        "error": error,
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def read_mp4_meta(path: str | Path) -> dict[str, Any]:
     media = MP4(str(path))
     tags = media.tags or {}
@@ -119,6 +157,10 @@ def read_mp4_meta(path: str | Path) -> dict[str, Any]:
         "artist": _first(tags.get("\xa9ART")),
         "date": _first(tags.get("\xa9day")),
         "web_meta": _web_from_sections(sections),
+        "subtitle_status": _json_section(
+            sections,
+            SUBTITLE_STATUS_SECTION,
+        ),
         "original_srt": sections.get(ORIGINAL_SECTION),
         "translated_srt": sections.get(TRANSLATED_SECTION),
         "original_srt_present": ORIGINAL_SECTION in sections,
@@ -130,6 +172,7 @@ def read_mp4_meta(path: str | Path) -> dict[str, Any]:
 def merge_write_mp4_meta(
     path: str | Path, *, web_meta: dict[str, Any] | None = None,
     original_srt: str | None = None, translated_srt: str | None = None,
+    subtitle_status: dict[str, Any] | None = None,
     base_comment: str | None = None,
 ) -> None:
     media = MP4(str(path))
@@ -140,6 +183,7 @@ def merge_write_mp4_meta(
         _first(tags.get("\xa9cmt")) if base_comment is None else base_comment,
         web_meta=web_meta,
         original_srt=original_srt, translated_srt=translated_srt,
+        subtitle_status=subtitle_status,
     )]
     if web_meta is not None:
         if web_meta.get("title"):
