@@ -56,7 +56,8 @@ echo ==================================================
 echo.
 echo [INFO] Download and subtitle workers run in parallel.
 echo [INFO] Each completed download is queued for the full subtitle pipeline.
-echo [INFO] A grid image is archived only after the whole video is complete.
+echo [INFO] Finished videos move from temp into their final folders.
+echo [INFO] videos grids move to downloaded; low_videos grids stay in place.
 echo.
 
 "%PYTHON%" "%ROOT%run_download.py"

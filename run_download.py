@@ -76,7 +76,13 @@ class SubtitleWorker:
         )
         self.closed = False
 
-    def enqueue(self, video_path, grid_path, is_low_quality=False):
+    def enqueue(
+        self,
+        video_path,
+        final_video_path,
+        grid_path,
+        is_low_quality=False,
+    ):
         if self.closed or self.process.stdin is None:
             raise RuntimeError("字幕工作者已關閉。")
         if self.process.poll() is not None:
@@ -85,14 +91,16 @@ class SubtitleWorker:
             )
         job = {
             "video": os.path.abspath(video_path),
+            "final_video": os.path.abspath(final_video_path),
             "grid": os.path.abspath(grid_path),
-            "archive_dir": os.path.abspath("downloads"),
+            "archive_dir": os.path.abspath("downloaded"),
+            "archive_grid": not bool(is_low_quality),
             "is_low_quality": bool(is_low_quality),
         }
         self.process.stdin.write(json.dumps(job, ensure_ascii=False) + "\n")
         self.process.stdin.flush()
         print(
-            f"   [QUEUE] 已交給背景字幕管線：{os.path.basename(video_path)}",
+            f"   [QUEUE] 已交給背景字幕管線：{os.path.basename(final_video_path)}",
             flush=True,
         )
 
@@ -177,6 +185,21 @@ def get_video_url_from_image(jpg_path):
     return None
 
 
+def has_completed_subtitle(video_path):
+    """影片內已有字幕 Meta 或舊同名 SRT 時視為完整成品。"""
+    legacy_srt = os.path.splitext(video_path)[0] + ".srt"
+    if os.path.exists(legacy_srt):
+        return True
+    try:
+        meta = video_meta.read_mp4_meta(video_path)
+        return bool(
+            meta.get("original_srt_present")
+            and meta.get("translated_srt_present")
+        )
+    except Exception:
+        return False
+
+
 def upgrade_media_web_meta(jpg_path, mp4_path, video_url, info=None):
     """補齊影片與九宮格 WEB_META；失敗不影響下載結果。"""
     try:
@@ -225,16 +248,77 @@ def process_single_directory(target_dir, is_low_quality, subtitle_worker):
         else:
             video_file_basename = base_name_without_num + ".mp4"
             
-        target_video_file = os.path.join(target_dir, video_file_basename)
-        os.makedirs("downloads", exist_ok=True)
+        final_video_file = os.path.join(target_dir, video_file_basename)
+        pipeline_dir_abs = os.path.abspath(
+            os.path.join("temp", "pipeline", target_dir)
+        )
+        os.makedirs(pipeline_dir_abs, exist_ok=True)
+        staged_video_file = os.path.join(
+            pipeline_dir_abs, video_file_basename
+        )
+        os.makedirs("downloaded", exist_ok=True)
         video_url = get_video_url_from_image(jpg_path)
 
-        if os.path.exists(target_video_file):
-            print(f"[{idx}/{len(jpg_files)}] [EXISTS] 影片已存在: {os.path.basename(target_video_file)}")
+        if os.path.exists(staged_video_file):
+            if os.path.exists(final_video_file):
+                if has_completed_subtitle(final_video_file):
+                    print(
+                        f"[{idx}/{len(jpg_files)}] [EXISTS] 正式成品已存在，"
+                        "暫存檔保留不覆寫"
+                    )
+                    subtitle_worker.enqueue(
+                        final_video_file,
+                        final_video_file,
+                        jpg_path,
+                        is_low_quality=is_low_quality,
+                    )
+                else:
+                    print(
+                        f"[{idx}/{len(jpg_files)}] [CONFLICT] 暫存與正式位置"
+                        "同時存在未完成影片，為避免覆寫已跳過"
+                    )
+                skipped_count += 1
+                continue
+            print(
+                f"[{idx}/{len(jpg_files)}] [RESUME] 找到未完成暫存影片："
+                f"{os.path.basename(staged_video_file)}"
+            )
             if video_url:
-                upgrade_media_web_meta(jpg_path, target_video_file, video_url)
+                upgrade_media_web_meta(
+                    jpg_path, staged_video_file, video_url
+                )
             subtitle_worker.enqueue(
-                target_video_file, jpg_path,
+                staged_video_file,
+                final_video_file,
+                jpg_path,
+                is_low_quality=is_low_quality,
+            )
+            skipped_count += 1
+            continue
+
+        if os.path.exists(final_video_file):
+            print(f"[{idx}/{len(jpg_files)}] [EXISTS] 影片已存在: {os.path.basename(final_video_file)}")
+            if has_completed_subtitle(final_video_file):
+                if is_low_quality:
+                    print("   [DONE] low video 已完整完成，九宮格保留原位")
+                    skipped_count += 1
+                    continue
+                subtitle_worker.enqueue(
+                    final_video_file,
+                    final_video_file,
+                    jpg_path,
+                    is_low_quality=False,
+                )
+                skipped_count += 1
+                continue
+            if video_url:
+                upgrade_media_web_meta(jpg_path, final_video_file, video_url)
+            shutil.move(final_video_file, staged_video_file)
+            print("   [STAGE] 舊未完成影片已移至 temp/pipeline 繼續處理")
+            subtitle_worker.enqueue(
+                staged_video_file,
+                final_video_file,
+                jpg_path,
                 is_low_quality=is_low_quality,
             )
             skipped_count += 1
@@ -249,10 +333,10 @@ def process_single_directory(target_dir, is_low_quality, subtitle_worker):
 
         print(f"[{idx}/{len(jpg_files)}] 正在啟動下載 ({mode_label}): {video_title}")
         print(f"   - 圖片 Metadata 讀取網址: {video_url}")
-        print(f"   - 輸出路徑: {target_video_file}")
+        print(f"   - 暫存路徑: {staged_video_file}")
+        print(f"   - 完成路徑: {final_video_file}")
 
         fmt_spec = 'worstvideo+worstaudio/worst' if is_low_quality else 'bestvideo+bestaudio/best'
-        target_dir_abs = os.path.abspath(target_dir)
         temp_dir_abs = os.path.abspath("temp")
         os.makedirs(temp_dir_abs, exist_ok=True)
         temp_thumb_template = os.path.join(temp_dir_abs, f"thumb_{idx}_%(id)s.%(ext)s")
@@ -260,7 +344,7 @@ def process_single_directory(target_dir, is_low_quality, subtitle_worker):
         ydl_opts = {
             'format': fmt_spec,
             'paths': {
-                'home': target_dir_abs,
+                'home': pipeline_dir_abs,
                 'temp': temp_dir_abs,
             },
             'outtmpl': {
@@ -289,7 +373,9 @@ def process_single_directory(target_dir, is_low_quality, subtitle_worker):
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([video_url])
-            download_success = True
+            download_success = os.path.exists(staged_video_file)
+            if not download_success:
+                print("   [!] yt-dlp 結束但找不到預期的暫存 MP4。")
         except Exception as e:
             err_str = str(e)
             print(f"   [!] yt-dlp 下載過程觸發異常: {e}")
@@ -338,14 +424,16 @@ def process_single_directory(target_dir, is_low_quality, subtitle_worker):
                     ffmpeg_cmd = ff_base_opts + ["-i", direct_mp4, "-c", "copy", temp_ffmpeg_file]
                 res_ff = subprocess.run(ffmpeg_cmd)
                 if res_ff.returncode == 0 and os.path.exists(temp_ffmpeg_file):
-                    shutil.move(temp_ffmpeg_file, target_video_file)
+                    shutil.move(temp_ffmpeg_file, staged_video_file)
                     download_success = True
 
         if download_success:
-            print(f"  [OK] 影片下載成功 -> {os.path.basename(target_video_file)}")
-            upgrade_media_web_meta(jpg_path, target_video_file, video_url)
+            print(f"  [OK] 影片下載至暫存 -> {os.path.basename(staged_video_file)}")
+            upgrade_media_web_meta(jpg_path, staged_video_file, video_url)
             subtitle_worker.enqueue(
-                target_video_file, jpg_path,
+                staged_video_file,
+                final_video_file,
+                jpg_path,
                 is_low_quality=is_low_quality,
             )
             success_count += 1

@@ -41,6 +41,29 @@ def archive_grid(grid: Path, archive_dir: Path) -> Path | None:
     return destination
 
 
+def finalize_video(video: Path, final_video: Path) -> Path:
+    """字幕與 Meta 完整後，才把暫存影片移入正式資料夾。"""
+    if video == final_video:
+        return final_video
+    final_video.parent.mkdir(parents=True, exist_ok=True)
+    if final_video.exists():
+        raise RuntimeError(f"正式影片路徑已存在，拒絕覆寫：{final_video}")
+    shutil.move(str(video), str(final_video))
+    print(f"  [完成] 影片已移至正式路徑：{final_video}", flush=True)
+    return final_video
+
+
+def finish_grid(
+    grid: Path,
+    archive_dir: Path,
+    should_archive: bool,
+) -> None:
+    if should_archive:
+        archive_grid(grid, archive_dir)
+    elif grid.exists():
+        print(f"  [保留] low video 九宮格保留原位：{grid}", flush=True)
+
+
 class SubtitleRuntime:
     """重用同一個 MOSS backend，逐支處理下載完成的影片。"""
 
@@ -61,8 +84,10 @@ class SubtitleRuntime:
 
     def process(self, job: dict[str, Any]) -> None:
         video = Path(job["video"]).resolve()
+        final_video = Path(job["final_video"]).resolve()
         grid = Path(job["grid"]).resolve()
         archive_dir = Path(job["archive_dir"]).resolve()
+        should_archive_grid = bool(job.get("archive_grid"))
         if job.get("is_low_quality") and self.configured_max_tokens is None:
             os.environ["MOSS_MAX_NEW_TOKENS"] = "1024"
         elif self.configured_max_tokens is None:
@@ -73,7 +98,8 @@ class SubtitleRuntime:
 
         if run_subtitle._subtitle_complete(video):
             print("[字幕管線] 已有舊 SRT 或影片字幕 Meta，直接略過字幕", flush=True)
-            archive_grid(grid, archive_dir)
+            finalize_video(video, final_video)
+            finish_grid(grid, archive_dir, should_archive_grid)
             return
         if not self.api_key:
             raise RuntimeError("找不到 OPENROUTER_API_KEY 環境變數。")
@@ -104,7 +130,8 @@ class SubtitleRuntime:
             and subtitle_meta.get("translated_srt_present")
         ):
             raise RuntimeError("字幕流程結束但影片內沒有完整雙字幕 Meta。")
-        archive_grid(grid, archive_dir)
+        finalize_video(video, final_video)
+        finish_grid(grid, archive_dir, should_archive_grid)
 
 
 def main() -> int:

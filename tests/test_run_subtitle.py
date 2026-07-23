@@ -77,6 +77,8 @@ def test_empty_embedded_subtitle_meta_is_considered_complete(tmp_path, monkeypat
         run_subtitle,
         "_read_video_meta",
         lambda path: {
+            "original_srt": "",
+            "original_srt_present": True,
             "translated_srt": "",
             "translated_srt_present": True,
         },

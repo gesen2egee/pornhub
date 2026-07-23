@@ -77,8 +77,12 @@ def _subtitle_path(video: Path) -> Path:
 
 
 def _has_embedded_subtitle_meta(video: Path) -> bool:
-    """空的 TRANSLATED_SRT 區段也代表字幕流程已完成。"""
-    return bool(_read_video_meta(video).get("translated_srt_present"))
+    """兩個字幕區段都存在才算完成；內容可為空。"""
+    meta = _read_video_meta(video)
+    return bool(
+        meta.get("original_srt_present")
+        and meta.get("translated_srt_present")
+    )
 
 
 def _subtitle_complete(video: Path) -> bool:

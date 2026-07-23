@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from PIL import Image
 
 import run_download
@@ -44,6 +46,11 @@ def test_existing_video_is_queued_without_moving_grid(tmp_path, monkeypatch):
         "upgrade_media_web_meta",
         lambda *args, **kwargs: None,
     )
+    monkeypatch.setattr(
+        run_download,
+        "has_completed_subtitle",
+        lambda path: True,
+    )
 
     class Worker:
         calls = []
@@ -59,8 +66,56 @@ def test_existing_video_is_queued_without_moving_grid(tmp_path, monkeypatch):
     )
 
     assert jpg.exists()
-    assert worker.calls == [
-        (("videos\\sample.mp4", "videos\\0001-sample.jpg"), {
-            "is_low_quality": False,
-        })
-    ]
+    assert len(worker.calls) == 1
+    args, kwargs = worker.calls[0]
+    assert Path(args[0]).resolve() == mp4
+    assert Path(args[1]).resolve() == mp4
+    assert Path(args[2]).resolve() == jpg
+    assert kwargs == {"is_low_quality": False}
+
+
+def test_incomplete_existing_video_moves_to_temp_before_queue(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "videos"
+    target.mkdir()
+    jpg = target / "0001-sample.jpg"
+    final_video = target / "sample.mp4"
+    image = Image.new("RGB", (16, 16), "black")
+    exif = image.getexif()
+    exif[0x010E] = "https://example.com/v"
+    image.save(jpg, exif=exif)
+    final_video.write_bytes(b"incomplete")
+    monkeypatch.setattr(
+        run_download,
+        "upgrade_media_web_meta",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        run_download,
+        "has_completed_subtitle",
+        lambda path: False,
+    )
+
+    class Worker:
+        calls = []
+
+        def enqueue(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    worker = Worker()
+    run_download.process_single_directory(
+        "videos",
+        is_low_quality=False,
+        subtitle_worker=worker,
+    )
+
+    staged = tmp_path / "temp" / "pipeline" / "videos" / "sample.mp4"
+    assert not final_video.exists()
+    assert staged.read_bytes() == b"incomplete"
+    assert jpg.exists()
+    args, _ = worker.calls[0]
+    assert Path(args[0]).resolve() == staged
+    assert Path(args[1]).resolve() == final_video

@@ -29,18 +29,19 @@ def make_runtime():
 
 
 def test_grid_moves_only_after_full_subtitle_meta(tmp_path, monkeypatch):
-    video = tmp_path / "videos" / "sample.mp4"
-    grid = video.with_suffix(".jpg")
-    archive = tmp_path / "downloads"
+    video = tmp_path / "temp" / "sample.mp4"
+    final_video = tmp_path / "videos" / "sample.mp4"
+    grid = tmp_path / "videos" / "sample.jpg"
+    archive = tmp_path / "downloaded"
     video.parent.mkdir()
+    grid.parent.mkdir()
     video.write_bytes(b"video")
     grid.write_bytes(b"grid")
     media = FakeMedia(video)
-    states = iter([False, True])
     monkeypatch.setattr(
         subtitle_worker.run_subtitle,
         "_subtitle_complete",
-        lambda path: next(states),
+        lambda path: False,
     )
     monkeypatch.setattr(
         subtitle_worker.run_subtitle,
@@ -63,10 +64,14 @@ def test_grid_moves_only_after_full_subtitle_meta(tmp_path, monkeypatch):
 
     make_runtime().process({
         "video": str(video),
+        "final_video": str(final_video),
         "grid": str(grid),
         "archive_dir": str(archive),
+        "archive_grid": True,
     })
 
+    assert not video.exists()
+    assert final_video.exists()
     assert not grid.exists()
     assert (archive / grid.name).exists()
     assert media.cleaned
@@ -74,6 +79,7 @@ def test_grid_moves_only_after_full_subtitle_meta(tmp_path, monkeypatch):
 
 def test_grid_stays_when_subtitle_meta_is_missing(tmp_path, monkeypatch):
     video = tmp_path / "sample.mp4"
+    final_video = tmp_path / "videos" / "sample.mp4"
     grid = tmp_path / "sample.jpg"
     video.write_bytes(b"video")
     grid.write_bytes(b"grid")
@@ -97,8 +103,42 @@ def test_grid_stays_when_subtitle_meta_is_missing(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="沒有完整雙字幕 Meta"):
         make_runtime().process({
             "video": str(video),
+            "final_video": str(final_video),
             "grid": str(grid),
-            "archive_dir": str(tmp_path / "downloads"),
+            "archive_dir": str(tmp_path / "downloaded"),
+            "archive_grid": True,
         })
 
+    assert video.exists()
+    assert not final_video.exists()
+    assert grid.exists()
+
+
+def test_low_video_finalizes_but_keeps_grid(tmp_path, monkeypatch):
+    video = tmp_path / "temp" / "sample.mp4"
+    final_video = tmp_path / "low_videos" / "sample.mp4"
+    grid = tmp_path / "low_videos" / "sample.jpg"
+    video.parent.mkdir()
+    grid.parent.mkdir()
+    video.write_bytes(b"video")
+    grid.write_bytes(b"grid")
+    monkeypatch.setattr(
+        subtitle_worker.run_subtitle,
+        "_subtitle_complete",
+        lambda path: True,
+    )
+
+    runtime = make_runtime()
+    runtime.api_key = None
+    runtime.process({
+        "video": str(video),
+        "final_video": str(final_video),
+        "grid": str(grid),
+        "archive_dir": str(tmp_path / "downloaded"),
+        "archive_grid": False,
+        "is_low_quality": True,
+    })
+
+    assert not video.exists()
+    assert final_video.exists()
     assert grid.exists()

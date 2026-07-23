@@ -35,7 +35,8 @@ pip install -r requirements.txt
 3. **下載與完整字幕雙管線 (`run_download`)**：
    - 將滿意的九宮格圖片移至 `videos/` 或 `low_videos/` 後，雙擊 **[run_download.bat](file:///c:/workspace/pornhub/run_download.bat)**。
    - 下載程序會持續抓下一支，獨立字幕程序則立即接手已下載影片，完成音訊判斷／增強、MOSS、翻譯、硬字幕與 Meta。
-   - **每支影片完整成功後**才將該九宮格移至 `downloads/`；字幕失敗時圖片保留原位。
+   - 影片先下載至 `temp/pipeline/`，完成字幕、硬字幕與 Meta 後才移入 `videos/` 或 `low_videos/`。
+   - `videos/` 的九宮格在整支影片完整成功後移至 `downloaded/`；`low_videos/` 的九宮格永遠保留原位。
 4. **下載即跳過開頭純色/黑邊 (Stream Direct Skip)**：
    - 在發起下載前 0.05 秒自動採樣分析遠端串流。若開頭純色/黑邊於 `0.5s ~ 10.0s` 之間，直接在下載時傳入前置跳過選項。
    - **落地的影片即為完美切除開頭、影音 100% 同步的精華影片**，零二次處理開銷！
@@ -55,7 +56,8 @@ pip install -r requirements.txt
 3. **步驟三：一鍵下載、字幕與歸檔**
    - 雙擊執行 **[run_download.bat](file:///c:/workspace/pornhub/run_download.bat)**。
    - 程式會自動下載影片，並讓背景字幕工作者同步處理已完成下載的影片。
-   - **整支影片完成硬字幕與 Meta 後**才歸檔九宮格，保持來源資料夾只留下未完成項目。
+   - 正式影片資料夾只會出現完整成品；失敗的中間影片留在 `temp/pipeline/` 供下次續跑。
+   - `videos/` 完成後歸檔九宮格至 `downloaded/`，`low_videos/` 則保留九宮格。
 
 ---
 
@@ -202,7 +204,7 @@ python capture_frames.py "https://www.pornhub.com/view_video.php?viewkey=6a4ea20
 - `-i`, `--interval`: 截圖間隔秒數（預設 `60` 秒 = 1 分鐘）。
 - `-q`, `--quality`: 畫質選擇（預設 `best` 最高清，可指定 `1080p`, `720p`, `480p`, `240p` 等）。
 - `-w`, `--workers`: 每部影片並行處理線程數（預設 `4`）。
-- `-o`, `--output`: 儲存根目錄（預設 `downloads`）。
+- `-o`, `--output`: 九宮格儲存目錄（預設 `previews`）。
 
 ---
 
