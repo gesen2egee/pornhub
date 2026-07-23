@@ -13,6 +13,10 @@ import yt_dlp
 import video_meta
 from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageStat
 
+EPORNER_HOME = "https://www.eporner.com/"
+EPORNER_SEARCH_API = "https://www.eporner.com/api/v2/video/search/"
+EPORNER_RESULTS_PER_PAGE = 30
+
 if sys.platform == 'win32':
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -50,14 +54,14 @@ def generate_output_folder_name(target, pages=1, base_output_dir="previews"):
     end_page = start_page + max(1, int(pages)) - 1
     page_tag = f"p{start_page}" if start_page == end_page else f"p{start_page}-{end_page}"
     
-    tag = "pornhub"
-    if not target or target.strip() in ["https://cn.pornhub.com/", "https://www.pornhub.com/"]:
-        tag = "pornhub"
+    tag = "eporner"
+    if not target or target.strip().rstrip("/") == "https://www.eporner.com":
+        tag = "eporner"
     elif os.path.isfile(target):
         tag = "file_links"
     else:
-        if "search=" in target:
-            m = re.search(r'search=([^&]+)', target)
+        if "search=" in target or "query=" in target:
+            m = re.search(r'(?:search|query)=([^&]+)', target)
             if m:
                 raw_kw = urllib.parse.unquote(m.group(1))
                 tag = "search_" + re.sub(r'[^\w\u4e00-\u9fa5]', '_', raw_kw)
@@ -118,7 +122,7 @@ def extract_single_page_urls(target_url):
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
         'Cookie': 'age_verified=1; platform=pc',
-        'Referer': 'https://cn.pornhub.com/'
+        'Referer': f"{urllib.parse.urlsplit(target_url).scheme}://{urllib.parse.urlsplit(target_url).netloc}/"
     }
     try:
         req = urllib.request.Request(target_url, headers=headers)
@@ -142,6 +146,21 @@ def extract_single_page_urls(target_url):
             urls = [f"https://www.pornhub.com/view_video.php?viewkey={k}" for k in unique_keys]
             print(f"[+] 從網頁主要列表中成功精確分析出 {len(urls)} 部影片！")
             return urls
+
+        eporner_paths = re.findall(
+            r'href=["\'](/(?:video-[^"\'?#]+|hd-porn/[^"\'?#]+))',
+            main_block,
+            re.IGNORECASE,
+        )
+        if eporner_paths:
+            seen = set()
+            urls = [
+                urllib.parse.urljoin("https://www.eporner.com/", path)
+                for path in eporner_paths
+                if not (path in seen or seen.add(path))
+            ]
+            print(f"[+] 從 Eporner 網頁成功分析出 {len(urls)} 部影片！")
+            return urls
     except Exception:
         pass
 
@@ -154,7 +173,7 @@ def extract_single_page_urls(target_url):
                 urls = []
                 for entry in res['entries']:
                     u = entry.get('url') or entry.get('webpage_url')
-                    if u and 'viewkey=' in u:
+                    if u and (u.startswith("http://") or u.startswith("https://")):
                         urls.append(u)
                 if urls:
                     seen = set()
@@ -166,18 +185,60 @@ def extract_single_page_urls(target_url):
 
     return [target_url]
 
+
+def extract_eporner_search_urls(keyword, pages=1, start_page=1):
+    """透過 Eporner API 擷取關鍵字或首頁的多頁影片清單。"""
+    all_urls = []
+    seen = set()
+    total_pages = max(1, int(pages))
+    query_label = keyword or "首頁熱門影片"
+
+    for idx, page_num in enumerate(range(start_page, start_page + total_pages), 1):
+        params = urllib.parse.urlencode({
+            "query": keyword,
+            "per_page": EPORNER_RESULTS_PER_PAGE,
+            "page": page_num,
+            "thumbsize": "big",
+            "order": "most-popular",
+            "lq": 1,
+            "format": "json",
+        })
+        api_url = f"{EPORNER_SEARCH_API}?{params}"
+        print(f"[*] 正在擷取 Eporner [{query_label}] 第 {idx}/{total_pages} 頁...")
+
+        try:
+            req = urllib.request.Request(api_url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+                "Referer": EPORNER_HOME,
+            })
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            print(f"[!] Eporner 第 {page_num} 頁搜尋失敗: {exc}")
+            continue
+
+        for video in payload.get("videos") or []:
+            url = video.get("url")
+            if url and url not in seen:
+                seen.add(url)
+                all_urls.append(url)
+
+    print(f"[+] Eporner 搜尋完成，共取得 {len(all_urls)} 部影片。")
+    return all_urls
+
+
 def extract_urls_from_target(target, pages=1):
     """從目標 (網頁 URL、關鍵字搜尋、檔案或單一影片 URL) 解析出所有影片 URL 列表 (支援多頁爬取)"""
     if not target:
-        target = "https://cn.pornhub.com/"
+        target = EPORNER_HOME
         
     # 判斷是否為關鍵字 (非 http/https 網址且非本地檔案)
     if not os.path.isfile(target) and not (target.startswith("http://") or target.startswith("https://")):
         keyword = target.strip()
-        encoded_kw = urllib.parse.quote_plus(keyword)
-        search_url = f"https://cn.pornhub.com/video/search?search={encoded_kw}&o=mv&t=a"
-        print(f"[*] 檢測到輸入內容為關鍵字 [{keyword}]，自動轉換為搜尋網址: {search_url}")
-        target = search_url
+        print(f"[*] 檢測到關鍵字 [{keyword}]，改用 Eporner 搜尋。")
+        return extract_eporner_search_urls(keyword, pages=pages)
     elif ("video/search" in target or "search=" in target) and ("o=" not in target or "t=" not in target):
         delimiter = "&" if "?" in target else "?"
         if "o=" not in target:
@@ -186,6 +247,19 @@ def extract_urls_from_target(target, pages=1):
         if "t=" not in target:
             target += f"{delimiter}t=a"
         print(f"[*] 搜尋網址自動補充預設排序與時間篩選參數: {target}")
+
+    parsed_target = urllib.parse.urlsplit(target)
+    hostname = (parsed_target.hostname or "").lower()
+    if hostname == "eporner.com" or hostname.endswith(".eporner.com"):
+        if re.match(r"^/(?:video-|hd-porn/|embed/)", parsed_target.path):
+            return [target]
+        if parsed_target.path.rstrip("/") in {"", "/search"}:
+            query = urllib.parse.parse_qs(parsed_target.query).get("query", [""])[0]
+            return extract_eporner_search_urls(query, pages=pages)
+        search_match = re.match(r"^/search/([^/]+)", parsed_target.path)
+        if search_match:
+            keyword = urllib.parse.unquote_plus(search_match.group(1))
+            return extract_eporner_search_urls(keyword, pages=pages)
 
     if os.path.isfile(target):
         print(f"[*] 讀取文字檔中的網址清單: {target}")
@@ -552,7 +626,7 @@ def process_single_video(video_url, args, index=1, total=1):
 
 def main():
     parser = argparse.ArgumentParser(description="影片 3x3 九宮格定時截圖工具 (9線程極速並行 & 多頁連續擷取)")
-    parser.add_argument("target", nargs="?", default="https://cn.pornhub.com/", help="影片網址、Pornhub 列表/分類/搜尋網頁 URL、關鍵字或包含網址的 txt 檔案路徑 (預設: https://cn.pornhub.com/)")
+    parser.add_argument("target", nargs="?", default=EPORNER_HOME, help="影片網址、網站列表/分類/搜尋 URL、Eporner 關鍵字或包含網址的 txt 檔案路徑")
     parser.add_argument("-p", "--pages", type=int, default=1, help="連續擷取的頁數 (預設: 1 頁)")
     parser.add_argument("-q", "--quality", default="720p", help="畫質選擇 (預設: 720p, 可選 best, 1080p, 480p 等)")
     parser.add_argument("-o", "--output", default="previews", help="輸出根目錄 (預設: previews)")
@@ -561,7 +635,7 @@ def main():
     
     args = parser.parse_args()
     
-    target_url = args.target.strip() if (args.target and args.target.strip()) else "https://cn.pornhub.com/"
+    target_url = args.target.strip() if (args.target and args.target.strip()) else EPORNER_HOME
     
     # 自動產生時間 + 關鍵字/網址標籤 + 頁碼區間的子資料夾
     sub_output_dir = generate_output_folder_name(target_url, pages=args.pages, base_output_dir=args.output)

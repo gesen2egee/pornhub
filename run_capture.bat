@@ -41,7 +41,7 @@ echo.
 set "URL="
 set /p "URL=Please paste Video, Keyword or Page URL (Press Enter to default Homepage): "
 
-if "!URL!"=="" set "URL=https://cn.pornhub.com/"
+if "!URL!"=="" set "URL=https://www.eporner.com/"
 
 set "PAGES=1"
 set /p "PAGES=Enter number of pages to scrape (Press Enter to default: 1): "
