@@ -2,6 +2,7 @@
 preview_map.json
 previews/
 videos/
+low_videos/
 downloads/
 
 # 工作任務與日誌紀錄
@@ -9,6 +10,7 @@ tasks/
 *.log
 
 # 暫存檔與快取
+temp/
 .temp_*/
 __pycache__/
 *.pyc

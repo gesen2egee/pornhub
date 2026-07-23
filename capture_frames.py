@@ -33,51 +33,45 @@ def log_event(text, output_dir="previews"):
     except Exception as e:
         print(f"[!] 寫入 Log 失敗: {e}")
 
-def clear_previews_folder_and_json(previews_dir="previews", json_path="preview_map.json"):
-    """每次開跑前自動清空之前的九宮格圖片與 preview_map.json 映射檔"""
-    if os.path.exists(previews_dir):
-        for f in os.listdir(previews_dir):
-            file_p = os.path.join(previews_dir, f)
-            if os.path.isfile(file_p) and f.endswith(".jpg"):
-                try:
-                    os.remove(file_p)
-                except Exception:
-                    pass
-        print(f"[*] 已自動清空 {previews_dir}/ 資料夾中的舊九宮格圖片。")
-    else:
-        os.makedirs(previews_dir, exist_ok=True)
-        
-    if os.path.exists(json_path):
-        try:
-            os.remove(json_path)
-            print(f"[*] 已自動重置舊的 {json_path} 映射檔。")
-        except Exception:
-            pass
+def get_start_page_from_url(url):
+    """從 URL 中解析 page=X，若無則預設為 1"""
+    if not url:
+        return 1
+    m = re.search(r'[?&]page=(\d+)', url)
+    if m:
+        return int(m.group(1))
+    return 1
 
-def update_preview_map_json(image_name, video_title, video_url, duration, root_dir="."):
-    """更新 pornhub 根目錄下的 preview_map.json 映射表檔案"""
-    json_path = os.path.abspath(os.path.join(root_dir, "preview_map.json"))
-    data = {}
-    if os.path.exists(json_path):
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-            
-    data[image_name] = {
-        "title": video_title,
-        "url": video_url,
-        "duration": duration,
-        "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
+def generate_output_folder_name(target, pages=1, base_output_dir="previews"):
+    """根據時間、搜尋關鍵字/URL 標籤及頁數區間生成動態子資料夾名稱"""
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    start_page = get_start_page_from_url(target)
+    end_page = start_page + max(1, int(pages)) - 1
+    page_tag = f"p{start_page}" if start_page == end_page else f"p{start_page}-{end_page}"
     
-    try:
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"[+] 已更新根目錄 JSON 索引 mapping: {json_path}")
-    except Exception as e:
-        print(f"[!] 更新 JSON mapping 失敗: {e}")
+    tag = "pornhub"
+    if not target or target.strip() in ["https://cn.pornhub.com/", "https://www.pornhub.com/"]:
+        tag = "pornhub"
+    elif os.path.isfile(target):
+        tag = "file_links"
+    else:
+        if "search=" in target:
+            m = re.search(r'search=([^&]+)', target)
+            if m:
+                raw_kw = urllib.parse.unquote(m.group(1))
+                tag = "search_" + re.sub(r'[^\w\u4e00-\u9fa5]', '_', raw_kw)
+        elif not target.startswith("http://") and not target.startswith("https://"):
+            tag = "search_" + re.sub(r'[^\w\u4e00-\u9fa5]', '_', target.strip())
+        elif "viewkey=" in target:
+            tag = "video"
+        else:
+            tag = "list"
+            
+    tag = tag.strip("_")
+    folder_name = f"{timestamp}_{tag}_{page_tag}"
+    full_path = os.path.join(base_output_dir, folder_name)
+    os.makedirs(full_path, exist_ok=True)
+    return full_path
 
 def format_time(seconds):
     """將秒數格式化為 00:00 或 00:00:00 格式"""
@@ -119,7 +113,10 @@ def extract_single_page_urls(target_url):
     """提取單一網頁主要列表中的影片網址"""
     print(f"[*] 正在分析網頁，擷取頁面中的影片清單: {target_url} ...")
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Cookie': 'age_verified=1; platform=pc',
         'Referer': 'https://cn.pornhub.com/'
     }
     try:
@@ -144,9 +141,10 @@ def extract_single_page_urls(target_url):
             urls = [f"https://www.pornhub.com/view_video.php?viewkey={k}" for k in unique_keys]
             print(f"[+] 從網頁主要列表中成功精確分析出 {len(urls)} 部影片！")
             return urls
-    except Exception as e:
-        print(f"[!] HTTP 網頁解析嘗試失敗: {e}，切換至 yt-dlp 解析...")
+    except Exception:
+        pass
 
+    # 若原生 HTTP 遭受 Cloudflare 防護阻擋 (403)，無縫切換至引擎深度解析
     ydl_opts = {'extract_flat': True, 'quiet': True}
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -159,9 +157,11 @@ def extract_single_page_urls(target_url):
                         urls.append(u)
                 if urls:
                     seen = set()
-                    return [u for u in urls if not (u in seen or seen.add(u))]
+                    unique_urls = [u for u in urls if not (u in seen or seen.add(u))]
+                    print(f"[+] 透過專業解析引擎成功擷取出 {len(unique_urls)} 部影片！")
+                    return unique_urls
     except Exception as e:
-        print(f"[!] yt-dlp 解析失敗: {e}")
+        print(f"[!] 網頁影片清單解析失敗: {e}")
 
     return [target_url]
 
@@ -174,9 +174,17 @@ def extract_urls_from_target(target, pages=1):
     if not os.path.isfile(target) and not (target.startswith("http://") or target.startswith("https://")):
         keyword = target.strip()
         encoded_kw = urllib.parse.quote_plus(keyword)
-        search_url = f"https://cn.pornhub.com/video/search?search={encoded_kw}"
+        search_url = f"https://cn.pornhub.com/video/search?search={encoded_kw}&o=mv&t=a"
         print(f"[*] 檢測到輸入內容為關鍵字 [{keyword}]，自動轉換為搜尋網址: {search_url}")
         target = search_url
+    elif ("video/search" in target or "search=" in target) and ("o=" not in target or "t=" not in target):
+        delimiter = "&" if "?" in target else "?"
+        if "o=" not in target:
+            target += f"{delimiter}o=mv"
+            delimiter = "&"
+        if "t=" not in target:
+            target += f"{delimiter}t=a"
+        print(f"[*] 搜尋網址自動補充預設排序與時間篩選參數: {target}")
 
     if os.path.isfile(target):
         print(f"[*] 讀取文字檔中的網址清單: {target}")
@@ -192,11 +200,13 @@ def extract_urls_from_target(target, pages=1):
     all_urls = []
     seen = set()
     total_pages = max(1, int(pages))
+    start_page = get_start_page_from_url(target)
+    end_page = start_page + total_pages - 1
     
-    for p in range(1, total_pages + 1):
+    for idx, p in enumerate(range(start_page, end_page + 1), 1):
         page_target = build_page_url(target, p)
-        if total_pages > 1:
-            print(f"\n[+] 正在連續處理第 [{p}/{total_pages}] 頁: {page_target}")
+        if total_pages > 1 or start_page > 1:
+            print(f"\n[+] 正在連續處理第 [{idx}/{total_pages}] 頁 (網頁 page={p}): {page_target}")
             
         page_urls = extract_single_page_urls(page_target)
         for u in page_urls:
@@ -204,8 +214,8 @@ def extract_urls_from_target(target, pages=1):
                 seen.add(u)
                 all_urls.append(u)
 
-    if total_pages > 1:
-        print(f"\n[+] 跨頁連續抓取完成！全數 {total_pages} 頁共計精確獲得 {len(all_urls)} 部影片！")
+    if total_pages > 1 or start_page > 1:
+        print(f"\n[+] 跨頁連續抓取完成！(處理頁碼 page={start_page}~{end_page}) 共計精確獲得 {len(all_urls)} 部影片！")
         
     return all_urls
 
@@ -440,11 +450,9 @@ def create_3x3_grid_image(image_data_list, title, duration, video_url, stream_ur
         # 繪製超大鮮綠色主字體
         draw.text((tag_x, tag_y), time_tag, fill=green_color, font=tag_font)
 
-    grid_img.save(output_file, quality=95)
-
-    # 更新根目錄 JSON 索引
-    image_basename = os.path.basename(output_file)
-    update_preview_map_json(image_basename, title, video_url, duration, root_dir=".")
+    exif = grid_img.getexif()
+    exif[0x010e] = video_url  # 將影片網址寫入 JPG 圖片 EXIF Metadata (ImageDescription)
+    grid_img.save(output_file, quality=95, exif=exif)
 
     succ_log_text = (
         f"[SUCCESS] 3x3 九宮格圖片生成成功\n"
@@ -490,7 +498,7 @@ def process_single_video(video_url, args, index=1, total=1):
     # 檔名加入 4 位數順序編號 (例如 0001-影片標題.jpg)
     final_output_file = os.path.join(args.output, f"{index:04d}-{safe_title}.jpg")
     
-    temp_dir = os.path.join(args.output, f".temp_{safe_title}")
+    temp_dir = os.path.join("temp", f".temp_{safe_title}")
     os.makedirs(temp_dir, exist_ok=True)
 
     timestamps = calculate_9_timestamps(duration)
@@ -547,10 +555,13 @@ def main():
     
     args = parser.parse_args()
     
-    # 每次開跑前自動清空 previews/ 資料夾與重置 preview_map.json
-    clear_previews_folder_and_json(previews_dir=args.output, json_path="preview_map.json")
-    
     target_url = args.target.strip() if (args.target and args.target.strip()) else "https://cn.pornhub.com/"
+    
+    # 自動產生時間 + 關鍵字/網址標籤 + 頁碼區間的子資料夾
+    sub_output_dir = generate_output_folder_name(target_url, pages=args.pages, base_output_dir=args.output)
+    args.output = sub_output_dir
+    print(f"[*] 九宮格截圖將儲存至專屬子目錄: {args.output}")
+    
     video_urls = extract_urls_from_target(target_url, pages=args.pages)
     
     if not video_urls:
@@ -563,7 +574,7 @@ def main():
         
     total_videos = len(video_urls)
     print(f"\n[START] 開始執行 3x3 九宮格批次作業 (9線程極速同時發起 | 連續 {args.pages} 頁)，共計 {total_videos} 部影片...")
-    log_event(f"[BATCH START] 啟動批次作業，目標網址: {args.target}，頁數: {args.pages}，預計處理影片數: {total_videos}", output_dir=args.output)
+    log_event(f"[BATCH START] 啟動批次作業，目標網址: {args.target}，頁數: {args.pages}，預計處理影片數: {total_videos}，輸出目錄: {args.output}", output_dir=args.output)
     
     completed_videos = 0
     skipped_videos = 0
