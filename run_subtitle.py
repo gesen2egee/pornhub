@@ -1,4 +1,4 @@
-"""使用 faster-whisper 的原生 segment/VAD 產生並翻譯字幕。"""
+"""使用可切換的 ASR backend 產生、翻譯並內嵌字幕。"""
 
 from __future__ import annotations
 
@@ -7,15 +7,13 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent
 VIDEOS = ROOT / "videos"
-WHISPER_ROOT = ROOT / "whisper"
-WHISPER_CACHE = WHISPER_ROOT / "model-cache"
 
 sys.path.insert(0, str(ROOT))
+from asr_backends import create_backend, resolve_backend  # noqa: E402
 from translate_srt_openrouter import (  # noqa: E402
     DEFAULT_MODEL,
     format_srt,
@@ -50,56 +48,6 @@ def _find_videos() -> list[Path]:
             seen_stems.add(stem_key)
             sources.append(video)
     return sources
-
-
-def _srt_time(seconds: float) -> str:
-    milliseconds = max(0, round(float(seconds) * 1000))
-    hours, remainder = divmod(milliseconds, 3_600_000)
-    minutes, remainder = divmod(remainder, 60_000)
-    seconds_part, millis = divmod(remainder, 1000)
-    return f"{hours:02d}:{minutes:02d}:{seconds_part:02d},{millis:03d}"
-
-
-def _load_whisper_model():
-    from faster_whisper import WhisperModel
-
-    model_name = os.getenv("WHISPER_MODEL", "large-v3")
-    device = os.getenv("WHISPER_DEVICE", "cuda")
-    compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "float16")
-    print(
-        f"載入 Whisper：{model_name}，device={device}，compute_type={compute_type}",
-        flush=True,
-    )
-    return WhisperModel(
-        model_name,
-        device=device,
-        compute_type=compute_type,
-        download_root=str(WHISPER_CACHE),
-    )
-
-
-def _transcribe_segments(model, video: Path) -> tuple[list[dict[str, Any]], str]:
-    language = os.getenv("WHISPER_LANGUAGE") or None
-    options: dict[str, Any] = {
-        "beam_size": 5,
-        "vad_filter": True,
-    }
-    if language:
-        options["language"] = language
-    segments, info = model.transcribe(str(video), **options)
-    cues: list[dict[str, Any]] = []
-    for index, segment in enumerate(segments, start=1):
-        text = segment.text.strip()
-        if not text:
-            continue
-        cues.append(
-            {
-                "id": index,
-                "time": f"{_srt_time(segment.start)} --> {_srt_time(segment.end)}",
-                "text": text,
-            }
-        )
-    return cues, getattr(info, "language", "unknown")
 
 
 def _has_soft_subtitle(video: Path) -> bool:
@@ -206,7 +154,7 @@ def _embed_soft_subtitle(
 
 def process_video(
     video: Path,
-    model,
+    backend,
     api_key: str | None,
     model_name: str,
     force: bool,
@@ -215,14 +163,17 @@ def process_video(
     output_video = video
     print(f"\n處理：{video.name}", flush=True)
     if output_srt.exists() and not force:
-        print(f"  1/3 同名 SRT 已存在，略過 Whisper 與翻譯：{output_srt}", flush=True)
+        print(
+            f"  1/3 同名 SRT 已存在，略過 ASR 與翻譯：{output_srt}",
+            flush=True,
+        )
     else:
-        if model is None or not api_key:
-            raise RuntimeError("缺少 Whisper 模型或 OpenRouter API key。")
-        print("  1/3 faster-whisper VAD 與自然 segment 辨識", flush=True)
-        cues, language = _transcribe_segments(model, video)
+        if backend is None or not api_key:
+            raise RuntimeError("缺少 ASR backend 或 OpenRouter API key。")
+        print(f"  1/3 {backend.display_name} 辨識", flush=True)
+        cues, language = backend.transcribe(video)
         if not cues:
-            raise RuntimeError("Whisper 沒有產生有效字幕段落。")
+            raise RuntimeError("ASR 沒有產生有效字幕段落。")
         print(f"  語言：{language}；字幕段落：{len(cues)}", flush=True)
         print("  2/3 OpenRouter 翻譯", flush=True)
         translated = translate_cues(cues, api_key, model_name)
@@ -244,6 +195,12 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=0, help="只處理前 N 部影片，0 表示全部")
     parser.add_argument("--dry-run", action="store_true", help="只列出待處理影片，不呼叫模型/API")
     args = parser.parse_args()
+
+    try:
+        backend_name = resolve_backend()
+    except ValueError as exc:
+        print(f"錯誤：{exc}", file=sys.stderr)
+        return 2
 
     videos = _find_videos()
     if not videos:
@@ -284,12 +241,14 @@ def main() -> int:
         print("錯誤：找不到 OPENROUTER_API_KEY 環境變數。", file=sys.stderr)
         return 2
 
-    model = _load_whisper_model() if needs_asr else None
+    backend = create_backend().load() if needs_asr else None
+    if needs_asr:
+        print(f"使用 ASR backend：{backend_name}", flush=True)
     model_name = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
     failures = 0
     for video in pending:
         try:
-            process_video(video, model, api_key, model_name, args.force)
+            process_video(video, backend, api_key, model_name, args.force)
         except Exception as exc:
             failures += 1
             print(f"失敗：{video.name}：{exc}", file=sys.stderr, flush=True)
