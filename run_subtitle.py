@@ -1,31 +1,23 @@
-"""從 low_videos 辨識字幕，翻譯後只輸出同名 SRT 到 videos。"""
+"""使用 faster-whisper 的原生 segment/VAD 產生並翻譯字幕。"""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
-import shutil
-import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent
 VIDEOS = ROOT / "videos"
-TEMP_AUDIO = ROOT / "temp" / "subtitle" / "audio"
-QWEN_ROOT = ROOT / "qwen-asr"
-QWEN_CACHE = QWEN_ROOT / "hf-cache"
+WHISPER_ROOT = ROOT / "whisper"
+WHISPER_CACHE = WHISPER_ROOT / "model-cache"
 
-os.environ.setdefault("HF_HOME", str(QWEN_CACHE))
-os.environ.setdefault("HF_HUB_CACHE", str(QWEN_CACHE / "hub"))
-sys.path.insert(0, str(QWEN_ROOT))
-
-from transcribe import _make_srt, _normalise_item  # noqa: E402
+sys.path.insert(0, str(ROOT))
 from translate_srt_openrouter import (  # noqa: E402
     DEFAULT_MODEL,
     format_srt,
-    parse_srt,
     translate_cues,
 )
 
@@ -44,15 +36,13 @@ def _find_videos() -> list[Path]:
         raise FileNotFoundError(
             f"找不到輸入資料夾，已檢查：{', '.join(map(str, candidates))}"
         )
+
     sources: list[Path] = []
     seen_stems: set[str] = set()
     for directory in existing_dirs:
-        videos = sorted(
-            path
-            for path in directory.iterdir()
-            if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
-        )
-        for video in videos:
+        for video in sorted(directory.iterdir()):
+            if not video.is_file() or video.suffix.lower() not in VIDEO_EXTENSIONS:
+                continue
             stem_key = video.stem.casefold()
             if stem_key in seen_stems:
                 continue
@@ -61,86 +51,71 @@ def _find_videos() -> list[Path]:
     return sources
 
 
-def _extract_audio(video: Path, audio: Path) -> None:
-    audio.parent.mkdir(parents=True, exist_ok=True)
-    command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        str(video),
-        "-map",
-        "0:a:0",
-        "-vn",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-c:a",
-        "pcm_s16le",
-        str(audio),
-    ]
-    subprocess.run(command, check=True)
+def _srt_time(seconds: float) -> str:
+    milliseconds = max(0, round(float(seconds) * 1000))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds_part, millis = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{seconds_part:02d},{millis:03d}"
 
 
-def _load_asr_model():
-    import torch
-    from qwen_asr import Qwen3ASRModel
+def _load_whisper_model():
+    from faster_whisper import WhisperModel
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("找不到 CUDA GPU，無法使用 Qwen3-ASR。")
-    print(f"使用 GPU：{torch.cuda.get_device_name(0)}", flush=True)
-    print("載入 Qwen3-ASR 與 ForcedAligner（只載入一次）...", flush=True)
-    return Qwen3ASRModel.from_pretrained(
-        "Qwen/Qwen3-ASR-1.7B",
-        dtype=torch.float16,
-        device_map="cuda:0",
-        max_inference_batch_size=1,
-        max_new_tokens=2048,
-        forced_aligner="Qwen/Qwen3-ForcedAligner-0.6B",
-        forced_aligner_kwargs={
-            "dtype": torch.float16,
-            "device_map": "cuda:0",
-        },
+    model_name = os.getenv("WHISPER_MODEL", "large-v3")
+    device = os.getenv("WHISPER_DEVICE", "cuda")
+    compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "float16")
+    print(
+        f"載入 Whisper：{model_name}，device={device}，compute_type={compute_type}",
+        flush=True,
+    )
+    return WhisperModel(
+        model_name,
+        device=device,
+        compute_type=compute_type,
+        download_root=str(WHISPER_CACHE),
     )
 
 
-def _audio_name(video: Path) -> str:
-    digest = hashlib.sha1(str(video).encode("utf-8")).hexdigest()[:12]
-    return f"{video.stem}_{digest}.wav"
+def _transcribe_segments(model, video: Path) -> tuple[list[dict[str, Any]], str]:
+    language = os.getenv("WHISPER_LANGUAGE") or None
+    options: dict[str, Any] = {
+        "beam_size": 5,
+        "vad_filter": True,
+    }
+    if language:
+        options["language"] = language
+    segments, info = model.transcribe(str(video), **options)
+    cues: list[dict[str, Any]] = []
+    for index, segment in enumerate(segments, start=1):
+        text = segment.text.strip()
+        if not text:
+            continue
+        cues.append(
+            {
+                "id": index,
+                "time": f"{_srt_time(segment.start)} --> {_srt_time(segment.end)}",
+                "text": text,
+            }
+        )
+    return cues, getattr(info, "language", "unknown")
 
 
 def process_video(video: Path, model, api_key: str, model_name: str) -> Path:
     output_srt = VIDEOS / f"{video.stem}.srt"
-    audio = TEMP_AUDIO / _audio_name(video)
-    try:
-        print(f"\n處理：{video.name}", flush=True)
-        print("  1/3 抽取音訊", flush=True)
-        _extract_audio(video, audio)
-        print("  2/3 Qwen3-ASR 辨識與時間對齊", flush=True)
-        result = model.transcribe(
-            audio=str(audio),
-            language=None,
-            return_time_stamps=True,
-        )[0]
-        items = [_normalise_item(item) for item in (result.time_stamps or [])]
-        raw_srt = _make_srt(items)
-        cues = parse_srt(raw_srt)
-        if not cues:
-            raise RuntimeError("ASR 沒有產生有效字幕段落。")
-        print(f"  語言：{result.language}；字幕段落：{len(cues)}", flush=True)
-        print("  3/3 OpenRouter Grok 4.5 翻譯", flush=True)
-        translated = translate_cues(cues, api_key, model_name)
-        temporary_output = output_srt.with_name(output_srt.name + ".tmp")
-        temporary_output.write_text(format_srt(translated), encoding="utf-8-sig")
-        temporary_output.replace(output_srt)
-        print(f"完成：{output_srt}", flush=True)
-        return output_srt
-    finally:
-        if audio.exists():
-            audio.unlink()
+    print(f"\n處理：{video.name}", flush=True)
+    print("  1/2 faster-whisper VAD 與自然 segment 辨識", flush=True)
+    cues, language = _transcribe_segments(model, video)
+    if not cues:
+        raise RuntimeError("Whisper 沒有產生有效字幕段落。")
+    print(f"  語言：{language}；字幕段落：{len(cues)}", flush=True)
+    print("  2/2 OpenRouter 翻譯", flush=True)
+    translated = translate_cues(cues, api_key, model_name)
+    temporary_output = output_srt.with_name(output_srt.name + ".tmp")
+    temporary_output.write_text(format_srt(translated), encoding="utf-8-sig")
+    temporary_output.replace(output_srt)
+    print(f"完成：{output_srt}", flush=True)
+    return output_srt
 
 
 def main() -> int:
@@ -152,7 +127,7 @@ def main() -> int:
 
     videos = _find_videos()
     if not videos:
-        print("low_videos、low_video、videos 都沒有可處理的影片（支援 mp4/mkv/mov/webm）。")
+        print("low_videos、low_video、videos 都沒有可處理的影片。")
         return 0 if args.dry_run else 1
     pending = [
         video
@@ -178,12 +153,8 @@ def main() -> int:
     if not api_key:
         print("錯誤：找不到 OPENROUTER_API_KEY 環境變數。", file=sys.stderr)
         return 2
-    if shutil.which("ffmpeg") is None:
-        print("錯誤：找不到 FFmpeg。", file=sys.stderr)
-        return 2
 
-    VIDEOS.mkdir(parents=True, exist_ok=True)
-    model = _load_asr_model()
+    model = _load_whisper_model()
     model_name = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
     failures = 0
     for video in pending:
