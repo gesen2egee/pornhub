@@ -104,7 +104,7 @@ MOSS 可選設定：
 - `MOSS_MODEL`：預設 `openmoss/MOSS-Transcribe-Diarize`。
 - `MOSS_DEVICE`：預設 `cuda:0`。
 - `MOSS_DTYPE`：預設 `bfloat16`，也支援 `float16`。
-- `MOSS_MAX_NEW_TOKENS`：預設 `65536`。
+- `MOSS_MAX_NEW_TOKENS`：一般流程預設 `65536`；`--low-only` 的 30 秒短片批次預設 `1024`，避免無語音片段長時間生成。
 - `MOSS_HOTWORDS`：逗號分隔的專有名詞提示。
 
 ---

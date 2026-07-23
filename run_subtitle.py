@@ -299,6 +299,9 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="只列出待處理影片，不呼叫模型/API")
     args = parser.parse_args()
 
+    if args.low_only:
+        os.environ.setdefault("MOSS_MAX_NEW_TOKENS", "1024")
+
     try:
         backend_name = resolve_backend()
     except ValueError as exc:
