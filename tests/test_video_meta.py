@@ -49,6 +49,19 @@ def test_base_comment_can_restore_sections_after_remux(monkeypatch):
     assert "[S01] 翻譯" in sections["TRANSLATED_SRT"]
 
 
+def test_empty_subtitle_sections_are_still_present():
+    merged = video_meta.merge_comment(
+        None,
+        original_srt="",
+        translated_srt="",
+    )
+    _, sections = video_meta.parse_sections(merged)
+    assert "ORIGINAL_SRT" in sections
+    assert "TRANSLATED_SRT" in sections
+    assert sections["ORIGINAL_SRT"] == ""
+    assert sections["TRANSLATED_SRT"] == ""
+
+
 def test_legacy_grid_round_trip(tmp_path):
     path = tmp_path / "grid.jpg"
     image = Image.new("RGB", (16, 16), "black")

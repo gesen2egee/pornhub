@@ -11,6 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 VIDEOS = ROOT / "videos"
+SUBTITLE_TEMP = ROOT / "tasks" / "subtitle-temp"
 
 sys.path.insert(0, str(ROOT))
 from asr_backends import create_backend  # noqa: E402
@@ -64,54 +65,25 @@ def _find_videos(low_only: bool = False) -> list[Path]:
     return sources
 
 
-def _has_soft_subtitle(video: Path) -> bool:
-    ffprobe = os.getenv("FFPROBE_EXE", "ffprobe")
-    command = [
-        ffprobe,
-        "-v",
-        "error",
-        "-select_streams",
-        "s:0",
-        "-show_entries",
-        "stream=codec_name",
-        "-of",
-        "csv=p=0",
-        video.name,
-    ]
+def _read_video_meta(video: Path) -> dict:
     try:
-        result = subprocess.run(
-            command,
-            check=False,
-            cwd=str(video.parent),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-    except FileNotFoundError:
-        return False
-    return result.returncode == 0 and bool(result.stdout.strip())
+        return video_meta.read_mp4_meta(video)
+    except Exception:
+        return {}
 
 
 def _subtitle_path(video: Path) -> Path:
     return video.with_suffix(".srt")
 
 
-def _uses_hard_subtitle(video: Path) -> bool:
-    video_parent = video.parent.resolve()
-    return any(
-        directory.exists() and directory.resolve() == video_parent
-        for directory in _low_video_directories()
-    )
+def _has_embedded_subtitle_meta(video: Path) -> bool:
+    """空的 TRANSLATED_SRT 區段也代表字幕流程已完成。"""
+    return bool(_read_video_meta(video).get("translated_srt_present"))
 
 
-def _has_current_hard_subtitle(video: Path) -> bool:
-    subtitle = _subtitle_path(video)
-    return (
-        subtitle.exists()
-        and video.exists()
-        and video.stat().st_mtime_ns >= subtitle.stat().st_mtime_ns
-    )
+def _subtitle_complete(video: Path) -> bool:
+    """未來以影片 Meta 為主；舊同名 SRT 直接視為已完成。"""
+    return _subtitle_path(video).exists() or _has_embedded_subtitle_meta(video)
 
 
 def _ffmpeg_filter_value(value: str) -> str:
@@ -129,7 +101,7 @@ def _burn_hard_subtitle(
     temporary_output = output_video.with_name(
         f".{output_video.stem}.hardsub.tmp{output_video.suffix}"
     )
-    subtitle_name = _ffmpeg_filter_value(subtitle.name)
+    subtitle_name = _ffmpeg_filter_value(str(subtitle.resolve()))
     subtitle_filter = (
         f"subtitles=filename='{subtitle_name}':"
         "force_style='FontName=Microsoft JhengHei,FontSize=18,"
@@ -191,81 +163,6 @@ def _burn_hard_subtitle(
     return output_video
 
 
-def _embed_soft_subtitle(
-    video: Path,
-    subtitle: Path,
-    output_video: Path,
-    force: bool,
-    mark_audio_enhanced: bool = False,
-) -> Path:
-    ffmpeg = os.getenv("FFMPEG_EXE", "ffmpeg")
-    temporary_output = output_video.with_name(
-        f".{output_video.stem}.tmp{output_video.suffix}"
-    )
-    is_mp4_container = output_video.suffix.lower() in {".mp4", ".mov"}
-    subtitle_codec = "mov_text" if is_mp4_container else "srt"
-    command = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        video.name,
-        "-f",
-        "srt",
-        "-i",
-        subtitle.name,
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a?",
-        "-map",
-        "1:0",
-        "-map_metadata",
-        "0",
-        "-c:v",
-        "copy",
-        "-c:a",
-        "copy",
-        "-c:s",
-        subtitle_codec,
-        "-disposition:s:0",
-        "default",
-        "-metadata:s:s:0",
-        "language=zho",
-        "-metadata:s:s:0",
-        "title=繁體中文字幕",
-        temporary_output.name,
-    ]
-    if is_mp4_container:
-        command[-1:-1] = ["-movflags", "+faststart"]
-    if mark_audio_enhanced:
-        command[-1:-1] = ["-metadata", f"comment={ENHANCE_MARKER}"]
-    print("  3/3 ffmpeg 軟字幕內嵌（不重新編碼）", flush=True)
-    try:
-        result = subprocess.run(
-            command,
-            check=False,
-            cwd=str(video.parent),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            "找不到 ffmpeg。請先把 ffmpeg 加入 PATH，或設定 FFMPEG_EXE。"
-        ) from exc
-
-    if result.returncode != 0:
-        details = (result.stderr or result.stdout).strip()
-        raise RuntimeError(f"ffmpeg 封裝失敗：{details[-1000:]}")
-    temporary_output.replace(output_video)
-    print(f"完成並覆蓋原始影片：{output_video}", flush=True)
-    return output_video
-
-
 def process_video(
     video: Path,
     backend,
@@ -275,70 +172,75 @@ def process_video(
     media_input: Path | None = None,
     audio_enhanced: bool = False,
 ) -> Path:
-    output_srt = _subtitle_path(video)
+    legacy_srt = _subtitle_path(video)
     output_video = video
     media_input = video if media_input is None else media_input
-    existing_meta: dict = {}
-    try:
-        existing_meta = video_meta.read_mp4_meta(video)
-    except Exception:
-        pass
+    existing_meta = _read_video_meta(video)
     original_srt: str | None = existing_meta.get("original_srt")
     translated_srt: str | None = None
+    burn_srt: Path | None = None
+    remove_burn_srt = False
     print(f"\n處理：{video.name}", flush=True)
-    if output_srt.exists() and not force:
+    if existing_meta.get("translated_srt_present") and not force:
+        print("  影片內已有字幕 Meta，直接略過", flush=True)
+        return video
+    if legacy_srt.exists() and not force:
         print(
-            f"  1/3 同名 SRT 已存在，略過 ASR 與翻譯：{output_srt}",
+            f"  1/3 使用舊同名 SRT：{legacy_srt}",
             flush=True,
         )
-        translated_srt = output_srt.read_text(encoding="utf-8-sig")
+        translated_srt = legacy_srt.read_text(encoding="utf-8-sig")
+        burn_srt = legacy_srt
     else:
         if backend is None or not api_key:
             raise RuntimeError("缺少 ASR backend 或 OpenRouter API key。")
         print(f"  1/3 {backend.display_name} 辨識", flush=True)
         cues, language = backend.transcribe(media_input)
-        if not cues:
-            raise RuntimeError("ASR 沒有產生有效字幕段落。")
         print(f"  語言：{language}；字幕段落：{len(cues)}", flush=True)
-        print("  2/3 OpenRouter 翻譯", flush=True)
         original_srt = format_srt(cues)
-        translated = translate_cues(cues, api_key, model_name)
-        translated_srt = format_srt(translated)
-        temporary_output = output_srt.with_name(output_srt.name + ".tmp")
-        temporary_output.write_text(translated_srt, encoding="utf-8-sig")
-        temporary_output.replace(output_srt)
-        print(f"完成：{output_srt}", flush=True)
+        if cues:
+            print("  2/3 OpenRouter 翻譯", flush=True)
+            translated = translate_cues(cues, api_key, model_name)
+            translated_srt = format_srt(translated)
+            SUBTITLE_TEMP.mkdir(parents=True, exist_ok=True)
+            burn_srt = (
+                SUBTITLE_TEMP
+                / f"{video.stem[:48]}-{abs(hash(video.resolve())):x}.srt"
+            )
+            burn_srt.write_text(translated_srt, encoding="utf-8-sig")
+            remove_burn_srt = True
+        else:
+            translated_srt = ""
+            print("  2/3 無字幕，將空字幕狀態寫入影片 Meta", flush=True)
 
-    if _uses_hard_subtitle(video):
-        result = _burn_hard_subtitle(
-            media_input,
-            output_srt,
-            output_video,
-            force,
-            mark_audio_enhanced=audio_enhanced,
-        )
-    else:
-        result = _embed_soft_subtitle(
-            media_input,
-            output_srt,
-            output_video,
-            force,
-            mark_audio_enhanced=audio_enhanced,
-        )
     try:
-        base_comment = existing_meta.get("raw_comment") or ""
-        if audio_enhanced and ENHANCE_MARKER not in base_comment:
-            base_comment = f"{ENHANCE_MARKER}\n{base_comment}".rstrip()
-        video_meta.merge_write_mp4_meta(
-            result,
-            web_meta=existing_meta.get("web_meta"),
-            original_srt=original_srt,
-            translated_srt=translated_srt,
-            base_comment=base_comment,
-        )
-        print("  [META] 已寫入 MOSS 原文與繁中字幕", flush=True)
-    except Exception as exc:
-        print(f"  [!] 寫入字幕 metadata 失敗：{exc}", flush=True)
+        if burn_srt is not None and translated_srt and translated_srt.strip():
+            result = _burn_hard_subtitle(
+                media_input,
+                burn_srt,
+                output_video,
+                force,
+                mark_audio_enhanced=audio_enhanced,
+            )
+        else:
+            result = output_video
+        try:
+            base_comment = existing_meta.get("raw_comment") or ""
+            if audio_enhanced and ENHANCE_MARKER not in base_comment:
+                base_comment = f"{ENHANCE_MARKER}\n{base_comment}".rstrip()
+            video_meta.merge_write_mp4_meta(
+                result,
+                web_meta=existing_meta.get("web_meta"),
+                original_srt=original_srt,
+                translated_srt=translated_srt,
+                base_comment=base_comment,
+            )
+            print("  [META] 已寫入 MOSS 原文與繁中字幕", flush=True)
+        except Exception as exc:
+            print(f"  [!] 寫入字幕 metadata 失敗：{exc}", flush=True)
+    finally:
+        if remove_burn_srt and burn_srt is not None:
+            burn_srt.unlink(missing_ok=True)
     return result
 
 
@@ -347,7 +249,7 @@ def main() -> int:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="重新產生 SRT，並重新製作字幕影片",
+        help="重新產生字幕 Meta，並重新製作硬字幕影片",
     )
     parser.add_argument("--limit", type=int, default=0, help="只處理前 N 部影片，0 表示全部")
     parser.add_argument(
@@ -368,15 +270,7 @@ def main() -> int:
     pending = [
         video
         for video in videos
-        if (
-            args.force
-            or not _subtitle_path(video).exists()
-            or (
-                not _has_current_hard_subtitle(video)
-                if _uses_hard_subtitle(video)
-                else not _has_soft_subtitle(video)
-            )
-        )
+        if args.force or not _subtitle_complete(video)
     ]
     skipped = len(videos) - len(pending)
     if args.limit > 0:
@@ -387,19 +281,13 @@ def main() -> int:
     )
     if args.dry_run:
         for video in pending:
-            subtitle_mode = "硬字幕" if _uses_hard_subtitle(video) else "軟字幕"
-            print(
-                f"{video} -> {_subtitle_path(video)} + "
-                f"{subtitle_mode}覆蓋原始影片"
-            )
+            print(f"{video} -> 硬字幕覆蓋原始影片 + 影片內字幕 Meta")
         return 0
     if not pending:
         print("沒有需要處理的影片。")
         return 0
 
-    needs_asr = args.force or any(
-        not _subtitle_path(video).exists() for video in pending
-    )
+    needs_asr = bool(pending)
     api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY")
     if needs_asr and not api_key:
         print("錯誤：找不到 OPENROUTER_API_KEY 環境變數。", file=sys.stderr)

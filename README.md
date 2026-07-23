@@ -88,9 +88,9 @@ PowerShell：
 .\run_subtitle.bat --force --limit 1
 ```
 
-字幕完成後由 OpenRouter 翻譯為繁體中文並輸出同名 SRT；`low_videos/` 會由 FFmpeg 把繁中字幕直接燒入影片，一般 `videos/` 則維持不重新編碼的軟字幕。只處理全部低畫質影片可執行：
+字幕完成後不再保留獨立 SRT；MOSS 原文與繁中翻譯完整存入影片 Meta，`low_videos/` 與一般 `videos/` 都由 FFmpeg 將繁中字幕直接燒入畫面。燒錄所需 SRT 只會短暫建立於已忽略的 `tasks/subtitle-temp/`，成功或失敗後都會清理。舊資料若已有同名 SRT，或影片內已有 `TRANSLATED_SRT`（包含空字幕區段），未來執行會直接略過。只處理全部低畫質影片可執行：
 
-低畫質硬字幕預設會比畫面底部提高約半個字體高度，降低被播放器進度條遮住的機會。
+硬字幕預設會比畫面底部提高約半個字體高度，降低被播放器進度條遮住的機會。
 
 ```bat
 run_subtitle.bat --low-only

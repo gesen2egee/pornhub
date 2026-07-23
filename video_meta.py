@@ -121,6 +121,8 @@ def read_mp4_meta(path: str | Path) -> dict[str, Any]:
         "web_meta": _web_from_sections(sections),
         "original_srt": sections.get(ORIGINAL_SECTION),
         "translated_srt": sections.get(TRANSLATED_SECTION),
+        "original_srt_present": ORIGINAL_SECTION in sections,
+        "translated_srt_present": TRANSLATED_SECTION in sections,
         "raw_comment": raw,
     }
 
