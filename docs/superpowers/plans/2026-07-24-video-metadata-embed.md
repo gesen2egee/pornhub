@@ -640,7 +640,10 @@ git commit -m "Add video_meta CLI and document MP4 metadata embed"
 
 ## Implementation notes (for agents)
 
-1. **Full SRT format only** for subtitle meta: use `format_srt` / file contents — never strip to plain lines.
+1. **Full original-format SRT only** for subtitle meta:
+   - `ORIGINAL_SRT` = ASR 原本輸出（`format_srt(original_cues)`），結構不改。
+   - `TRANSLATED_SRT` = **只換翻譯版本**（同序號／時間軸／`[Sxx]`，只換正文）；磁碟同名 `.srt` 與此相同。
+   - Never strip to plain text lines.
 2. **Do not touch** `capture_frames.py` EXIF URL write or `get_video_url_from_image` behavior.
 3. **Meta failure never fails** download or subtitle main result.
 4. **Eporner:** no HTML scrape; missing fields null/`[]`.

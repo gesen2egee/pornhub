@@ -11,12 +11,13 @@
 ### 目標
 
 1. 每部下載成功的 MP4 都帶有**可再讀取**的網頁 meta（標題、上傳者、標籤、分類、views…）。
-2. 字幕完成後，同一支 MP4 的 metadata 內另存：
-   - **原文 SRT**（MOSS，含 `[S01]` / `[S02]` …與完整時間軸）
-   - **翻譯 SRT**（繁中，**同樣保留** `[S01]` / `[S02]` …與**相同** cue 時間軸）
-3. 影片層級時間一併寫入 WEB_META：`duration`、`duration_string`、`upload_date`、`timestamp`、`meta_written_at`。
-4. Meta 用途僅為**封存與之後程式讀回**，不當播放器字幕軌。
-5. **不影響**現有圖片 EXIF → `run_download` 下載流程。
+2. 字幕完成後，同一支 MP4 的 metadata 內另存**兩份完整原格式 SRT**（序號 + 時間軸 + 正文，不得壓成純文字）：
+   - **ORIGINAL_SRT**：ASR 原本輸出（含 `[S01]` / `[S02]` …與完整時間軸），**一字不改結構**。
+   - **TRANSLATED_SRT**：**只換翻譯版本**——與原文相同序號／時間軸／`[Sxx]` 前綴，**僅 cue 正文換成繁中譯文**。
+3. 磁碟同名 `.srt`（給軟／硬字幕用）= **只換翻譯版本**（與 TRANSLATED_SRT 一致）。
+4. 影片層級時間一併寫入 WEB_META：`duration`、`duration_string`、`upload_date`、`timestamp`、`meta_written_at`。
+5. Meta 用途僅為**封存與之後程式讀回**，不當播放器字幕軌。
+6. **不影響**現有圖片 EXIF → `run_download` 下載流程。
 
 ### 非目標
 
@@ -88,9 +89,9 @@
 ===WEB_META_V1===
 {...單行或緊湊 JSON...}
 ===ORIGINAL_SRT===
-（完整 SRT：序號 + 時間軸 + 正文，含 [S01] 等）
+（ASR 原本完整 SRT 輸出格式，未改結構）
 ===TRANSLATED_SRT===
-（完整 SRT：序號 + **相同時間軸** + 譯文，含 [S01] 等）
+（只換翻譯版本：同格式，僅正文為繁中）
 ```
 
 規則：
@@ -100,7 +101,8 @@
 3. 下載階段：只寫／更新 `WEB_META_V1`；若 comment 已有字幕區段則保留。
 4. 字幕階段：更新 `ORIGINAL_SRT` 與 `TRANSLATED_SRT`；保留 `WEB_META_V1`。
 5. 若某階段尚未有資料，可省略該區段（讀取時當空）。
-6. **時間必存（見 §5）：** 影片層級時間在 WEB_META；字幕 cue 時間軸在完整 SRT 內，翻譯不得改動。
+6. **兩份字幕都必須是完整原格式 SRT**（`format_srt`／檔案原文），禁止只存純譯句列表。
+7. **時間必存（見 §5）：** 影片層級時間在 WEB_META；字幕 cue 時間軸在完整 SRT 內，翻譯不得改動。
 
 ### 4.3 `WEB_META_V1` 欄位（schema）
 
@@ -312,4 +314,5 @@ python video_meta.py export path.mp4 --out-dir dir/
 | EP meta | yt-dlp only | 第一版夠用；缺欄 null |
 | 發言者 | 原文＋翻譯都保留 | 使用者明確要求「前後都要保留 [S01]」 |
 | 時間 | 影片層級 + cue 時間軸都存 | 使用者要求「時間也要」；翻譯不得改 SRT 時間行 |
+| 雙份 SRT | 原本輸出 + 只換翻譯版本 | 結構／時間／`[Sxx]` 相同，只換正文；磁碟 `.srt` = 翻譯版 |
 | meta 失敗 | 不阻斷主流程 | 下載／字幕優先 |
