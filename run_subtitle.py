@@ -229,8 +229,16 @@ def process_video(
         original_srt = format_srt(cues)
         if cues:
             print("  2/3 OpenRouter 翻譯", flush=True)
-            translated = translate_cues(cues, api_key, model_name)
-            translated_srt = format_srt(translated)
+            try:
+                translated = translate_cues(cues, api_key, model_name)
+                translated_srt = format_srt(translated)
+            except Exception as exc:
+                translated_srt = ""
+                print(
+                    "  [!] 翻譯失敗，保留未硬編碼影片；"
+                    f"翻譯 Meta 寫空並視為完成：{exc}",
+                    flush=True,
+                )
         else:
             translated_srt = ""
             print("  2/3 無字幕，將空字幕狀態寫入影片 Meta", flush=True)

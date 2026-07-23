@@ -1,7 +1,5 @@
 from pathlib import Path
 
-import pytest
-
 import run_subtitle
 
 
@@ -95,6 +93,25 @@ def test_empty_embedded_subtitle_meta_is_considered_complete(tmp_path, monkeypat
     assert run_subtitle._subtitle_complete(video)
 
 
+def test_failed_translation_empty_meta_is_considered_complete(
+    tmp_path,
+    monkeypatch,
+):
+    video = tmp_path / "sample.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(
+        run_subtitle,
+        "_read_video_meta",
+        lambda path: {
+            "original_srt": "1\n00:00:00,000 --> 00:00:01,000\nHi\n",
+            "original_srt_present": True,
+            "translated_srt": "",
+            "translated_srt_present": True,
+        },
+    )
+    assert run_subtitle._subtitle_complete(video)
+
+
 def test_burn_srt_strips_labels_but_keeps_srt_structure():
     content = (
         "1\n00:00:00,000 --> 00:00:01,000\n[S01] 第一行\n"
@@ -130,7 +147,10 @@ def test_process_video_stores_empty_subtitle_meta(tmp_path, monkeypatch):
     assert meta_calls[0]["translated_srt"] == ""
 
 
-def test_translation_failure_never_burns_hard_subtitle(tmp_path, monkeypatch):
+def test_translation_failure_is_complete_without_hard_subtitle(
+    tmp_path,
+    monkeypatch,
+):
     video = tmp_path / "sample.mp4"
     video.write_bytes(b"video")
     backend = FakeBackend(
@@ -143,6 +163,7 @@ def test_translation_failure_never_burns_hard_subtitle(tmp_path, monkeypatch):
         ]
     )
     burn_calls = []
+    meta_calls = []
     monkeypatch.setattr(
         run_subtitle,
         "translate_cues",
@@ -153,11 +174,19 @@ def test_translation_failure_never_burns_hard_subtitle(tmp_path, monkeypatch):
         "_burn_hard_subtitle",
         lambda *args, **kwargs: burn_calls.append(args),
     )
+    monkeypatch.setattr(
+        run_subtitle.video_meta,
+        "merge_write_mp4_meta",
+        lambda path, **kwargs: meta_calls.append(kwargs),
+    )
 
-    with pytest.raises(RuntimeError, match="translation failed"):
-        run_subtitle.process_video(video, backend, "key", "model", True)
+    result = run_subtitle.process_video(video, backend, "key", "model", True)
 
+    assert result == video
     assert burn_calls == []
+    assert "[S01]" not in meta_calls[0]["original_srt"]
+    assert meta_calls[0]["original_srt"].rstrip().endswith("Hi")
+    assert meta_calls[0]["translated_srt"] == ""
 
 
 def test_process_video_uses_enhanced_media_for_asr_and_packaging(
