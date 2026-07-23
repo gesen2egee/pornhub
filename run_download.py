@@ -50,15 +50,32 @@ def direct_fetch_pornhub_mp4_stream(webpage_url):
 
 from PIL import Image
 
+
+def is_http_video_url(url):
+    """接受可交由 yt-dlp 處理的完整 HTTP/HTTPS 網址。"""
+    if not isinstance(url, str):
+        return False
+    parsed = urllib.parse.urlparse(url.strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+
+
+def is_pornhub_url(url):
+    """判斷網址是否適用 Pornhub 專用的原生備用解析器。"""
+    if not is_http_video_url(url):
+        return False
+    hostname = (urllib.parse.urlparse(url.strip()).hostname or "").lower()
+    return hostname == "pornhub.com" or hostname.endswith(".pornhub.com")
+
+
 def get_video_url_from_image(jpg_path):
     """直接從九宮格 JPG 圖片檔案的 EXIF Metadata (ImageDescription 0x010e) 中讀取影片 URL"""
     try:
         with Image.open(jpg_path) as img:
             exif = img.getexif()
             url = exif.get(0x010e)
-            if url and isinstance(url, str) and ("pornhub.com" in url or "viewkey=" in url):
+            if is_http_video_url(url):
                 return url.strip()
-    except Exception as e:
+    except Exception:
         pass
     return None
 
@@ -171,8 +188,12 @@ def process_single_directory(target_dir, is_low_quality):
                     print("=" * 65)
                     prompted_upgrade = True
             
-            print(f"   [FALLBACK] 嘗試啟動原生備用解析器繞過異常...")
-            direct_mp4 = direct_fetch_pornhub_mp4_stream(video_url)
+            if not is_pornhub_url(video_url):
+                print("   [SKIP FALLBACK] 此來源不是 Pornhub，不使用 Pornhub 專用備用解析器。")
+                direct_mp4 = None
+            else:
+                print(f"   [FALLBACK] 嘗試啟動 Pornhub 原生備用解析器繞過異常...")
+                direct_mp4 = direct_fetch_pornhub_mp4_stream(video_url)
             if direct_mp4:
                 print(f"   [+] 成功解析直連 MP4 串流，發起 FFmpeg 極速下載 (帶認證 Header，暫存於 temp/)...")
                 temp_ffmpeg_file = os.path.join(temp_dir_abs, f"ffmpeg_{idx}_{video_file_basename}")
