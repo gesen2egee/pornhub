@@ -32,9 +32,10 @@ pip install -r requirements.txt
 2. **`0001-` 順序編號檔名 (原影片保持原名)**：
    - 九宮格圖檔名按下載順序編號：`0001-影片標題.jpg`、`0002-影片標題.jpg`。
    - 將圖檔移至 `videos/` 下載時，下載出的原影片維持**原始影片標題**：`videos/影片標題.mp4`！
-3. **二階段原影片下載與九宮格搬移 (`run_download`)**：
-   - 將滿意的九宮格圖片移至 `videos/` 資料夾後，雙擊 **[run_download.bat](file:///c:/workspace/pornhub/run_download.bat)**，即可一鍵下載原影片。
-   - **下載成功後，自動將該九宮格 `.jpg` 移動至 `downloads/` 資料夾保留**，歸檔保存。
+3. **下載與完整字幕雙管線 (`run_download`)**：
+   - 將滿意的九宮格圖片移至 `videos/` 或 `low_videos/` 後，雙擊 **[run_download.bat](file:///c:/workspace/pornhub/run_download.bat)**。
+   - 下載程序會持續抓下一支，獨立字幕程序則立即接手已下載影片，完成音訊判斷／增強、MOSS、翻譯、硬字幕與 Meta。
+   - **每支影片完整成功後**才將該九宮格移至 `downloads/`；字幕失敗時圖片保留原位。
 4. **下載即跳過開頭純色/黑邊 (Stream Direct Skip)**：
    - 在發起下載前 0.05 秒自動採樣分析遠端串流。若開頭純色/黑邊於 `0.5s ~ 10.0s` 之間，直接在下載時傳入前置跳過選項。
    - **落地的影片即為完美切除開頭、影音 100% 同步的精華影片**，零二次處理開銷！
@@ -51,10 +52,10 @@ pip install -r requirements.txt
    - 開啟 `previews/` 資料夾，瀏覽九宮格預覽圖。
    - **將滿意想下載的九宮格圖片 (`0001-影片標題.jpg`)，直接「剪貼/移動」到 `videos/` 資料夾中**。
 
-3. **步驟三：一鍵下載原影片並自動清理**
+3. **步驟三：一鍵下載、字幕與歸檔**
    - 雙擊執行 **[run_download.bat](file:///c:/workspace/pornhub/run_download.bat)**。
-   - 程式會自動下載最高畫質原始影片 (`videos/影片標題.mp4`)。
-   - **下載成功後自動刪除九宮格 `.jpg` 圖檔**，保持 `videos/` 資料夾乾淨！
+   - 程式會自動下載影片，並讓背景字幕工作者同步處理已完成下載的影片。
+   - **整支影片完成硬字幕與 Meta 後**才歸檔九宮格，保持來源資料夾只留下未完成項目。
 
 ---
 
@@ -76,25 +77,11 @@ install_moss.bat
 
 ### 使用 MOSS 推理
 
-CMD：
+字幕已整合至唯一入口 `run_download.bat`，不再提供獨立字幕 BAT。下載與字幕分屬兩個長駐程序：前一支下載完成便立即排入字幕佇列，同時下載程序繼續抓下一支；MOSS 模型只載入一次供整批影片共用。
 
-```bat
-run_subtitle.bat --force --limit 1
-```
-
-PowerShell：
-
-```powershell
-.\run_subtitle.bat --force --limit 1
-```
-
-字幕完成後不再保留獨立 SRT；MOSS 原文與繁中翻譯完整存入影片 Meta，`low_videos/` 與一般 `videos/` 都由 FFmpeg 將繁中字幕直接燒入畫面。燒錄所需 SRT 只會短暫建立於已忽略的 `tasks/subtitle-temp/`，成功或失敗後都會清理。舊資料若已有同名 SRT，或影片內已有 `TRANSLATED_SRT`（包含空字幕區段），未來執行會直接略過。只處理全部低畫質影片可執行：
+字幕完成後不再保留獨立 SRT；MOSS 原文與繁中翻譯完整存入影片 Meta，`low_videos/` 與一般 `videos/` 都由 FFmpeg 將繁中字幕直接燒入畫面。燒錄所需 SRT 只會短暫建立於已忽略的 `tasks/subtitle-temp/`，成功或失敗後都會清理。舊資料若已有同名 SRT，或影片內已有 `TRANSLATED_SRT`（包含空字幕區段），未來執行會直接略過。
 
 硬字幕預設會比畫面底部提高約半個字體高度，降低被播放器進度條遮住的機會。
-
-```bat
-run_subtitle.bat --low-only
-```
 
 ### 字幕前自動音訊增強
 

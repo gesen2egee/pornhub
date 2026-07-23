@@ -36,7 +36,7 @@ if errorlevel 1 exit /b %ERRORLEVEL%
 "%PYTHON%" -m pip install --index-url https://download.pytorch.org/whl/cu128 torch torchaudio
 if errorlevel 1 exit /b %ERRORLEVEL%
 
-"%PYTHON%" -m pip install "git+https://github.com/OpenMOSS/MOSS-Transcribe-Diarize.git@9990574e6ac62390a21bcce25a914d66ac92c25e" modelscope requests
+"%PYTHON%" -m pip install "git+https://github.com/OpenMOSS/MOSS-Transcribe-Diarize.git@9990574e6ac62390a21bcce25a914d66ac92c25e" modelscope requests mutagen Pillow
 if errorlevel 1 exit /b %ERRORLEVEL%
 
 "%PYTHON%" -m pip install librosa pyloudnorm scipy soundfile tqdm

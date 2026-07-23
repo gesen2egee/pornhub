@@ -51,6 +51,63 @@ def direct_fetch_pornhub_mp4_stream(webpage_url):
 from PIL import Image
 
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_MOSS_PYTHON = os.path.join(ROOT, "moss", ".venv", "Scripts", "python.exe")
+
+
+class SubtitleWorker:
+    """以獨立 MOSS 程序處理字幕，下載主流程可持續抓下一支。"""
+
+    def __init__(self):
+        python = os.getenv("MOSS_PYTHON", DEFAULT_MOSS_PYTHON)
+        if not os.path.exists(python):
+            raise RuntimeError(
+                f"找不到 MOSS 字幕環境：{python}。請先執行 install_moss.bat。"
+            )
+        worker_env = os.environ.copy()
+        worker_env["PYTHONUTF8"] = "1"
+        self.process = subprocess.Popen(
+            [python, os.path.join(ROOT, "subtitle_worker.py")],
+            cwd=ROOT,
+            stdin=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            env=worker_env,
+        )
+        self.closed = False
+
+    def enqueue(self, video_path, grid_path, is_low_quality=False):
+        if self.closed or self.process.stdin is None:
+            raise RuntimeError("字幕工作者已關閉。")
+        if self.process.poll() is not None:
+            raise RuntimeError(
+                f"字幕工作者已提前結束，ExitCode={self.process.returncode}。"
+            )
+        job = {
+            "video": os.path.abspath(video_path),
+            "grid": os.path.abspath(grid_path),
+            "archive_dir": os.path.abspath("downloads"),
+            "is_low_quality": bool(is_low_quality),
+        }
+        self.process.stdin.write(json.dumps(job, ensure_ascii=False) + "\n")
+        self.process.stdin.flush()
+        print(
+            f"   [QUEUE] 已交給背景字幕管線：{os.path.basename(video_path)}",
+            flush=True,
+        )
+
+    def close(self):
+        if self.closed:
+            return self.process.returncode or 0
+        self.closed = True
+        if self.process.stdin is not None:
+            try:
+                self.process.stdin.close()
+            except BrokenPipeError:
+                pass
+        return self.process.wait()
+
+
 def get_low_video_sample_range(duration):
     """超過一分鐘取 30–60 秒，否則維持取影片開頭 30 秒。"""
     try:
@@ -142,7 +199,7 @@ def upgrade_media_web_meta(jpg_path, mp4_path, video_url, info=None):
     except Exception as exc:
         print(f"   [!] 補齊 WEB_META 失敗（不影響影片）：{exc}")
 
-def process_single_directory(target_dir, is_low_quality):
+def process_single_directory(target_dir, is_low_quality, subtitle_worker):
     """處理單一目錄 (low_videos/ 或 videos/) 中 JPG 圖片內嵌 EXIF 網址的下載邏輯"""
     # 從名字為順序開始下載 (字母/數字自然排序)
     jpg_files = sorted(glob.glob(os.path.join(target_dir, "*.jpg")))
@@ -169,7 +226,6 @@ def process_single_directory(target_dir, is_low_quality):
             video_file_basename = base_name_without_num + ".mp4"
             
         target_video_file = os.path.join(target_dir, video_file_basename)
-        dest_downloads_jpg = os.path.join("downloads", image_name)
         os.makedirs("downloads", exist_ok=True)
         video_url = get_video_url_from_image(jpg_path)
 
@@ -177,14 +233,10 @@ def process_single_directory(target_dir, is_low_quality):
             print(f"[{idx}/{len(jpg_files)}] [EXISTS] 影片已存在: {os.path.basename(target_video_file)}")
             if video_url:
                 upgrade_media_web_meta(jpg_path, target_video_file, video_url)
-            if not is_low_quality:
-                try:
-                    shutil.move(jpg_path, dest_downloads_jpg)
-                    print(f"   [Move] 已自動將九宮格圖片移動至 downloads/ 資料夾: {image_name}\n")
-                except Exception as e:
-                    print(f"   [!] 移動圖片至 downloads/ 失敗: {e}\n")
-            else:
-                print(f"   [Keep] 九宮格圖片保留於 {target_dir}/ 原位: {image_name}\n")
+            subtitle_worker.enqueue(
+                target_video_file, jpg_path,
+                is_low_quality=is_low_quality,
+            )
             skipped_count += 1
             continue
 
@@ -292,14 +344,10 @@ def process_single_directory(target_dir, is_low_quality):
         if download_success:
             print(f"  [OK] 影片下載成功 -> {os.path.basename(target_video_file)}")
             upgrade_media_web_meta(jpg_path, target_video_file, video_url)
-            if not is_low_quality:
-                try:
-                    shutil.move(jpg_path, dest_downloads_jpg)
-                    print(f"   [Move] 已自動將九宮格圖片移動至 downloads/ 資料夾: {image_name}\n")
-                except Exception as e:
-                    print(f"   [!] 移動圖片至 downloads/ 失敗: {e}\n")
-            else:
-                print(f"  [Keep] 九宮格圖片保留於 {target_dir}/ 原位: {image_name}\n")
+            subtitle_worker.enqueue(
+                target_video_file, jpg_path,
+                is_low_quality=is_low_quality,
+            )
             success_count += 1
         else:
             print(f"  [FAIL] 影片下載失敗: {video_url}\n")
@@ -321,26 +369,46 @@ def run_download_process():
     if not low_jpgs and not high_jpgs:
         print(f"[!] low_videos/ 與 videos/ 資料夾中均找不到任何被移入的九宮格 JPG 圖片！")
         print(f"[i] 請將預覽圖片移動至 low_videos/ (最低畫質/極速) 或 videos/ (最高畫質) 後再次執行。")
-        return
+        return 0
 
     print(f"[+] 檢測到 low_videos/ ({len(low_jpgs)} 張圖片) | videos/ ({len(high_jpgs)} 張圖片)\n")
 
-    # 【階段一】優先處理 low_videos/ 目錄 (最低畫質)
-    if low_jpgs:
-        print("==================================================")
-        print(" [階段 1/2] 開始處理 low_videos/ (最低解析度/動態30秒取樣)")
-        print("==================================================")
-        process_single_directory("low_videos", is_low_quality=True)
+    try:
+        subtitle_worker = SubtitleWorker()
+    except Exception as exc:
+        print(f"[錯誤] 無法啟動字幕管線：{exc}", file=sys.stderr)
+        return 2
 
-    # 【階段二】處理完 low_videos/ 後，處理 videos/ 目錄 (最高畫質)
-    if high_jpgs:
-        print("\n==================================================")
-        print(" [階段 2/2] 開始處理 videos/ (最高畫質下載)")
-        print("==================================================")
-        process_single_directory("videos", is_low_quality=False)
+    try:
+        # 【階段一】優先處理 low_videos/ 目錄 (最低畫質)
+        if low_jpgs:
+            print("==================================================")
+            print(" [階段 1/2] 開始處理 low_videos/ (最低解析度/動態30秒取樣)")
+            print("==================================================")
+            process_single_directory(
+                "low_videos", is_low_quality=True,
+                subtitle_worker=subtitle_worker,
+            )
+
+        # 【階段二】處理完 low_videos/ 後，處理 videos/ 目錄 (最高畫質)
+        if high_jpgs:
+            print("\n==================================================")
+            print(" [階段 2/2] 開始處理 videos/ (最高畫質下載)")
+            print("==================================================")
+            process_single_directory(
+                "videos", is_low_quality=False,
+                subtitle_worker=subtitle_worker,
+            )
+    finally:
+        print("\n[*] 下載佇列完成，等待背景字幕管線處理剩餘影片...")
+        subtitle_exit = subtitle_worker.close()
 
     print("\n==================================================")
-    print(f"[ALL DONE] 雙階段下載作業全數完畢！")
+    if subtitle_exit:
+        print("[未完成] 部分字幕流程失敗，相關九宮格保留在原資料夾。")
+        return subtitle_exit
+    print("[ALL DONE] 下載、完整字幕與九宮格歸檔全數完成！")
+    return 0
 
 if __name__ == "__main__":
-    run_download_process()
+    raise SystemExit(run_download_process())
