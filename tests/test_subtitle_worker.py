@@ -142,3 +142,18 @@ def test_low_video_finalizes_but_keeps_grid(tmp_path, monkeypatch):
     assert not video.exists()
     assert final_video.exists()
     assert grid.exists()
+
+
+def test_low_job_has_shorter_bounded_timeout(monkeypatch):
+    monkeypatch.setenv("SUBTITLE_LOW_JOB_TIMEOUT_SECONDS", "12")
+    monkeypatch.setenv("SUBTITLE_JOB_TIMEOUT_SECONDS", "34")
+    assert subtitle_worker.subtitle_job_timeout({"is_low_quality": True}) == 12
+    assert subtitle_worker.subtitle_job_timeout({"is_low_quality": False}) == 34
+
+
+def test_invalid_timeout_uses_default(monkeypatch):
+    monkeypatch.setenv("SUBTITLE_LOW_JOB_TIMEOUT_SECONDS", "invalid")
+    assert (
+        subtitle_worker.subtitle_job_timeout({"is_low_quality": True})
+        == subtitle_worker.DEFAULT_LOW_JOB_TIMEOUT
+    )

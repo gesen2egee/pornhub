@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 import run_subtitle
 
 
@@ -126,6 +128,36 @@ def test_process_video_stores_empty_subtitle_meta(tmp_path, monkeypatch):
     assert burn_calls == []
     assert meta_calls[0]["original_srt"] == ""
     assert meta_calls[0]["translated_srt"] == ""
+
+
+def test_translation_failure_never_burns_hard_subtitle(tmp_path, monkeypatch):
+    video = tmp_path / "sample.mp4"
+    video.write_bytes(b"video")
+    backend = FakeBackend(
+        cues=[
+            {
+                "id": 1,
+                "time": "00:00:00,000 --> 00:00:01,000",
+                "text": "Hi",
+            }
+        ]
+    )
+    burn_calls = []
+    monkeypatch.setattr(
+        run_subtitle,
+        "translate_cues",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("translation failed")),
+    )
+    monkeypatch.setattr(
+        run_subtitle,
+        "_burn_hard_subtitle",
+        lambda *args, **kwargs: burn_calls.append(args),
+    )
+
+    with pytest.raises(RuntimeError, match="translation failed"):
+        run_subtitle.process_video(video, backend, "key", "model", True)
+
+    assert burn_calls == []
 
 
 def test_process_video_uses_enhanced_media_for_asr_and_packaging(

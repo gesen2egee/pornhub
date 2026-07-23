@@ -53,6 +53,18 @@ from PIL import Image
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MOSS_PYTHON = os.path.join(ROOT, "moss", ".venv", "Scripts", "python.exe")
+DOWNLOAD_SOCKET_TIMEOUT = 30
+DOWNLOAD_RETRIES = 3
+FALLBACK_DOWNLOAD_TIMEOUT = 2 * 60 * 60
+
+
+def positive_env_seconds(name, default):
+    """讀取正整數秒數；設定錯誤時安全退回預設值。"""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(1, value)
 
 
 class SubtitleWorker:
@@ -353,6 +365,11 @@ def process_single_directory(target_dir, is_low_quality, subtitle_worker):
             },
             'quiet': False,
             'no_warnings': True,
+            'socket_timeout': DOWNLOAD_SOCKET_TIMEOUT,
+            'retries': DOWNLOAD_RETRIES,
+            'fragment_retries': DOWNLOAD_RETRIES,
+            'extractor_retries': DOWNLOAD_RETRIES,
+            'file_access_retries': DOWNLOAD_RETRIES,
         }
 
         # videos 模式 (最高畫質) 內嵌縮圖封面
@@ -406,6 +423,7 @@ def process_single_directory(target_dir, is_low_quality, subtitle_worker):
                     "ffmpeg",
                     "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
                     "-allowed_segment_extensions", "ALL",
+                    "-rw_timeout", str(DOWNLOAD_SOCKET_TIMEOUT * 1_000_000),
                     "-headers", ff_headers,
                     "-y"
                 ]
@@ -422,10 +440,25 @@ def process_single_directory(target_dir, is_low_quality, subtitle_worker):
                     ]
                 else:
                     ffmpeg_cmd = ff_base_opts + ["-i", direct_mp4, "-c", "copy", temp_ffmpeg_file]
-                res_ff = subprocess.run(ffmpeg_cmd)
-                if res_ff.returncode == 0 and os.path.exists(temp_ffmpeg_file):
-                    shutil.move(temp_ffmpeg_file, staged_video_file)
-                    download_success = True
+                try:
+                    fallback_timeout = positive_env_seconds(
+                        "DOWNLOAD_JOB_TIMEOUT_SECONDS",
+                        FALLBACK_DOWNLOAD_TIMEOUT,
+                    )
+                    res_ff = subprocess.run(
+                        ffmpeg_cmd,
+                        timeout=fallback_timeout,
+                    )
+                    if (
+                        res_ff.returncode == 0
+                        and os.path.exists(temp_ffmpeg_file)
+                    ):
+                        shutil.move(temp_ffmpeg_file, staged_video_file)
+                        download_success = True
+                except subprocess.TimeoutExpired:
+                    print(
+                        "   [!] FFmpeg 單支下載超時，保留暫存並繼續下一支。"
+                    )
 
         if download_success:
             print(f"  [OK] 影片下載至暫存 -> {os.path.basename(staged_video_file)}")

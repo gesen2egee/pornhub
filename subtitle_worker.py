@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import queue
 import shutil
+import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +23,31 @@ try:
     sys.stdin.reconfigure(encoding="utf-8", errors="strict")
 except Exception:
     pass
+
+
+RESULT_MARKER = "__SUBTITLE_JOB_RESULT__"
+DEFAULT_LOW_JOB_TIMEOUT = 15 * 60
+DEFAULT_JOB_TIMEOUT = 2 * 60 * 60
+
+
+def _positive_timeout(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(1, value)
+
+
+def subtitle_job_timeout(job: dict[str, Any]) -> int:
+    if job.get("is_low_quality"):
+        return _positive_timeout(
+            "SUBTITLE_LOW_JOB_TIMEOUT_SECONDS",
+            DEFAULT_LOW_JOB_TIMEOUT,
+        )
+    return _positive_timeout(
+        "SUBTITLE_JOB_TIMEOUT_SECONDS",
+        DEFAULT_JOB_TIMEOUT,
+    )
 
 
 def archive_grid(grid: Path, archive_dir: Path) -> Path | None:
@@ -134,10 +164,9 @@ class SubtitleRuntime:
         finish_grid(grid, archive_dir, should_archive_grid)
 
 
-def main() -> int:
-    failures = 0
+def runtime_main() -> int:
+    """實際執行字幕工作的常駐子程序；每支完成後回報 supervisor。"""
     runtime: SubtitleRuntime | None = None
-    print("[字幕管線] 背景工作者已啟動，等待下載完成影片", flush=True)
     for raw_line in sys.stdin:
         job: dict[str, Any] = {}
         if not raw_line.strip():
@@ -147,12 +176,151 @@ def main() -> int:
             if runtime is None:
                 runtime = SubtitleRuntime()
             runtime.process(job)
+            result = {"ok": True}
         except Exception as exc:
-            failures += 1
             name = job.get("video", "未知影片")
             print(f"[字幕管線失敗] {name}：{exc}", file=sys.stderr, flush=True)
+            result = {"ok": False, "error": str(exc)}
+        print(
+            RESULT_MARKER + json.dumps(result, ensure_ascii=False),
+            flush=True,
+        )
+    return 0
+
+
+class RuntimeSupervisor:
+    """監督可重用 MOSS runtime；單支卡住時只重啟 runtime。"""
+
+    def __init__(self) -> None:
+        self.process: subprocess.Popen[str] | None = None
+        self.output: queue.Queue[str | None] = queue.Queue()
+        self.reader: threading.Thread | None = None
+
+    def _start(self) -> None:
+        self.output = queue.Queue()
+        process = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--runtime"],
+            cwd=str(Path(__file__).resolve().parent),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=os.environ.copy(),
+        )
+        self.process = process
+
+        def read_output() -> None:
+            assert process.stdout is not None
+            for line in process.stdout:
+                self.output.put(line)
+            self.output.put(None)
+
+        self.reader = threading.Thread(target=read_output, daemon=True)
+        self.reader.start()
+
+    def _stop(self) -> None:
+        process = self.process
+        self.process = None
+        if process is None or process.poll() is not None:
+            return
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        else:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+    def process_job(self, job: dict[str, Any]) -> tuple[bool, str | None]:
+        if self.process is None or self.process.poll() is not None:
+            self._start()
+        assert self.process is not None
+        assert self.process.stdin is not None
+        timeout = subtitle_job_timeout(job)
+        self.process.stdin.write(json.dumps(job, ensure_ascii=False) + "\n")
+        self.process.stdin.flush()
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._stop()
+                return False, f"單支字幕工作超過 {timeout} 秒，已終止並繼續下一支"
+            try:
+                line = self.output.get(timeout=min(1.0, remaining))
+            except queue.Empty:
+                if self.process is None or self.process.poll() is not None:
+                    self._stop()
+                    return False, "字幕 runtime 意外結束"
+                continue
+            if line is None:
+                self._stop()
+                return False, "字幕 runtime 未回報結果便結束"
+            if line.startswith(RESULT_MARKER):
+                try:
+                    result = json.loads(line[len(RESULT_MARKER):])
+                except json.JSONDecodeError:
+                    return False, "字幕 runtime 回報格式錯誤"
+                return bool(result.get("ok")), result.get("error")
+            print(line, end="", flush=True)
+
+    def close(self) -> None:
+        process = self.process
+        if process is None:
+            return
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self._stop()
+        self.process = None
+
+
+def supervisor_main() -> int:
+    failures = 0
+    supervisor = RuntimeSupervisor()
+    print("[字幕管線] 背景工作者已啟動，等待下載完成影片", flush=True)
+    try:
+        for raw_line in sys.stdin:
+            if not raw_line.strip():
+                continue
+            job = json.loads(raw_line.lstrip("\ufeff"))
+            ok, error = supervisor.process_job(job)
+            if not ok:
+                failures += 1
+                name = job.get("video", "未知影片")
+                print(
+                    f"[字幕監督失敗] {name}：{error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+    finally:
+        supervisor.close()
     print(f"[字幕管線] 全部佇列完成；失敗 {failures} 支", flush=True)
     return 1 if failures else 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--runtime", action="store_true")
+    args = parser.parse_args()
+    return runtime_main() if args.runtime else supervisor_main()
 
 
 if __name__ == "__main__":
