@@ -34,7 +34,12 @@ def test_process_video_uses_selected_backend(tmp_path, monkeypatch):
         run_subtitle,
         "_burn_hard_subtitle",
         lambda source, subtitle, output, force, **kwargs: burn_calls.append(
-            (source, subtitle, output)
+            (
+                source,
+                subtitle,
+                output,
+                subtitle.read_text(encoding="utf-8-sig"),
+            )
         ) or output,
     )
     meta_calls = []
@@ -58,6 +63,8 @@ def test_process_video_uses_selected_backend(tmp_path, monkeypatch):
     assert burn_calls[0][0] == video
     assert burn_calls[0][1].parent == run_subtitle.SUBTITLE_TEMP
     assert not burn_calls[0][1].exists()
+    assert "[S01]" not in burn_calls[0][3]
+    assert burn_calls[0][3].rstrip().endswith("Hi")
     assert "[S01] Hi" in meta_calls[0][1]["original_srt"]
     assert "[S01] Hi" in meta_calls[0][1]["translated_srt"]
     assert "base_comment" in meta_calls[0][1]
@@ -84,6 +91,17 @@ def test_empty_embedded_subtitle_meta_is_considered_complete(tmp_path, monkeypat
         },
     )
     assert run_subtitle._subtitle_complete(video)
+
+
+def test_burn_srt_strips_labels_but_keeps_srt_structure():
+    content = (
+        "1\n00:00:00,000 --> 00:00:01,000\n[S01] 第一行\n"
+        "[S02] 第二行\n"
+    )
+    result = run_subtitle._strip_speaker_labels_from_srt(content)
+    assert result == (
+        "1\n00:00:00,000 --> 00:00:01,000\n第一行\n第二行\n"
+    )
 
 
 def test_process_video_stores_empty_subtitle_meta(tmp_path, monkeypatch):

@@ -22,6 +22,7 @@ from audio_enhance_stage import (  # noqa: E402
 )
 from translate_srt_openrouter import (  # noqa: E402
     DEFAULT_MODEL,
+    SPEAKER_LABEL_PATTERN,
     format_srt,
     translate_cues,
 )
@@ -92,6 +93,27 @@ def _subtitle_complete(video: Path) -> bool:
 
 def _ffmpeg_filter_value(value: str) -> str:
     return value.replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
+
+
+def _strip_speaker_labels_from_srt(content: str) -> str:
+    """只供畫面燒錄使用；影片 Meta 仍保存完整說話者標籤。"""
+    return "".join(
+        SPEAKER_LABEL_PATTERN.sub("", line)
+        for line in content.splitlines(keepends=True)
+    )
+
+
+def _write_burn_subtitle(video: Path, translated_srt: str) -> Path:
+    SUBTITLE_TEMP.mkdir(parents=True, exist_ok=True)
+    burn_srt = (
+        SUBTITLE_TEMP
+        / f"{video.stem[:48]}-{abs(hash(video.resolve())):x}.srt"
+    )
+    burn_srt.write_text(
+        _strip_speaker_labels_from_srt(translated_srt),
+        encoding="utf-8-sig",
+    )
+    return burn_srt
 
 
 def _burn_hard_subtitle(
@@ -185,7 +207,11 @@ def process_video(
     burn_srt: Path | None = None
     remove_burn_srt = False
     print(f"\n處理：{video.name}", flush=True)
-    if existing_meta.get("translated_srt_present") and not force:
+    if (
+        existing_meta.get("original_srt_present")
+        and existing_meta.get("translated_srt_present")
+        and not force
+    ):
         print("  影片內已有字幕 Meta，直接略過", flush=True)
         return video
     if legacy_srt.exists() and not force:
@@ -194,7 +220,6 @@ def process_video(
             flush=True,
         )
         translated_srt = legacy_srt.read_text(encoding="utf-8-sig")
-        burn_srt = legacy_srt
     else:
         if backend is None or not api_key:
             raise RuntimeError("缺少 ASR backend 或 OpenRouter API key。")
@@ -206,16 +231,13 @@ def process_video(
             print("  2/3 OpenRouter 翻譯", flush=True)
             translated = translate_cues(cues, api_key, model_name)
             translated_srt = format_srt(translated)
-            SUBTITLE_TEMP.mkdir(parents=True, exist_ok=True)
-            burn_srt = (
-                SUBTITLE_TEMP
-                / f"{video.stem[:48]}-{abs(hash(video.resolve())):x}.srt"
-            )
-            burn_srt.write_text(translated_srt, encoding="utf-8-sig")
-            remove_burn_srt = True
         else:
             translated_srt = ""
             print("  2/3 無字幕，將空字幕狀態寫入影片 Meta", flush=True)
+
+    if translated_srt and translated_srt.strip():
+        burn_srt = _write_burn_subtitle(video, translated_srt)
+        remove_burn_srt = True
 
     try:
         if burn_srt is not None and translated_srt and translated_srt.strip():
