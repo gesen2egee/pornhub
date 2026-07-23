@@ -3,3 +3,7 @@
 
 # ModelScope 模型快取
 model-cache/
+
+# 字幕前音訊分類模型與 ASMR Enhancer 原始碼
+audio-model-cache/
+asmr-enhancer/

@@ -73,7 +73,7 @@ MOSS 模式需要 Windows、NVIDIA GPU／Driver、Python 3.12 與 CUDA 相容環
 install_moss.bat
 ```
 
-安裝器會建立 `moss/.venv`，從官方 CUDA 12.8 wheel index 安裝 PyTorch，固定安裝 MOSS 官方程式碼 commit `9990574e6ac62390a21bcce25a914d66ac92c25e`，並從 ModelScope 下載 `openmoss/MOSS-Transcribe-Diarize` 至 `moss/model-cache`。若 CUDA 不可用，安裝器會停止，不會改用 CPU。
+安裝器會建立 `moss/.venv`，從官方 CUDA 12.8 wheel index 安裝 PyTorch，固定安裝 MOSS 官方程式碼 commit `9990574e6ac62390a21bcce25a914d66ac92c25e`，並從 ModelScope 下載 `openmoss/MOSS-Transcribe-Diarize` 至 `moss/model-cache`。同時會安裝音訊分析依賴，並固定下載 `xmlans/asmr-enhancer` commit `ade1a82b4f8b97abf088280d22156448cc0a888f`。若 CUDA 不可用，安裝器會停止，不會改用 CPU。
 
 ### 使用 MOSS 推理
 
@@ -98,6 +98,30 @@ $env:ASR_BACKEND = "moss"
 ```bat
 run_subtitle.bat --low-only
 ```
+
+### 字幕前自動音訊增強
+
+字幕流程預設會在載入 MOSS／Whisper 前完成音訊判斷：
+
+1. 避開固定片頭，從影片 25%、50%、75% 各取 4 秒。
+2. 使用響度、峰均比、穩定度與 AudioSet AST 音樂分類結果判斷。
+3. `pass` 影片保留原音軌。
+4. `enhance` 與 `uncertain` 影片使用 ASMR Enhancer 產生暫存影片。
+5. ASR 與最後字幕封裝使用選定音軌；成功後才覆蓋原影片。
+6. 增強完成的影片會寫入 `ASMR Enhancer auto v1` metadata，`--force` 重跑時不會重複增強。
+
+音訊分類器只載入一次，分類完成後會釋放 GPU，再執行 ASMR Enhancer，最後才載入 ASR 模型。第一次執行會下載 `MIT/ast-finetuned-audioset-10-10-0.4593` 至 `moss/audio-model-cache`。每次判斷報告寫入已忽略的 `tasks/audio-enhance-latest.json`。
+
+可選設定：
+
+- `AUDIO_AUTO_ENHANCE`：預設 `1`；設為 `0` 可關閉整段自動判斷與增強。
+- `AUDIO_CLASSIFIER_MODEL`：預設 `MIT/ast-finetuned-audioset-10-10-0.4593`。
+- `AUDIO_CLASSIFIER_REVISION`：預設固定為測試過的 Hugging Face commit `f826b80d28226b62986cc218e5cec390b1096902`。
+- `AUDIO_CLASSIFIER_CACHE`：覆蓋音訊分類模型快取路徑。
+- `AUDIO_STAGE_PYTHON`：字幕音訊處理子程序，預設使用 `moss/.venv/Scripts/python.exe`；即使 ASR 切換為 Whisper，也會使用此隔離環境。
+- `AUDIO_GPU_RESERVE_MB`：預設保留 2048 MB；可用 VRAM 不足時分類器自動改用 CPU。
+- `ASMR_ENHANCER_DEVICE`：預設 `auto`，也可指定 `cpu` 或 `cuda`。
+- `ASMR_ENHANCER_SCRIPT`：覆蓋 ASMR Enhancer 程式路徑。
 
 `OPENROUTER_API_KEY` 預設從 OS 環境變數取得，不寫入專案檔案。
 

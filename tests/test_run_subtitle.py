@@ -34,7 +34,7 @@ def test_process_video_uses_selected_backend(tmp_path, monkeypatch):
     monkeypatch.setattr(
         run_subtitle,
         "_embed_soft_subtitle",
-        lambda video, subtitle, output, force: output,
+        lambda video, subtitle, output, force, **kwargs: output,
     )
 
     output = run_subtitle.process_video(
@@ -61,7 +61,7 @@ def test_process_video_skips_backend_when_srt_exists(tmp_path, monkeypatch):
     monkeypatch.setattr(
         run_subtitle,
         "_embed_soft_subtitle",
-        lambda video, subtitle, output, force: output,
+        lambda video, subtitle, output, force, **kwargs: output,
     )
 
     run_subtitle.process_video(video, backend, None, "model", False)
@@ -77,3 +77,45 @@ def test_process_video_rejects_empty_asr_result(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="ASR 沒有產生有效字幕"):
         run_subtitle.process_video(video, backend, "key", "model", True)
+
+
+def test_process_video_uses_enhanced_media_for_asr_and_packaging(
+    tmp_path,
+    monkeypatch,
+):
+    video = tmp_path / "sample.mp4"
+    enhanced = tmp_path / ".sample.audio-enhance.tmp.mp4"
+    video.write_bytes(b"video")
+    enhanced.write_bytes(b"enhanced")
+    backend = FakeBackend(
+        cues=[
+            {
+                "id": 1,
+                "time": "00:00:00,000 --> 00:00:01,000",
+                "text": "Hi",
+            }
+        ]
+    )
+    calls = []
+    monkeypatch.setattr(run_subtitle, "translate_cues", lambda cues, *_: cues)
+    monkeypatch.setattr(
+        run_subtitle,
+        "_embed_soft_subtitle",
+        lambda source, subtitle, output, force, **kwargs: calls.append(
+            (source, output, kwargs["mark_audio_enhanced"])
+        )
+        or output,
+    )
+
+    run_subtitle.process_video(
+        video,
+        backend,
+        "key",
+        "model",
+        True,
+        media_input=enhanced,
+        audio_enhanced=True,
+    )
+
+    assert backend.videos == [enhanced]
+    assert calls == [(enhanced, video, True)]

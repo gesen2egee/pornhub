@@ -14,6 +14,11 @@ VIDEOS = ROOT / "videos"
 
 sys.path.insert(0, str(ROOT))
 from asr_backends import create_backend, resolve_backend  # noqa: E402
+from audio_enhance_stage import (  # noqa: E402
+    ENHANCE_MARKER,
+    auto_enhance_enabled,
+    prepare_audio_media,
+)
 from translate_srt_openrouter import (  # noqa: E402
     DEFAULT_MODEL,
     format_srt,
@@ -114,7 +119,11 @@ def _ffmpeg_filter_value(value: str) -> str:
 
 
 def _burn_hard_subtitle(
-    video: Path, subtitle: Path, output_video: Path, force: bool
+    video: Path,
+    subtitle: Path,
+    output_video: Path,
+    force: bool,
+    mark_audio_enhanced: bool = False,
 ) -> Path:
     ffmpeg = os.getenv("FFMPEG_EXE", "ffmpeg")
     temporary_output = output_video.with_name(
@@ -156,6 +165,8 @@ def _burn_hard_subtitle(
         "+faststart",
         temporary_output.name,
     ]
+    if mark_audio_enhanced:
+        command[-1:-1] = ["-metadata", f"comment={ENHANCE_MARKER}"]
     print("  3/3 ffmpeg 繁中硬字幕燒錄", flush=True)
     try:
         result = subprocess.run(
@@ -181,7 +192,11 @@ def _burn_hard_subtitle(
 
 
 def _embed_soft_subtitle(
-    video: Path, subtitle: Path, output_video: Path, force: bool
+    video: Path,
+    subtitle: Path,
+    output_video: Path,
+    force: bool,
+    mark_audio_enhanced: bool = False,
 ) -> Path:
     ffmpeg = os.getenv("FFMPEG_EXE", "ffmpeg")
     temporary_output = output_video.with_name(
@@ -225,6 +240,8 @@ def _embed_soft_subtitle(
     ]
     if is_mp4_container:
         command[-1:-1] = ["-movflags", "+faststart"]
+    if mark_audio_enhanced:
+        command[-1:-1] = ["-metadata", f"comment={ENHANCE_MARKER}"]
     print("  3/3 ffmpeg 軟字幕內嵌（不重新編碼）", flush=True)
     try:
         result = subprocess.run(
@@ -255,9 +272,12 @@ def process_video(
     api_key: str | None,
     model_name: str,
     force: bool,
+    media_input: Path | None = None,
+    audio_enhanced: bool = False,
 ) -> Path:
     output_srt = _subtitle_path(video)
     output_video = video
+    media_input = video if media_input is None else media_input
     print(f"\n處理：{video.name}", flush=True)
     if output_srt.exists() and not force:
         print(
@@ -268,7 +288,7 @@ def process_video(
         if backend is None or not api_key:
             raise RuntimeError("缺少 ASR backend 或 OpenRouter API key。")
         print(f"  1/3 {backend.display_name} 辨識", flush=True)
-        cues, language = backend.transcribe(video)
+        cues, language = backend.transcribe(media_input)
         if not cues:
             raise RuntimeError("ASR 沒有產生有效字幕段落。")
         print(f"  語言：{language}；字幕段落：{len(cues)}", flush=True)
@@ -282,8 +302,20 @@ def process_video(
         print(f"完成：{output_srt}", flush=True)
 
     if _uses_hard_subtitle(video):
-        return _burn_hard_subtitle(video, output_srt, output_video, force)
-    return _embed_soft_subtitle(video, output_srt, output_video, force)
+        return _burn_hard_subtitle(
+            media_input,
+            output_srt,
+            output_video,
+            force,
+            mark_audio_enhanced=audio_enhanced,
+        )
+    return _embed_soft_subtitle(
+        media_input,
+        output_srt,
+        output_video,
+        force,
+        mark_audio_enhanced=audio_enhanced,
+    )
 
 
 def main() -> int:
@@ -355,17 +387,51 @@ def main() -> int:
         print("錯誤：找不到 OPENROUTER_API_KEY 環境變數。", file=sys.stderr)
         return 2
 
-    backend = create_backend().load() if needs_asr else None
-    if needs_asr:
-        print(f"使用 ASR backend：{backend_name}", flush=True)
-    model_name = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
-    failures = 0
-    for video in pending:
+    try:
+        use_audio_enhance = auto_enhance_enabled()
+    except ValueError as exc:
+        print(f"錯誤：{exc}", file=sys.stderr)
+        return 2
+    prepared_media = {}
+    if use_audio_enhance:
+        print(
+            "字幕前音訊流程：中段三點分析 → pass／enhance "
+            "（uncertain 自動 enhance）",
+            flush=True,
+        )
         try:
-            process_video(video, backend, api_key, model_name, args.force)
+            prepared_media = prepare_audio_media(pending)
         except Exception as exc:
-            failures += 1
-            print(f"失敗：{video.name}：{exc}", file=sys.stderr, flush=True)
+            print(f"錯誤：字幕前音訊處理失敗：{exc}", file=sys.stderr)
+            return 2
+
+    failures = 0
+    try:
+        backend = create_backend().load() if needs_asr else None
+        if needs_asr:
+            print(f"使用 ASR backend：{backend_name}", flush=True)
+        model_name = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
+        for video in pending:
+            media = prepared_media.get(video)
+            try:
+                process_video(
+                    video,
+                    backend,
+                    api_key,
+                    model_name,
+                    args.force,
+                    media_input=media.media_input if media else video,
+                    audio_enhanced=media.enhanced if media else False,
+                )
+            except Exception as exc:
+                failures += 1
+                print(f"失敗：{video.name}：{exc}", file=sys.stderr, flush=True)
+            finally:
+                if media:
+                    media.cleanup()
+    finally:
+        for media in prepared_media.values():
+            media.cleanup()
     print(f"批次完成：成功 {len(pending) - failures} 部，失敗 {failures} 部。")
     return 1 if failures else 0
 

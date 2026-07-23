@@ -57,5 +57,9 @@ def test_installer_pins_cuda_wheel_and_moss_commit():
 
     assert "https://download.pytorch.org/whl/cu128" in content
     assert "9990574e6ac62390a21bcce25a914d66ac92c25e" in content
+    assert "ade1a82b4f8b97abf088280d22156448cc0a888f" in content
+    assert "pyloudnorm" in content
+    assert "xmlans/asmr-enhancer" in content
+    assert "where git" in content
     assert 'py -3.12 -m venv "%ROOT%moss\\.venv"' in content
     assert '"%PYTHON%" "%ROOT%moss_setup.py"' in content
