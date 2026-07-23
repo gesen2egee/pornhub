@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Embed readable web page meta and full original/translated SRT (with `[Sxx]` and cue timings) into each downloaded MP4, without changing the JPG EXIF download flow.
+**Goal:** Embed readable web page meta into MP4 (and 九宮格 JPG), with FALLBACK upgrade for old URL-only grids; store full original + translation-only-swapped SRT in MP4 comment after subtitles.
 
-**Architecture:** New `video_meta.py` owns comment section parse/merge and mutagen MP4 read/write. `run_download.py` writes `WEB_META_V1` after successful download. `translate_srt_openrouter.py` keeps speaker prefixes and cue `time` unchanged during translation. `run_subtitle.py` writes full original + translated SRT into the same comment after soft/hard subtitle packaging. Meta failures log warnings and never fail download/subtitle success.
+**Architecture:** `video_meta.py` owns sectioned comment codec, mutagen MP4 R/W, Pillow JPG EXIF R/W, legacy detection. `run_download` still reads URL only from `ImageDescription`; after download success **or** when the video already exists, fetches yt-dlp info and upgrades MP4 + legacy JPG to WEB_META. `capture_frames` writes new grids as URL+WEB_META. Translation keeps `[Sxx]` + times; subtitle step writes dual full-format SRT into MP4. Meta failures never fail download/subtitle.
 
-**Tech Stack:** Python 3, mutagen, yt-dlp, existing Pillow/ffmpeg pipelines, pytest.
+**Tech Stack:** Python 3, mutagen, Pillow, yt-dlp, ffmpeg, pytest.
 
 **Spec:** `docs/superpowers/specs/2026-07-24-video-metadata-embed-design.md`
 
@@ -16,14 +16,15 @@
 
 | File | Responsibility |
 |------|----------------|
-| Create `video_meta.py` | Sectioned comment codec; `build_web_meta`; mutagen merge write/read; optional CLI `show`/`export` |
-| Create `tests/test_video_meta.py` | Unit tests for parse/merge/build/read-write |
+| Create `video_meta.py` | Comment codec; `build_web_meta`; MP4 R/W; JPG legacy detect + WEB_META R/W; CLI |
+| Create `tests/test_video_meta.py` | Unit tests for parse/merge/MP4/JPG/legacy |
 | Modify `translate_srt_openrouter.py` | Preserve `[Sxx]` + `time` through translation |
-| Modify `tests/test_run_subtitle.py` (+ new translate tests if needed) | Expect speaker labels kept |
-| Modify `run_download.py` | After download success, write WEB_META |
-| Modify `run_subtitle.py` | Keep labels; after embed/burn, write dual SRT meta |
+| Modify `tests/test_run_subtitle.py` (+ translate tests) | Expect speaker labels kept |
+| Modify `run_download.py` | After success **or** exists: `upgrade_media_web_meta` (MP4 + legacy JPG) |
+| Modify `capture_frames.py` | New grids: URL + WEB_META (no more URL-only) |
+| Modify `run_subtitle.py` | Dual full SRT into MP4 after package |
 | Modify `requirements.txt` | Add `mutagen` |
-| Modify `README.md` | Document meta embed + speaker retention |
+| Modify `README.md` | Meta embed, fallback upgrade, speaker retention |
 
 ---
 
@@ -417,94 +418,155 @@ git commit -m "Keep speaker labels and cue times through translation"
 
 ---
 
-### Task 4: Wire WEB_META into `run_download`
+### Task 4: JPG legacy detect + write WEB_META (in `video_meta`)
+
+**Files:**
+- Modify: `video_meta.py`
+- Modify: `tests/test_video_meta.py`
+
+- [ ] **Step 1: Failing tests for legacy grid + upgrade**
+
+```python
+from PIL import Image
+import video_meta
+
+def _url_only_jpg(path, url="https://www.pornhub.com/view_video.php?viewkey=abc"):
+    img = Image.new("RGB", (8, 8), (0, 0, 0))
+    exif = img.getexif()
+    exif[0x010E] = url
+    img.save(path, exif=exif)
+
+def test_legacy_grid_detection_and_upgrade(tmp_path):
+    jpg = tmp_path / "g.jpg"
+    _url_only_jpg(jpg)
+    assert video_meta.is_legacy_grid_jpg(jpg) is True
+    assert video_meta.read_grid_jpg_meta(jpg)["url"].startswith("https://")
+
+    web = video_meta.build_web_meta({"title": "T", "webpage_url": "https://x", "tags": ["a"]})
+    video_meta.write_grid_jpg_web_meta(jpg, web)
+    assert video_meta.is_legacy_grid_jpg(jpg) is False
+    got = video_meta.read_grid_jpg_meta(jpg)
+    assert got["web_meta"]["title"] == "T"
+    assert got["url"].startswith("https://")  # URL must survive
+```
+
+- [ ] **Step 2: Implement** `is_legacy_grid_jpg`, `read_grid_jpg_meta`, `write_grid_jpg_web_meta`  
+  - URL stays in `0x010E`  
+  - WEB_META in UserComment `0x9286` as `===WEB_META_V1===\n{json}` (charset prefix as needed for Pillow round-trip)
+
+- [ ] **Step 3: pytest PASS + commit**
+
+```bash
+git add video_meta.py tests/test_video_meta.py
+git commit -m "Detect and upgrade legacy URL-only grid JPG meta"
+```
+
+---
+
+### Task 5: Wire FALLBACK upgrade into `run_download`
 
 **Files:**
 - Modify: `run_download.py`
-- Create: `tests/test_run_download_meta.py` (or extend existing download tests if any)
+- Create: `tests/test_run_download_meta.py`
 
-- [ ] **Step 1: Write a focused unit test with mocks**
+- [ ] **Step 1: Tests with mocks**
 
 ```python
 # tests/test_run_download_meta.py
 import run_download
 
-
-def test_write_web_meta_for_download_calls_merge(monkeypatch, tmp_path):
-    video = tmp_path / "v.mp4"
-    video.write_bytes(b"x")
-    captured = {}
+def test_upgrade_media_web_meta_writes_mp4_and_legacy_jpg(monkeypatch, tmp_path):
+    mp4 = tmp_path / "v.mp4"
+    jpg = tmp_path / "g.jpg"
+    mp4.write_bytes(b"x")
+    # create url-only jpg via helper or PIL
+    calls = {"mp4": None, "jpg": None}
 
     class FakeYDL:
-        def __init__(self, *a, **k):
-            pass
-        def __enter__(self):
-            return self
-        def __exit__(self, *a):
-            return False
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
         def extract_info(self, url, download=False):
             return {"title": "FromNet", "uploader": "U", "tags": ["t"], "webpage_url": url}
 
     monkeypatch.setattr(run_download.yt_dlp, "YoutubeDL", FakeYDL)
+    monkeypatch.setattr(
+        run_download.video_meta,
+        "merge_write_mp4_meta",
+        lambda path, **kw: calls.__setitem__("mp4", kw.get("web_meta")),
+    )
+    monkeypatch.setattr(run_download.video_meta, "is_legacy_grid_jpg", lambda p: True)
+    monkeypatch.setattr(
+        run_download.video_meta,
+        "write_grid_jpg_web_meta",
+        lambda path, web, **kw: calls.__setitem__("jpg", web),
+    )
 
-    def fake_merge(path, **kwargs):
-        captured["path"] = str(path)
-        captured["web_meta"] = kwargs.get("web_meta")
+    run_download.upgrade_media_web_meta(str(jpg), str(mp4), "https://example.com/v")
+    assert calls["mp4"]["title"] == "FromNet"
+    assert calls["jpg"]["title"] == "FromNet"
 
-    monkeypatch.setattr(run_download.video_meta, "merge_write_mp4_meta", fake_merge)
-    # if import style is `import video_meta` then patch video_meta.merge_write_mp4_meta
-    # and ensure run_download uses that name.
 
-    run_download.write_web_meta_for_download(str(video), "https://example.com/v")
-    assert captured["web_meta"]["title"] == "FromNet"
-    assert captured["web_meta"]["tags"] == ["t"]
-    assert "duration" in captured["web_meta"]  # schema keys present
+def test_upgrade_skips_jpg_write_when_not_legacy(monkeypatch, tmp_path):
+    # is_legacy False → still write mp4; jpg write not required (or may overwrite per spec default)
+    ...
 ```
 
-Extract helper in `run_download.py`:
+Prefer **always refresh WEB_META on both** when extract succeeds (spec default overwrite for consistency). Then `is_legacy` only affects logging `[UPGRADE]` vs silent refresh — or always write JPG WEB_META when path exists.
+
+**Spec default:** overwrite WEB on JPG when upgrading so MP4 and JPG match. Implement:
 
 ```python
-def write_web_meta_for_download(video_path: str, video_url: str, info: dict | None = None) -> None:
-    """Best-effort; log warning on failure; never raise."""
+def upgrade_media_web_meta(jpg_path, mp4_path, video_url, info=None) -> None:
+    """Best-effort; never raise."""
+    # extract_info if needed
+    # web = build_web_meta(info)
+    # if mp4 exists: merge_write_mp4_meta(mp4, web_meta=web)
+    # if jpg exists: write_grid_jpg_web_meta(jpg, web); log UPGRADE if was legacy
 ```
 
-Download loop:
+- [ ] **Step 2: Call sites in `process_single_directory`**
 
-```python
-if download_success:
-    write_web_meta_for_download(target_video_file, video_url, info=None)
-```
+1. After **`download_success`** (before/after move JPG — **upgrade JPG while still at `jpg_path`**, before move to `downloads/`).
+2. On **`EXISTS` skip** branch: if mp4 exists, still call `upgrade_media_web_meta(jpg_path, target_video_file, video_url)` so re-running download upgrades old library without re-download.
 
-- [ ] **Step 2: Implement helper**
+**Do not change:** reading URL only from ImageDescription; format selection; pornhub stream fallback parser.
 
-Logic:
-1. If `info` is None, `yt_dlp.YoutubeDL({quiet, no_warnings}).extract_info(url, download=False)` inside try.
-2. `web = build_web_meta(info)`
-3. `merge_write_mp4_meta(path, web_meta=web)` only — do not pass original_srt/translated_srt (preserve any existing).
-4. On any exception: `print` warning with exception; return.
-
-Optional optimization (same task if easy): during successful `ydl.download`, capture info via a progress hook or `extract_info` before download to avoid second network call — not required for v1; double fetch OK.
-
-- [ ] **Step 3: Call helper after every `download_success`** (both quality paths already funnel to same success block).
-
-**Do not change:** EXIF read, JPG move logic, format selection, fallback parser.
-
-- [ ] **Step 4: Run tests**
-
-```
-.\.venv\Scripts\python.exe -m pytest tests/test_run_download_meta.py tests/test_video_meta.py -v
-```
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 3: pytest + commit**
 
 ```bash
 git add run_download.py tests/test_run_download_meta.py
-git commit -m "Write web page meta into MP4 after successful download"
+git commit -m "Fallback upgrade WEB_META on MP4 and legacy grid JPGs"
 ```
 
 ---
 
-### Task 5: Wire dual SRT meta into `run_subtitle`
+### Task 6: `capture_frames` writes new-format grids
+
+**Files:**
+- Modify: `capture_frames.py` (where EXIF is set ~453–455)
+- Optional small test if easy; else manual note
+
+- [ ] **Step 1: After setting `exif[0x010e] = video_url`, also embed WEB_META**
+
+Prefer calling `video_meta.write_grid_jpg_web_meta` **after** save, or build web from available title/duration/url and set UserComment before save.
+
+Minimal: use fields already in `create_3x3_grid_image` / `process_single_video` (`title`, `duration`, `video_url`) plus any yt-dlp info already fetched in `extract_video_info` — extend `extract_video_info` return or pass full `info` dict into grid save.
+
+Simplest robust path:
+1. Change `extract_video_info` to also return raw yt-dlp `info` subset or full dict.
+2. `build_web_meta(info)` + write URL + UserComment on grid save.
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add capture_frames.py
+git commit -m "Write WEB_META into new grid JPGs at capture time"
+```
+
+---
+
+### Task 7: Wire dual SRT meta into `run_subtitle`
 
 **Files:**
 - Modify: `run_subtitle.py`
@@ -593,7 +655,7 @@ git commit -m "Embed original and translated SRT into MP4 metadata"
 
 ---
 
-### Task 6: CLI show/export + README
+### Task 8: CLI show/export + README
 
 **Files:**
 - Modify: `video_meta.py` (`if __name__ == "__main__"`)
@@ -615,11 +677,11 @@ If a local mp4 with meta exists after tests, run show once.
 
 - [ ] **Step 3: README updates**
 
-- Note MP4 embeds web meta after download.
-- Note subtitle meta stores **full original-format SRT** (index + timestamps + text) for original and translated, including `[Sxx]`.
-- Note translation **keeps** speaker labels (replace old “會移除” wording).
+- Note MP4 embeds web meta after download; dual full SRT after subtitle.
+- **FALLBACK:** old URL-only 九宮格 auto-upgraded on `run_download` (success or exists) to WEB_META on both video + JPG.
+- New capture grids already include WEB_META; download still reads URL from ImageDescription only.
+- Translation **keeps** `[Sxx]`; TRANSLATED = structure same, body only swapped.
 - Document `python video_meta.py show|export`.
-- State JPG EXIF download flow unchanged.
 
 - [ ] **Step 4: Full test suite**
 
@@ -641,15 +703,14 @@ git commit -m "Add video_meta CLI and document MP4 metadata embed"
 ## Implementation notes (for agents)
 
 1. **Full original-format SRT only** for subtitle meta:
-   - `ORIGINAL_SRT` = ASR 原本輸出（`format_srt(original_cues)`），結構不改。
-   - `TRANSLATED_SRT` = **只換翻譯版本**（同序號／時間軸／`[Sxx]`，只換正文）；磁碟同名 `.srt` 與此相同。
-   - Never strip to plain text lines.
-2. **Do not touch** `capture_frames.py` EXIF URL write or `get_video_url_from_image` behavior.
-3. **Meta failure never fails** download or subtitle main result.
-4. **Eporner:** no HTML scrape; missing fields null/`[]`.
-5. Prefer TDD order: test → fail → implement → pass → commit per task.
-6. Use project venv: `G:\pornhub\.venv\Scripts\python.exe`.
-7. **Merge contract:** keyword `None` / omitted section = **preserve existing**; only pass strings/dicts for sections to update. Never wipe SRT when writing WEB, never wipe WEB when writing SRT-only.
+   - `ORIGINAL_SRT` = ASR 原本輸出；`TRANSLATED_SRT` = 只換翻譯版本；disk `.srt` = 翻譯版。
+2. **Download URL** still only from JPG `ImageDescription`; do not break that.
+3. **FALLBACK:** legacy URL-only JPG → auto fetch meta → upgrade MP4 + JPG; also on EXISTS skip path.
+4. **JPG stores WEB_META only** (no SRT); SRT only in MP4.
+5. **Meta failure never fails** download or subtitle.
+6. **Eporner:** yt-dlp only; missing null/`[]`.
+7. **Merge contract:** `None`/omit = preserve section.
+8. TDD + project venv `.\.venv\Scripts\python.exe`.
 
 ---
 

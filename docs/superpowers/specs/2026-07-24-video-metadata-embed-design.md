@@ -2,7 +2,7 @@
 
 **日期：** 2026-07-24  
 **狀態：** Approved for user review  
-**範圍：** 下載後寫入網頁 meta；字幕流程寫入原文／翻譯 SRT meta；讀回工具。不改九宮格圖片下載鏈。
+**範圍：** 下載後寫入網頁 meta；舊版九宮格 FALLBACK 升級；字幕雙份完整 SRT meta；讀回工具。
 
 ---
 
@@ -17,14 +17,15 @@
 3. 磁碟同名 `.srt`（給軟／硬字幕用）= **只換翻譯版本**（與 TRANSLATED_SRT 一致）。
 4. 影片層級時間一併寫入 WEB_META：`duration`、`duration_string`、`upload_date`、`timestamp`、`meta_written_at`。
 5. Meta 用途僅為**封存與之後程式讀回**，不當播放器字幕軌。
-6. **不影響**現有圖片 EXIF → `run_download` 下載流程。
+6. **下載讀 URL 相容：** 仍從九宮格 `ImageDescription` 讀影片網址；舊圖只含 URL 時可照常下載。
+7. **舊格式 FALLBACK：** 下載時若九宮格為「只有網址的舊格式」，自動抓取網頁 meta，升級為**有 WEB_META 的影片 + 有 WEB_META 的九宮格**。
 
 ### 非目標
 
 - 不把字幕當第二條軟字幕軌給播放器用。
-- 不改九宮格 JPG EXIF 寫入／讀取（`ImageDescription` 仍只服務下載 URL）。
+- **不**把完整雙份 SRT 塞進九宮格（SRT 只進 MP4）；九宮格只升 **WEB_META**（+ 保留 URL）。
 - 第一版不為 Eporner 自寫 HTML 補強 uploader／tags（yt-dlp 缺的欄位存 `null`）。
-- 不強制額外 sidecar `.json` 作為主儲存（meta 跟 MP4 走）。
+- 不強制額外 sidecar `.json` 作為主儲存（meta 跟 MP4／JPG 走）。
 
 ---
 
@@ -32,42 +33,48 @@
 
 | 能力 | 現況 |
 |------|------|
-| 九宮格 EXIF | 只嵌影片 URL；下載依賴此欄位 |
+| 九宮格 EXIF | **舊格式**：只嵌影片 URL（`ImageDescription`）；下載依賴此欄位 |
 | Pornhub 網頁 meta | yt-dlp 可取 tags、categories、cast、uploader、views、likes… |
-| Eporner 網頁 meta | yt-dlp 較薄（title、views、rating、description 關鍵字串等；無結構化 tags/uploader） |
-| 字幕 | MOSS 原文含 `[Sxx]`；`translate_cues`／`strip_speaker_labels` **會去掉**發言者後再寫 `.srt` |
-| MP4 comment 容量 | mutagen 寫入 `©cmt` 實測 1KB～2MB exact 讀回；實務雙份 SRT（約 10–50KB）足夠 |
+| Eporner 網頁 meta | yt-dlp 較薄（title、views、rating、description 關鍵字串等） |
+| 字幕 | MOSS 原文含 `[Sxx]`；翻譯路徑目前會 strip 發言者（本設計改為保留） |
+| MP4 comment 容量 | mutagen 寫入 `©cmt` 實測可到 2MB exact 讀回 |
 
 ---
 
 ## 3. 架構
 
 ```
-[capture_frames / JPG EXIF]  ──不變──►  run_download
-                                           │
-                                           ├─ 下載 MP4（現有邏輯）
-                                           └─ 成功後：寫入 WEB_META 到 MP4 tags
+[capture_frames]  新圖：URL + WEB_META 寫入 JPG
+        │
+        ▼
+[run_download]  讀 ImageDescription URL（舊／新格式皆可）
+        │
+        ├─ 下載 MP4（現有邏輯；已存在則跳過下載）
+        │
+        └─ FALLBACK 升級（下載成功或片已存在，best-effort）：
+              extract_info → WEB_META → MP4
+              若九宮格舊格式 → WEB_META → JPG UserComment（URL 不變）
 
 [run_subtitle]
     ASR → original_cues（含 [Sxx]）
-    翻譯 → translated_cues（**保留 [Sxx]**）
-    寫同名 .srt（翻譯，含 [Sxx]）
-    軟字幕 / 硬字幕（現有）
-    最後：合併寫入 ORIGINAL_SRT + TRANSLATED_SRT 到 MP4 comment
-           （並保留既有 WEB_META 區段）
+    翻譯 → translated_cues（只換正文，保留 [Sxx] + 時間）
+    寫同名 .srt = 只換翻譯版本
+    軟／硬字幕（現有）
+    最後：ORIGINAL_SRT + TRANSLATED_SRT 寫入 MP4 comment（保留 WEB_META）
 ```
 
 ### 元件
 
 | 元件 | 職責 |
 |------|------|
-| `video_meta.py`（新） | 序列化／解析 comment 區段；mutagen 讀寫；從 yt-dlp info 建 WEB_META |
-| `run_download.py` | 下載成功後呼叫寫入 WEB_META；**不改** EXIF 讀 URL |
+| `video_meta.py`（新） | 序列化／解析 comment 區段；mutagen 讀寫 MP4；Pillow 讀寫 JPG EXIF meta；`build_web_meta`；舊格式偵測與升級 |
+| `run_download.py` | 仍只從 `ImageDescription` 讀 URL；下載成功／片已存在後做 meta 升級 fallback |
+| `capture_frames.py` | **新產九宮格**即寫 URL + WEB_META（避免再產出舊格式） |
 | `translate_srt_openrouter.py` | 翻譯時保留發言者標籤（見 §5） |
-| `run_subtitle.py` | 翻譯後不再 strip；封裝後寫入雙份 SRT meta |
-| CLI 讀取（可掛在 `video_meta.py` 或小腳本） | 顯示／匯出 meta |
+| `run_subtitle.py` | 翻譯後不再 strip；封裝後寫入雙份完整 SRT meta |
+| CLI 讀取 | 顯示／匯出 MP4（與可選 JPG）meta |
 
-寫入實作優先使用 **mutagen** 直接改 MP4 atom，避免 Windows 下 `ffmpeg -metadata` 命令列長度限制。
+寫入 MP4 優先使用 **mutagen**；寫入 JPG 使用 **Pillow EXIF**（與現況一致）。
 
 ---
 
@@ -201,14 +208,55 @@ System prompt 可補一句：正文翻譯結果不要自行加 `[Sxx]` 前綴（
 
 ## 6. 流程細節
 
-### 6.1 `run_download`
+### 6.0 九宮格 meta 格式與舊版偵測
 
-1. 既有：從 JPG EXIF 讀 URL、yt-dlp／fallback 下載。
-2. **新增（僅 `download_success` 後）：**
-   - 若下載過程已有 `extract_info` 結果可重用則重用；否則對 `video_url` 再 `extract_info(download=False)` 一次（失敗則 log 警告，不讓下載算失敗）。
-   - `build_web_meta(info)` → `merge_write_mp4_meta(mp4_path, web_meta=…)`，**同時**寫入 §4.1 的 `title` / `artist` / `date`。
-3. low_videos 與 videos 兩路徑皆寫入。
-4. 圖片搬移／保留邏輯不變。
+| 欄位 | EXIF tag | 內容 |
+|------|----------|------|
+| 影片 URL（下載用） | `ImageDescription` `0x010e` | 純 URL 字串（**永遠保留，下載只讀此欄**） |
+| 網頁 meta | `UserComment` `0x9286` | 與 MP4 相同分區語法，至少含 `===WEB_META_V1===` + JSON（**不含**長 SRT） |
+
+**舊格式（URL-only）判定** — 任一成立即視為舊格式、需要升級：
+
+1. 有合法 URL 於 `ImageDescription`，且
+2. `UserComment` 缺失／空白，或 parse 後沒有可解析的 `WEB_META_V1` JSON。
+
+**新格式：** URL + 可讀 `WEB_META_V1`。
+
+讀寫 API（`video_meta.py`）：
+
+```text
+is_legacy_grid_jpg(path) -> bool
+read_grid_jpg_meta(path) -> {url, web_meta, raw_user_comment}
+write_grid_jpg_web_meta(path, web_meta, *, url=None) -> None
+  # url=None 時保留既有 ImageDescription；寫入時不得清空 URL
+```
+
+`UserComment` 寫入注意：Pillow 對 UserComment 常需 `charset` 前綴（如 `ascii\x00\x00\x00` 或 `UNICODE\x00`）；實作須 round-trip 測過再定 charset，以 UTF-8 可讀為準。
+
+### 6.1 `run_download`（含 FALLBACK 升級）
+
+1. 既有：從 JPG `ImageDescription` 讀 URL、yt-dlp／fallback 下載。**不改讀 URL 邏輯。**
+2. **升級觸發點（best-effort，失敗只警告）：**
+   - **A. 下載成功**後，或
+   - **B. 影片已存在而 skip 下載**時（重跑 download 可幫舊庫升級，不必重下片）。
+3. 升級步驟（共用 helper，例如 `upgrade_media_web_meta(jpg_path, mp4_path, video_url)`）：
+   1. `extract_info(url, download=False)`（失敗 → 警告並 return；**不**把下載標成 FAIL）。
+   2. `web = build_web_meta(info)`。
+   3. 若 `mp4_path` 存在 → `merge_write_mp4_meta(mp4, web_meta=web)`（補齊／覆寫 WEB；保留已有 SRT 區段）。
+   4. 若 `is_legacy_grid_jpg(jpg)` → `write_grid_jpg_web_meta(jpg, web)`，log：`[UPGRADE] 九宮格舊格式→已寫入 WEB_META`。
+   5. 若九宮格已是新格式：可選擇**仍用最新 info 覆寫** WEB_META（建議：覆寫，資料較新）或跳過；**預設覆寫**以與 MP4 一致。
+4. low_videos 與 videos 兩路徑皆適用。
+5. 圖片搬移／保留邏輯不變（videos 成功後仍搬到 `downloads/`；搬移前完成 JPG 升級，使 `downloads/` 內也是新格式）。
+
+### 6.1b `capture_frames`（新圖直接新格式）
+
+產九宮格存檔時：
+
+1. `ImageDescription` = `video_url`（同現況）。
+2. 用當次 `extract_video_info`／yt-dlp info 建 `build_web_meta`（若當次 info 欄位不足，可再一次輕量 extract 或只寫已有 title/duration + url）。
+3. `UserComment` = `===WEB_META_V1===\n{json}`。
+
+如此新截圖不再產出「只有網址」的舊格式；舊圖仍靠 §6.1 fallback 升級。
 
 ### 6.2 `run_subtitle`
 
@@ -251,31 +299,37 @@ python video_meta.py export path.mp4 --out-dir dir/
 
 | 情況 | 行為 |
 |------|------|
-| yt-dlp 取 meta 失敗 | 下載仍算成功；印警告；MP4 可不寫 WEB_META |
-| mutagen 寫入失敗 | 印錯誤；不 rollback 影片檔；不影響下載／字幕主流程成功碼（或字幕流程記 warning，可討論） |
+| yt-dlp 取 meta 失敗 | 下載仍算成功；印警告；不升級 MP4／JPG |
+| mutagen／Pillow 寫入失敗 | 印警告；不 rollback；不影響下載／字幕成功 |
 | comment 過大 | 實務不會；若未來需要可警告 > 2MB |
-| 舊片無 meta | 讀取回空；不報錯 |
+| 舊片／舊九宮格無 meta | 讀取回空；**重跑 run_download** 觸發 fallback 升級 |
 | 重封裝後 meta 遺失 | 字幕步驟結尾強制 mutagen 重寫字幕區 + 保留 web |
+| 無 URL 的九宮格 | 維持現況 SKIP 下載；無法升級 |
 
-建議：**meta 失敗不阻斷**主流程（下載／字幕），但 log 清楚，方便之後批次補寫。
+建議：**meta／升級失敗不阻斷**主流程（下載／字幕），但 log 清楚（含 `[UPGRADE]`），方便之後批次補寫。
 
 ---
 
 ## 8. 測試計畫
 
 1. **單元：`video_meta` 分區 parse/merge**  
-   - 只 WEB、只字幕、兩者皆有、未知區段保留。
+   - 只 WEB、只字幕、兩者皆有、未知區段保留；`None` 不刪既有區段。
 2. **單元：發言者與時間軸保留**  
    - `[S01] Hello` → 譯文以 `[S01] ` 開頭；無標籤句子不受影響；避免雙重前綴。  
    - 翻譯前後 `cue["time"]` 字串 identical；`format_srt` 含 `-->` 時間行。  
    - `build_web_meta` 含 `duration` / `duration_string` / `upload_date` / `timestamp` / `meta_written_at` keys。
-3. **整合（可用暫存小 MP4）：**  
-   - 寫 WEB_META → ffprobe/mutagen 讀回欄位一致（含 date tag 與 JSON 時間欄）。  
-   - 再寫雙 SRT → WEB 仍在、兩段 SRT exact（含時間軸）。  
-4. **回歸：**  
+3. **單元：九宮格舊／新格式**  
+   - 只有 `ImageDescription` URL → `is_legacy_grid_jpg` True。  
+   - 寫入 UserComment WEB_META 後 → False；URL 仍可讀。  
+   - round-trip `web_meta` JSON 一致。
+4. **整合（暫存小 MP4 + 小 JPG）：**  
+   - 寫 WEB_META → mutagen／Pillow 讀回。  
+   - 再寫雙 SRT → WEB 仍在、兩段 SRT exact。  
+   - 模擬 download helper：舊 JPG + 新 MP4 → 兩者皆有 WEB_META。  
+5. **回歸：**  
    - 無 EXIF 的 JPG 仍 skip；有 EXIF 下載路徑不因 meta 失敗而 FAIL。  
    - `run_subtitle` 軟字幕仍成功。  
-5. **既有測試：** 更新任何「翻譯後不得含 `[S01]`」的斷言，改為「必須保留」。
+6. **既有測試：** 更新任何「翻譯後不得含 `[S01]`」的斷言，改為「必須保留」。
 
 ---
 
@@ -295,12 +349,13 @@ python video_meta.py export path.mp4 --out-dir dir/
 
 ## 11. 實作順序（高階）
 
-1. `video_meta.py` + 單元測試（格式、讀寫）。  
+1. `video_meta.py` + 單元測試（格式、MP4／JPG 讀寫、legacy 偵測）。  
 2. 翻譯路徑保留 `[Sxx]` + 測試。  
-3. 接入 `run_download`（成功後 WEB_META）。  
-4. 接入 `run_subtitle`（雙 SRT + 合併寫入）。  
-5. CLI 讀取／export。  
-6. README。
+3. 接入 `run_download`（WEB_META + **舊九宮格 FALLBACK 升級**；片已存在也升級）。  
+4. `capture_frames` 新圖直接寫 URL+WEB_META。  
+5. 接入 `run_subtitle`（雙完整 SRT + 合併寫入）。  
+6. CLI 讀取／export。  
+7. README。
 
 ---
 
@@ -308,11 +363,13 @@ python video_meta.py export path.mp4 --out-dir dir/
 
 | 決策 | 選擇 | 原因 |
 |------|------|------|
-| 存哪 | 只 MP4，不動 JPG 下載鏈 | 使用者要求不影響下載流程 |
-| 字幕怎麼存 | comment 分區，不當字幕軌 | 只要 meta 封存；容量實測足夠 |
-| 寫入工具 | mutagen | 避開 Windows CLI 長度限制；大段多行可靠 |
+| 下載讀 URL | 仍只用 `ImageDescription` | 相容舊九宮格；下載鏈不破 |
+| 舊格式 FALLBACK | 下載成功或片已存在時抓 meta，升級 MP4+JPG | 使用者要求自動升級舊庫 |
+| 九宮格存什麼 | URL + WEB_META only（無 SRT） | 圖小、夠用；SRT 只進影片 |
+| 字幕怎麼存 | MP4 comment 分區，完整原格式 SRT | 封存用；容量實測足夠 |
+| 寫入工具 | mutagen（MP4）+ Pillow（JPG） | 可靠；避開 ffmpeg CLI 長度限制 |
 | EP meta | yt-dlp only | 第一版夠用；缺欄 null |
 | 發言者 | 原文＋翻譯都保留 | 使用者明確要求「前後都要保留 [S01]」 |
-| 時間 | 影片層級 + cue 時間軸都存 | 使用者要求「時間也要」；翻譯不得改 SRT 時間行 |
-| 雙份 SRT | 原本輸出 + 只換翻譯版本 | 結構／時間／`[Sxx]` 相同，只換正文；磁碟 `.srt` = 翻譯版 |
+| 時間 | 影片層級 + cue 時間軸都存 | 使用者要求「時間也要」 |
+| 雙份 SRT | 原本輸出 + 只換翻譯版本 | 結構相同，只換正文；`.srt` = 翻譯版 |
 | meta 失敗 | 不阻斷主流程 | 下載／字幕優先 |
