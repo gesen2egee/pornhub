@@ -62,8 +62,8 @@ pip install -r requirements.txt
 
 字幕流程支援兩個 backend：
 
-- `whisper`：預設值，沿用 `whisper/.venv` 的 faster-whisper。
-- `moss`：使用 MOSS-Transcribe-Diarize，同一次推理產生時間戳與 `[S01]`、`[S02]` 等匿名說話者標籤。
+- `moss`：預設值，使用 MOSS-Transcribe-Diarize，同一次推理產生時間戳與 `[S01]`、`[S02]` 等匿名說話者標籤。
+- `whisper`：可選，沿用 `whisper/.venv` 的 faster-whisper。
 
 ### Windows CUDA 安裝 MOSS
 
@@ -91,7 +91,13 @@ $env:ASR_BACKEND = "moss"
 .\run_subtitle.bat --force --limit 1
 ```
 
-不設定 `ASR_BACKEND` 時仍使用 Whisper。字幕完成後會沿用既有流程：OpenRouter 翻譯為繁體中文、輸出同名 SRT，再由 FFmpeg 封裝為軟字幕。`OPENROUTER_API_KEY` 預設從 OS 環境變數取得，不寫入專案檔案。
+不設定 `ASR_BACKEND` 時使用 MOSS。字幕完成後由 OpenRouter 翻譯為繁體中文並輸出同名 SRT；`low_videos/` 會由 FFmpeg 把繁中字幕直接燒入影片，一般 `videos/` 則維持不重新編碼的軟字幕。只處理全部低畫質影片可執行：
+
+```bat
+run_subtitle.bat --low-only
+```
+
+`OPENROUTER_API_KEY` 預設從 OS 環境變數取得，不寫入專案檔案。
 
 MOSS 可選設定：
 

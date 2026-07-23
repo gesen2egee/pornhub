@@ -12,8 +12,8 @@ from asr_backends import (
 )
 
 
-def test_resolve_backend_defaults_to_whisper():
-    assert resolve_backend({}) == "whisper"
+def test_resolve_backend_defaults_to_moss():
+    assert resolve_backend({}) == "moss"
 
 
 def test_resolve_backend_accepts_moss_case_insensitively():
@@ -63,14 +63,14 @@ def test_moss_segments_to_cues_rejects_empty_transcript():
         moss_segments_to_cues([])
 
 
-def test_create_backend_defaults_to_whisper(monkeypatch):
+def test_create_backend_defaults_to_moss(monkeypatch):
     monkeypatch.delenv("ASR_BACKEND", raising=False)
-    assert isinstance(create_backend(), WhisperBackend)
-
-
-def test_create_backend_selects_moss(monkeypatch):
-    monkeypatch.setenv("ASR_BACKEND", "moss")
     assert isinstance(create_backend(), MossBackend)
+
+
+def test_create_backend_selects_whisper(monkeypatch):
+    monkeypatch.setenv("ASR_BACKEND", "whisper")
+    assert isinstance(create_backend(), WhisperBackend)
 
 
 def test_moss_backend_refuses_cpu():

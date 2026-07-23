@@ -3,7 +3,7 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 
 set "ROOT=%~dp0"
-if not defined ASR_BACKEND set "ASR_BACKEND=whisper"
+if not defined ASR_BACKEND set "ASR_BACKEND=moss"
 
 if /I "%ASR_BACKEND%"=="whisper" (
     set "PYTHON=%ROOT%whisper\.venv\Scripts\python.exe"
@@ -24,7 +24,7 @@ if not exist "%PYTHON%" (
     exit /b 2
 )
 
-echo [開始] ASR_BACKEND=%ASR_BACKEND% -^> OpenRouter -^> 同目錄同名.srt -^> 覆蓋原始影片
+echo [開始] ASR_BACKEND=%ASR_BACKEND% -^> OpenRouter -^> 低畫質硬字幕／一般影片軟字幕
 "%PYTHON%" "%ROOT%run_subtitle.py" %*
 set "EXIT_CODE=%ERRORLEVEL%"
 echo [結束] ExitCode=%EXIT_CODE%

@@ -24,12 +24,20 @@ from translate_srt_openrouter import (  # noqa: E402
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm"}
 
 
-def _find_videos() -> list[Path]:
-    candidates: list[Path] = []
+def _low_video_directories() -> list[Path]:
+    directories: list[Path] = []
     configured_dir = os.getenv("LOW_VIDEO_DIR")
     if configured_dir:
-        candidates.append(Path(configured_dir))
-    candidates.extend([ROOT / "low_videos", ROOT / "low_video", VIDEOS])
+        directories.append(Path(configured_dir))
+    directories.extend([ROOT / "low_videos", ROOT / "low_video"])
+    return directories
+
+
+def _find_videos(low_only: bool = False) -> list[Path]:
+    candidates: list[Path] = []
+    candidates.extend(_low_video_directories())
+    if not low_only:
+        candidates.append(VIDEOS)
     existing_dirs = [path for path in candidates if path.exists()]
     if not existing_dirs:
         raise FileNotFoundError(
@@ -81,6 +89,94 @@ def _has_soft_subtitle(video: Path) -> bool:
 
 def _subtitle_path(video: Path) -> Path:
     return video.with_suffix(".srt")
+
+
+def _uses_hard_subtitle(video: Path) -> bool:
+    video_parent = video.parent.resolve()
+    return any(
+        directory.exists() and directory.resolve() == video_parent
+        for directory in _low_video_directories()
+    )
+
+
+def _has_current_hard_subtitle(video: Path) -> bool:
+    subtitle = _subtitle_path(video)
+    return (
+        subtitle.exists()
+        and video.exists()
+        and video.stat().st_mtime_ns >= subtitle.stat().st_mtime_ns
+    )
+
+
+def _ffmpeg_filter_value(value: str) -> str:
+    return value.replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
+
+
+def _burn_hard_subtitle(
+    video: Path, subtitle: Path, output_video: Path, force: bool
+) -> Path:
+    ffmpeg = os.getenv("FFMPEG_EXE", "ffmpeg")
+    temporary_output = output_video.with_name(
+        f".{output_video.stem}.hardsub.tmp{output_video.suffix}"
+    )
+    subtitle_name = _ffmpeg_filter_value(subtitle.name)
+    subtitle_filter = (
+        f"subtitles=filename='{subtitle_name}':"
+        "force_style='FontName=Microsoft JhengHei,FontSize=18,"
+        "Outline=2,Shadow=1,MarginV=18,Alignment=2'"
+    )
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        video.name,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-map_metadata",
+        "0",
+        "-vf",
+        subtitle_filter,
+        "-c:v",
+        "libx264",
+        "-preset",
+        os.getenv("HARDSUB_PRESET", "veryfast"),
+        "-crf",
+        os.getenv("HARDSUB_CRF", "20"),
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        temporary_output.name,
+    ]
+    print("  3/3 ffmpeg 繁中硬字幕燒錄", flush=True)
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            cwd=str(video.parent),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "找不到 ffmpeg。請先把 ffmpeg 加入 PATH，或設定 FFMPEG_EXE。"
+        ) from exc
+
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"ffmpeg 硬字幕燒錄失敗：{details[-1000:]}")
+    temporary_output.replace(output_video)
+    print(f"完成硬字幕並覆蓋原始影片：{output_video}", flush=True)
+    return output_video
 
 
 def _embed_soft_subtitle(
@@ -182,6 +278,8 @@ def process_video(
         temporary_output.replace(output_srt)
         print(f"完成：{output_srt}", flush=True)
 
+    if _uses_hard_subtitle(video):
+        return _burn_hard_subtitle(video, output_srt, output_video, force)
     return _embed_soft_subtitle(video, output_srt, output_video, force)
 
 
@@ -190,9 +288,14 @@ def main() -> int:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="重新產生 SRT，並重新封裝後覆蓋原始影片",
+        help="重新產生 SRT，並重新製作字幕影片",
     )
     parser.add_argument("--limit", type=int, default=0, help="只處理前 N 部影片，0 表示全部")
+    parser.add_argument(
+        "--low-only",
+        action="store_true",
+        help="只處理 low_videos／LOW_VIDEO_DIR，不處理一般 videos",
+    )
     parser.add_argument("--dry-run", action="store_true", help="只列出待處理影片，不呼叫模型/API")
     args = parser.parse_args()
 
@@ -202,7 +305,7 @@ def main() -> int:
         print(f"錯誤：{exc}", file=sys.stderr)
         return 2
 
-    videos = _find_videos()
+    videos = _find_videos(low_only=args.low_only)
     if not videos:
         print("low_videos、low_video、videos 都沒有可處理的影片。")
         return 0 if args.dry_run else 1
@@ -212,21 +315,26 @@ def main() -> int:
         if (
             args.force
             or not _subtitle_path(video).exists()
-            or not _has_soft_subtitle(video)
+            or (
+                not _has_current_hard_subtitle(video)
+                if _uses_hard_subtitle(video)
+                else not _has_soft_subtitle(video)
+            )
         )
     ]
     skipped = len(videos) - len(pending)
     if args.limit > 0:
         pending = pending[: args.limit]
     print(
-        f"來源影片：{len(videos)} 部；略過已有 SRT 與軟字幕影片：{skipped} 部；待處理：{len(pending)} 部",
+        f"來源影片：{len(videos)} 部；略過已完成字幕影片：{skipped} 部；待處理：{len(pending)} 部",
         flush=True,
     )
     if args.dry_run:
         for video in pending:
+            subtitle_mode = "硬字幕" if _uses_hard_subtitle(video) else "軟字幕"
             print(
                 f"{video} -> {_subtitle_path(video)} + "
-                f"覆蓋原始影片"
+                f"{subtitle_mode}覆蓋原始影片"
             )
         return 0
     if not pending:

@@ -20,9 +20,9 @@ DEFAULT_MOSS_PROMPT = (
 
 
 def resolve_backend(environment: Mapping[str, str] | None = None) -> str:
-    """解析 ASR backend；未設定時保持既有 Whisper 行為。"""
+    """解析 ASR backend；未設定時預設使用 MOSS。"""
     environment = os.environ if environment is None else environment
-    backend = environment.get("ASR_BACKEND", "whisper").strip().lower() or "whisper"
+    backend = environment.get("ASR_BACKEND", "moss").strip().lower() or "moss"
     if backend not in {"whisper", "moss"}:
         raise ValueError("ASR_BACKEND 只允許 whisper、moss。")
     return backend

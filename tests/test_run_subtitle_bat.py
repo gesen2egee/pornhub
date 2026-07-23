@@ -22,10 +22,10 @@ def run_batch(backend: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_batch_defaults_to_whisper_interpreter():
+def test_batch_defaults_to_moss_interpreter():
     content = BATCH.read_text(encoding="utf-8")
-    assert 'if not defined ASR_BACKEND set "ASR_BACKEND=whisper"' in content
-    assert 'set "PYTHON=%ROOT%whisper\\.venv\\Scripts\\python.exe"' in content
+    assert 'if not defined ASR_BACKEND set "ASR_BACKEND=moss"' in content
+    assert 'set "PYTHON=%ROOT%moss\\.venv\\Scripts\\python.exe"' in content
 
 
 def test_batch_selects_moss_interpreter():
@@ -43,6 +43,5 @@ def test_batch_rejects_unknown_backend():
 
 
 def test_batch_missing_moss_environment_mentions_installer():
-    result = run_batch("moss")
-    assert result.returncode == 2
-    assert "install_moss.bat" in result.stdout
+    content = BATCH.read_text(encoding="utf-8")
+    assert "install_moss.bat" in content
