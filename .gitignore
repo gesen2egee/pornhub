@@ -9,6 +9,9 @@ downloads/
 tasks/
 *.log
 
+# 壓縮封存檔
+*.zip
+
 # 暫存檔與快取
 temp/
 .temp_*/
