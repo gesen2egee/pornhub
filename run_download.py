@@ -244,7 +244,7 @@ def run_download_process():
         print("\n==================================================")
         print(" [階段 2/2] 開始處理 videos/ (最高畫質下載)")
         print("==================================================")
-        process_single_directory("videos", is_low_quality=False, preview_map=preview_map, target_json_path=target_json_path)
+        process_single_directory("videos", is_low_quality=False)
 
     print("\n==================================================")
     print(f"[ALL DONE] 雙階段下載作業全數完畢！")
