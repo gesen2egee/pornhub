@@ -58,27 +58,29 @@
         ├─ build_page_url(url, page)
         ├─ extract_list_urls(page_url)  → video URLs
         ├─ is_single_video(url)
-        └─ ydl_opts(context)            → extra yt-dlp options
+        ├─ ydl_opts(context)
+        ├─ extract_info(url)            → optional dict | None
+        └─ resolve_stream(url)          → optional stream | None
         │
         ▼
-[capture_frames]  九宮格 + EXIF URL + WEB_META
+[capture_frames]  單片解析同一套 §3 順序 → 九宮格 + EXIF URL + WEB_META
         │
         ▼
-[run_download]    讀 URL → yt-dlp (adapter.ydl_opts) → low/full
-                  Pornhub fallback 保留；他站無則略過
+[run_download]    讀 URL → 同一套 §3 順序 → low/full
+                  僅 Pornhub 保留 HTML MP4 fallback
 ```
 
 ### 元件
 
 | 元件 | 職責 |
 |------|------|
-| `lib/sites/base.py` | `SiteAdapter` 協定／基底：match、search、分頁、列表、單片判斷、ydl_opts |
+| `lib/sites/base.py` | `SiteAdapter`：match、search、分頁、列表、單片、ydl_opts、可選 extract_info／resolve_stream（預設回 `None`，不 raise） |
 | `lib/sites/registry.py` | 註冊與 `get_adapter_for_url` / `default_adapter` |
 | `lib/sites/http_util.py` | 共用 UA、age cookie、fetch HTML（薄封裝） |
 | `lib/sites/<name>.py` | 各站薄適配（見 §4） |
 | `lib/sites/__init__.py` | 匯出 registry 公開 API |
-| `capture_frames.py` | 移除硬編碼 pornhub/eporner 分支，改呼叫 registry |
-| `run_download.py` | 下載／extract_info 時合併 `adapter.ydl_opts`；Pornhub fallback 仍限 pornhub |
+| `capture_frames.py` | 列表走 registry；`extract_video_info` 走 §3 單片順序 |
+| `run_download.py` | 下載／META 走 §3 單片順序；Pornhub HTML fallback 仍限 pornhub |
 | `tasks/plugins-research/` | clone 研究用 repo（gitignore 或文件說明可重 clone） |
 | `tasks/tests/test_sites_smoke.py` | 每站真實連線五項 smoke |
 
@@ -98,7 +100,7 @@ class SiteAdapter:
     def ydl_opts(self, purpose: str) -> dict: ...
     # purpose: "list" | "info" | "download_low" | "download_full"
 
-    # 可選 hooks（預設 NotImplemented / 回傳 None → 走通用路徑）
+    # 可選 hooks：base 固定 return None（不 raise），呼叫端 null-check
     def extract_info(self, video_url: str, purpose: str) -> dict | None: ...
     def resolve_stream(self, video_url: str, prefer_lowest: bool) -> dict | None:
         # 可回傳 {"url": stream_or_m3u8, "http_headers": {...}, "info": partial_info}
@@ -110,16 +112,18 @@ class SiteAdapter:
 - `build_page_url`：query `page=`
 - `extract_list_urls`：先站點 HTML 規則（若覆寫），否則 `yt-dlp extract_flat`
 - `ydl_opts`：`{}`（沿用全域設定）
-- `extract_info` / `resolve_stream`：回傳 `None`（不攔截）
+- `extract_info` / `resolve_stream`：固定 `return None`（不 raise）
 - 關鍵字非 URL：用 **default adapter = Eporner** 的 `search_url`
 
-**單片 info／下載呼叫順序（固定）：**
+**單片 info／串流／下載呼叫順序（固定；capture 與 download 共用）：**
 
-1. 若 adapter 實作 `extract_info` 且回傳 dict → 用於 META／時長／標題（可與下載分開）。  
-2. 下載：若 adapter 實作 `resolve_stream` 且回傳可下載 `url` → 以該串流 + headers 交給既有 ffmpeg／yt-dlp URL 下載路徑（含 low 區間）。  
+1. 若 `extract_info(...)` 回傳 dict → 取 title／duration／WEB_META 原料；若 dict 已含可播 `url`（或 stream 欄位）可直接用於截幀。  
+2. 若仍缺可播串流：若 `resolve_stream(...)` 回傳 `{"url", "http_headers", ...}` → 用於截幀與下載（含 low 區間）。  
 3. 否則：`yt-dlp` + `adapter.ydl_opts(purpose)`（**Tier 1 主路徑**；Tier 3 優先靠 headers／referer／format 讓 yt-dlp 過）。  
-4. 僅 Pornhub：既有 HTML MP4 fallback。  
+4. 僅 Pornhub：既有 HTML MP4 fallback（download 路徑；capture 若 yt-dlp 已能給 stream 則不必）。  
 5. 仍失敗 → 該片失敗；smoke 則 **skip** 並寫 status（不擴成每站完整下載器）。
+
+Smoke #3（預覽）／#4（META）／#5（low）必須共用上述策略，避免「能下載不能截幀」的不一致實作。
 
 **Tier 3 內建邊界：** 研究 plugin 後，優先把「能讓 yt-dlp 成功的 opts + 列表 HTML」內建；僅當 yt-dlp 仍無法解析時，才在該 adapter 實作 `resolve_stream`／`extract_info`（m3u8 + Referer 等），**禁止** runtime import research 目錄。
 
@@ -173,7 +177,7 @@ class SiteAdapter:
 ### capture_frames
 
 - `get_start_page_from_url` / `build_page_url` / `extract_single_page_urls` / 關鍵字轉搜尋 → 改走 registry。  
-- `extract_video_info`：`YoutubeDL({**base, **adapter.ydl_opts("info")})`。  
+- `extract_video_info`：**必須**走 §3 單片順序（`extract_info` → `resolve_stream` → yt-dlp+`ydl_opts("info")`），產出 title、duration、`stream_url`、`http_headers`、`web_meta`；不得在 capture 路徑只接 yt-dlp 而忽略 hooks。  
 - 九宮格寫入：維持 URL + WEB_META（既有 `video_meta`）。  
 - 輸出資料夾命名：可用 adapter.name 或既有 search_ 標籤邏輯，不破壞時間戳格式。
 
