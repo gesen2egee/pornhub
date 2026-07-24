@@ -10,6 +10,7 @@ from sites.eporner import DEFAULT_URL as EPORNER_DEFAULT_URL
 from sites.eporner import EpornerAdapter
 from sites.eroprofile import EroProfileAdapter
 from sites.hanime import HanimeAdapter
+from sites.hypnotube import HypnoTubeAdapter
 from sites.jable import JableAdapter
 from sites.missav import MissAVAdapter
 from sites.porn91 import Porn91Adapter
@@ -60,6 +61,7 @@ def ensure_registered() -> None:
     register(JableAdapter())
     register(Porn91Adapter())
     register(HanimeAdapter())
+    register(HypnoTubeAdapter())
     _REGISTERED = True
 
 

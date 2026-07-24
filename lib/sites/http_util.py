@@ -29,9 +29,50 @@ def default_headers(url: str | None = None) -> dict[str, str]:
 
 
 def fetch_html(url: str, timeout: int = 15) -> str:
+    """Plain urllib fetch (no TLS fingerprint impersonation)."""
     req = urllib.request.Request(url, headers=default_headers(url))
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="ignore")
+
+
+def fetch_html_impersonate(url: str, timeout: int = 20, impersonate: str = "chrome") -> str:
+    """
+    Headless-ish HTML fetch via curl_cffi browser TLS impersonation.
+    Falls back to urllib if curl_cffi is unavailable.
+    """
+    try:
+        from curl_cffi import requests as cf_requests
+    except ImportError:
+        return fetch_html(url, timeout=timeout)
+
+    headers = default_headers(url)
+    resp = cf_requests.get(
+        url,
+        headers=headers,
+        timeout=timeout,
+        impersonate=impersonate,
+        allow_redirects=True,
+    )
+    resp.raise_for_status()
+    text = resp.text or ""
+    if isinstance(text, bytes):
+        return text.decode("utf-8", errors="ignore")
+    return text
+
+
+def fetch_html_best(url: str, timeout: int = 20) -> tuple[str, str]:
+    """
+    Try impersonate first, then plain urllib.
+    Returns (html, method) where method is 'curl_cffi' or 'urllib'.
+    """
+    try:
+        html = fetch_html_impersonate(url, timeout=timeout)
+        if html and len(html) > 500 and "just a moment" not in html.lower():
+            return html, "curl_cffi"
+    except Exception:
+        pass
+    html = fetch_html(url, timeout=timeout)
+    return html, "urllib"
 
 
 def hostname_of(url: str) -> str:

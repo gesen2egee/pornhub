@@ -7,7 +7,8 @@ import urllib.parse
 from typing import Any
 
 from sites.base import SiteAdapter
-from sites.http_util import DEFAULT_UA
+from sites.http_util import DEFAULT_UA, fetch_html_best
+from sites.scrape_meta import scrape_info_from_html
 
 
 class MissAVAdapter(SiteAdapter):
@@ -58,7 +59,7 @@ class MissAVAdapter(SiteAdapter):
 
     def extract_list_urls_from_html(self, page_url: str) -> list[str]:
         try:
-            html = self.fetch_html(page_url)
+            html, _ = fetch_html_best(page_url)
         except Exception:
             return []
         hrefs = re.findall(r'href="(https?://[^"]*missav[^"]+)"', html, re.I)
@@ -77,35 +78,31 @@ class MissAVAdapter(SiteAdapter):
                 urls.append(full)
         return urls
 
+    def extract_info(self, video_url: str, purpose: str) -> dict[str, Any] | None:
+        del purpose
+        try:
+            html, method = fetch_html_best(video_url)
+        except Exception:
+            return None
+        info = scrape_info_from_html(html, video_url)
+        info["extractor"] = "MissAV"
+        info["_scrape_method"] = method
+        return info if info.get("title") or info.get("url") else None
+
     def resolve_stream(
         self,
         video_url: str,
         prefer_lowest: bool = False,
     ) -> dict[str, Any] | None:
         del prefer_lowest
-        try:
-            html = self.fetch_html(video_url)
-        except Exception:
+        info = self.extract_info(video_url, "info")
+        if not info or not info.get("url"):
             return None
-        m = re.search(r"https?://[^\"'\s]+\.m3u8[^\"'\s]*", html, re.I)
-        if not m:
-            # common packed forms
-            m = re.search(r"source\s*[:=]\s*['\"](https?://[^'\"]+\.m3u8[^'\"]*)['\"]", html, re.I)
-        if not m:
-            return None
-        stream = m.group(1) if m.lastindex else m.group(0)
-        stream = stream.replace("\\/", "/")
-        title_m = re.search(r"<title>([^<]+)</title>", html, re.I)
-        title = title_m.group(1).strip() if title_m else None
         return {
-            "url": stream,
+            "url": info["url"],
             "http_headers": {
                 "User-Agent": DEFAULT_UA,
                 "Referer": "https://missav.ai/",
             },
-            "info": {
-                "title": title,
-                "webpage_url": video_url,
-                "url": stream,
-            },
+            "info": info,
         }

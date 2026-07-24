@@ -37,6 +37,9 @@ def test_match_known_hosts():
     assert sites.get_adapter_for_url(
         "https://www.eroprofile.com/m/videos/view/abc"
     ).name == "eroprofile"
+    assert sites.get_adapter_for_url(
+        "https://hypnotube.com/video/some-slug-12345.html"
+    ).name == "hypnotube"
     assert sites.get_adapter_for_url("https://unknown.example/v/1").name == "generic"
 
 
