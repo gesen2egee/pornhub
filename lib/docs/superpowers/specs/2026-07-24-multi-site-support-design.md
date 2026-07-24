@@ -115,15 +115,20 @@ class SiteAdapter:
 - `extract_info` / `resolve_stream`：固定 `return None`（不 raise）
 - 關鍵字非 URL：用 **default adapter = Eporner** 的 `search_url`
 
-**單片 info／串流／下載呼叫順序（固定；capture 與 download 共用）：**
+**單片 info／串流解析（固定；capture 與 download 必須同一 helper）：**
 
-1. 若 `extract_info(...)` 回傳 dict → 取 title／duration／WEB_META 原料；若 dict 已含可播 `url`（或 stream 欄位）可直接用於截幀。  
-2. 若仍缺可播串流：若 `resolve_stream(...)` 回傳 `{"url", "http_headers", ...}` → 用於截幀與下載（含 low 區間）。  
+建議集中在 `lib/sites/resolve.py` 的 `resolve_playable(adapter, video_url, purpose, prefer_lowest)`，回傳統一結構：
+`{"info": dict|None, "stream_url": str|None, "http_headers": dict, "source": "extract_info"|"resolve_stream"|"yt_dlp"|"pornhub_fallback"}`。
+
+順序：
+
+1. 若 `extract_info(...)` 回傳 dict → 填 `info`（title／duration／WEB_META 原料）；若 dict 已含可播 `url`（或同等 stream 欄位）→ **截幀與下載同權使用**該 URL。  
+2. 若仍缺可播串流：若 `resolve_stream(...)` 回傳 `{"url", "http_headers", ...}` → **截幀與下載同權使用**。  
 3. 否則：`yt-dlp` + `adapter.ydl_opts(purpose)`（**Tier 1 主路徑**；Tier 3 優先靠 headers／referer／format 讓 yt-dlp 過）。  
-4. 僅 Pornhub：既有 HTML MP4 fallback（download 路徑；capture 若 yt-dlp 已能給 stream 則不必）。  
+4. 僅 Pornhub 且仍失敗：既有 HTML MP4 fallback（download；若 capture 需要 stream 且前三步皆無，亦可呼叫同一 fallback 僅取 URL，不強制）。  
 5. 仍失敗 → 該片失敗；smoke 則 **skip** 並寫 status（不擴成每站完整下載器）。
 
-Smoke #3（預覽）／#4（META）／#5（low）必須共用上述策略，避免「能下載不能截幀」的不一致實作。
+Smoke #3（預覽）／#4（META）／#5（low）必須呼叫同一 `resolve_playable`，禁止 capture／download 各寫一套順序。
 
 **Tier 3 內建邊界：** 研究 plugin 後，優先把「能讓 yt-dlp 成功的 opts + 列表 HTML」內建；僅當 yt-dlp 仍無法解析時，才在該 adapter 實作 `resolve_stream`／`extract_info`（m3u8 + Referer 等），**禁止** runtime import research 目錄。
 
@@ -155,7 +160,7 @@ Smoke #3（預覽）／#4（META）／#5（low）必須共用上述策略，避�
 |----|---------------------------|----------|
 | **MissAV** | `yt-dlp-plugin-yellow`（或同等 yellow 系） | 優先 ydl_opts（headers/referer）；不足再 `resolve_stream`（m3u8） |
 | **Jable.tv** | 同上 | 同上 |
-| **91porn** | 同上 | cookies：`SITE_91PORN_COOKIES`；未設定 smoke skip（`needs_cookies`） |
+| **91porn** | 同上 | cookies：`SITE_91PORN_COOKIES` = **本機 Netscape cookies.txt 檔案路徑**；未設定 smoke skip（`needs_cookies`） |
 | **hanime.tv** | `hanime-plugin` 或同等 | 優先 opts；不足再 extract_info／resolve_stream |
 | **HentaiHaven / hstream.moe** | 若與 hanime 同源邏輯 | optional；同源則共用 base，否則 skip 並記錄 |
 
@@ -177,16 +182,17 @@ Smoke #3（預覽）／#4（META）／#5（low）必須共用上述策略，避�
 ### capture_frames
 
 - `get_start_page_from_url` / `build_page_url` / `extract_single_page_urls` / 關鍵字轉搜尋 → 改走 registry。  
-- `extract_video_info`：**必須**走 §3 單片順序（`extract_info` → `resolve_stream` → yt-dlp+`ydl_opts("info")`），產出 title、duration、`stream_url`、`http_headers`、`web_meta`；不得在 capture 路徑只接 yt-dlp 而忽略 hooks。  
+- `extract_video_info`：**必須**呼叫 `resolve_playable(..., purpose="info")`（§3 同一 helper），產出 title、duration、`stream_url`、`http_headers`、`web_meta`；禁止另寫一套 yt-dlp-only 路徑。  
 - 九宮格寫入：維持 URL + WEB_META（既有 `video_meta`）。  
 - 輸出資料夾命名：可用 adapter.name 或既有 search_ 標籤邏輯，不破壞時間戳格式。
 
 ### run_download
 
 - 自 JPG 讀 URL 後 `get_adapter_for_url`。  
-- 下載依 §3 **呼叫順序**：`resolve_stream` → yt-dlp+`ydl_opts` → 僅 Pornhub HTML fallback。  
-- `is_pornhub_url` + `direct_fetch_pornhub_mp4_stream` 保留，不泛化到他站。  
-- META 升級：優先 adapter `extract_info`；否則 `YoutubeDL` + `ydl_opts("info")` 再 `build_web_meta`。
+- 下載串流與 META **不得另寫順序**：呼叫與 capture 相同的 `resolve_playable(...)`（§3 完整五步）。  
+  - 下載：使用回傳的 `stream_url`／headers（或 yt-dlp 路徑，依 `source`）。  
+  - META：使用回傳的 `info`（若有）→ `build_web_meta`；`info` 不足可再輕量 extract，但不改串流決策。  
+- `direct_fetch_pornhub_mp4_stream` 僅作為 `resolve_playable` 第 4 步實作細節，不泛化到他站。
 
 ### video_meta
 
@@ -237,7 +243,7 @@ lib\.venv\Scripts\python.exe -m pytest -q tasks\tests\test_sites_smoke.py -m sit
 
 | 情況 | 行為 |
 |------|------|
-| 未知 host | 通用 adapter：extract_flat + query 分頁；列表失敗則當單 URL |
+| 未知 host | `GenericAdapter`（`lib/sites/generic.py`）：extract_flat + query 分頁；列表失敗則當單 URL |
 | 列表空 | 回傳 `[]`；capture 印警告 |
 | yt-dlp extract 失敗 | 與現況相同：該片跳過／記 log |
 | META 失敗 | 不阻斷下載（既有原則） |
@@ -249,7 +255,7 @@ lib\.venv\Scripts\python.exe -m pytest -q tasks\tests\test_sites_smoke.py -m sit
 
 | 路徑 | 動作 |
 |------|------|
-| `lib/sites/*.py` | 新增 |
+| `lib/sites/*.py`（含 `resolve.py`、`generic.py`） | 新增 |
 | `lib/capture_frames.py` | 改為 registry |
 | `lib/run_download.py` | 合併 ydl_opts；小幅 |
 | `lib/tests/test_sites_*.py` | 可選單元 |
