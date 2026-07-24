@@ -14,12 +14,8 @@ import video_meta
 
 MAX_VIDEO_WIDTH = 1920
 MAX_VIDEO_HEIGHT = 1080
-HIGH_VIDEO_FORMAT = (
-    "bestvideo[width<=1920][height<=1080]+bestaudio/"
-    "bestvideo[width<=1080][height<=1920]+bestaudio/"
-    "best[width<=1920][height<=1080]/"
-    "best[width<=1080][height<=1920]"
-)
+HIGH_VIDEO_FORMAT = "bestvideo*+bestaudio/best"
+HIGH_VIDEO_FORMAT_SORT = ["res:1080"]
 
 if sys.platform == 'win32':
     try:
@@ -217,6 +213,17 @@ def _backup_over_1080_video(video_path):
     return destination
 
 
+def _grid_for_video_in_directory(video_path, directory):
+    """依去編號後檔名尋找同名九宮格。"""
+    video_stem = os.path.splitext(os.path.basename(video_path))[0].casefold()
+    for grid_path in glob.glob(os.path.join(directory, "*.jpg")):
+        grid_stem = os.path.splitext(os.path.basename(grid_path))[0]
+        normalized = re.sub(r"^\d{4}-", "", grid_stem).casefold()
+        if normalized == video_stem:
+            return grid_path
+    return None
+
+
 def prepare_over_1080_redownloads():
     """備份現有超標影片、還原九宮格，回傳只需重下載的九宮格。"""
     selected_grids = []
@@ -236,10 +243,11 @@ def prepare_over_1080_redownloads():
                 continue
 
             archived_grid = _archived_grid_for_video(video_path)
-            local_grid = os.path.join(
-                ROOT,
-                "videos",
-                os.path.basename(archived_grid),
+            local_grid = _grid_for_video_in_directory(
+                video_path,
+                os.path.join(ROOT, "videos"),
+            ) or os.path.join(
+                ROOT, "videos", os.path.basename(archived_grid)
             )
             source_grid = (
                 archived_grid
@@ -277,6 +285,32 @@ def prepare_over_1080_redownloads():
             print(
                 f"[REQUEUE] {dimensions[0]}×{dimensions[1]} 已備份至 "
                 f"{backup_path}，九宮格已排入 1080P 重下載"
+            )
+
+    backup_root = os.path.join(ROOT, "temp", "over-1080-backup")
+    for backup_video in glob.glob(
+        os.path.join(backup_root, "**", "*.mp4"),
+        recursive=True,
+    ):
+        basename = os.path.basename(backup_video)
+        if os.path.exists(os.path.join(ROOT, "videos", basename)):
+            continue
+        if os.path.exists(
+            os.path.join(ROOT, "temp", "pipeline", "videos", basename)
+        ):
+            continue
+        local_grid = _grid_for_video_in_directory(
+            backup_video,
+            os.path.join(ROOT, "videos"),
+        )
+        if (
+            local_grid
+            and get_video_url_from_image(local_grid)
+            and local_grid not in selected_grids
+        ):
+            selected_grids.append(local_grid)
+            print(
+                f"[RESUME] 接續先前未成功的 1080P 重下載：{basename}"
             )
     return selected_grids
 
@@ -587,6 +621,7 @@ def process_single_directory(
 
     success_count = 0
     skipped_count = 0
+    failed_count = 0
     prompted_upgrade = False
 
     for idx, jpg_path in enumerate(jpg_files, 1):
@@ -718,6 +753,8 @@ def process_single_directory(
             'extractor_retries': DOWNLOAD_RETRIES,
             'file_access_retries': DOWNLOAD_RETRIES,
         }
+        if not is_low_quality:
+            ydl_opts["format_sort"] = HIGH_VIDEO_FORMAT_SORT
 
         # videos 模式 (最高畫質) 內嵌縮圖封面
         if not is_low_quality:
@@ -851,8 +888,13 @@ def process_single_directory(
             success_count += 1
         else:
             print(f"  [FAIL] 影片下載失敗: {video_url}\n")
+            failed_count += 1
 
-    print(f"[*] [{target_dir}/] 處理完成: 成功下載 {success_count} 部 | 已存在/跳過 {skipped_count} 部")
+    print(
+        f"[*] [{target_dir}/] 處理完成: 成功下載 {success_count} 部 | "
+        f"已存在/跳過 {skipped_count} 部 | 失敗 {failed_count} 部"
+    )
+    return failed_count
 
 def run_download_process(
     retry_subtitles=False,
@@ -890,6 +932,7 @@ def run_download_process(
 
     print(f"[+] 檢測到 low_videos/ ({len(low_jpgs)} 張圖片) | videos/ ({len(high_jpgs)} 張圖片)\n")
 
+    download_failures = 0
     try:
         subtitle_worker = SubtitleWorker()
     except Exception as exc:
@@ -919,10 +962,10 @@ def run_download_process(
             print("==================================================")
             print(" [階段 1/2] 開始處理 low_videos/ (最低解析度/動態30秒取樣)")
             print("==================================================")
-            process_single_directory(
+            download_failures += process_single_directory(
                 "low_videos", is_low_quality=True,
                 subtitle_worker=subtitle_worker,
-            )
+            ) or 0
 
         if not retry_subtitles and not repair_over_1080:
             enqueue_official_subtitle_retries(
@@ -939,7 +982,7 @@ def run_download_process(
             print("\n==================================================")
             print(" [階段 2/2] 開始處理 videos/ (最高畫質下載)")
             print("==================================================")
-            process_single_directory(
+            download_failures += process_single_directory(
                 "videos", is_low_quality=False,
                 subtitle_worker=subtitle_worker,
                 selected_jpgs=(
@@ -947,7 +990,7 @@ def run_download_process(
                     if repair_over_1080
                     else None
                 ),
-            )
+            ) or 0
     finally:
         print("\n[*] 下載佇列完成，等待背景字幕管線處理剩餘影片...")
         subtitle_exit = subtitle_worker.close()
@@ -956,6 +999,12 @@ def run_download_process(
     if subtitle_exit:
         print("[未完成] 部分字幕流程失敗，相關九宮格保留在原資料夾。")
         return subtitle_exit
+    if download_failures:
+        print(
+            f"[未完成] 有 {download_failures} 支影片下載失敗，"
+            "九宮格已保留供下次重試。"
+        )
+        return 3
     print("[ALL DONE] 下載、完整字幕與九宮格歸檔全數完成！")
     return 0
 

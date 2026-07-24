@@ -6,6 +6,8 @@ import run_download
 
 
 def test_1080p_limit_accepts_landscape_and_portrait():
+    assert run_download.HIGH_VIDEO_FORMAT == "bestvideo*+bestaudio/best"
+    assert run_download.HIGH_VIDEO_FORMAT_SORT == ["res:1080"]
     assert run_download.is_within_1080p_dimensions(1920, 1080)
     assert run_download.is_within_1080p_dimensions(1080, 1920)
     assert run_download.is_within_1080p_dimensions(810, 1440)
