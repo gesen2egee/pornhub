@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 from collections.abc import Mapping
 from pathlib import Path
@@ -157,6 +158,12 @@ class MossBackend:
         )
         segments = list(self._parse(result["text"]))
         return moss_segments_to_cues(segments), "multilingual"
+
+    def release_transient_memory(self) -> None:
+        """保留模型但釋放每個 ASR 分段產生的暫存 CPU／CUDA cache。"""
+        gc.collect()
+        if self._torch is not None and self._torch.cuda.is_available():
+            self._torch.cuda.empty_cache()
 
 
 def create_backend() -> MossBackend:

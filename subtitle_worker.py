@@ -334,6 +334,7 @@ class RuntimeSupervisor:
                     return False, "字幕 runtime 回報格式錯誤"
                 return bool(result.get("ok")), result.get("error")
             print(line, end="", flush=True)
+            deadline = time.monotonic() + timeout
 
     def close(self) -> None:
         process = self.process

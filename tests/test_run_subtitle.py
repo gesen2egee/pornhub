@@ -189,6 +189,7 @@ def test_chunked_asr_merges_timestamps_into_full_timeline(
     class ChunkBackend:
         def __init__(self):
             self.inputs = []
+            self.releases = 0
 
         def transcribe(self, path):
             self.inputs.append(path)
@@ -201,11 +202,15 @@ def test_chunked_asr_merges_timestamps_into_full_timeline(
                 "en",
             )
 
+        def release_transient_memory(self):
+            self.releases += 1
+
     backend = ChunkBackend()
     cues, language = run_subtitle._transcribe_with_chunks(media, backend)
 
     assert extracted == [(0, 900), (900, 900), (1800, 1)]
     assert len(backend.inputs) == 3
+    assert backend.releases == 3
     assert cues[0]["id"] == 1
     assert cues[0]["time"] == "00:00:01,000 --> 00:00:02,500"
     assert cues[1]["id"] == 2

@@ -213,7 +213,12 @@ def _transcribe_with_chunks(media: Path, backend) -> tuple[list[dict], str]:
     """每 15 分鐘執行 MOSS，最後合併成單一完整時間軸。"""
     duration = _probe_media_duration(media)
     if duration is None or duration <= ASR_CHUNK_SECONDS:
-        return backend.transcribe(media)
+        try:
+            return backend.transcribe(media)
+        finally:
+            release = getattr(backend, "release_transient_memory", None)
+            if callable(release):
+                release()
 
     part_count = math.ceil(duration / ASR_CHUNK_SECONDS)
     print(
@@ -234,7 +239,16 @@ def _transcribe_with_chunks(media: Path, backend) -> tuple[list[dict], str]:
                 flush=True,
             )
             _extract_audio_chunk(media, chunk, start, part_duration)
-            cues, language = backend.transcribe(chunk)
+            try:
+                cues, language = backend.transcribe(chunk)
+            finally:
+                release = getattr(
+                    backend,
+                    "release_transient_memory",
+                    None,
+                )
+                if callable(release):
+                    release()
             merged.extend(_offset_cues(cues, start, len(merged) + 1))
             if language and language not in languages:
                 languages.append(language)
