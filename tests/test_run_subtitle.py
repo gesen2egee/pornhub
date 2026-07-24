@@ -238,6 +238,66 @@ def test_short_media_uses_single_asr_call(tmp_path, monkeypatch):
     assert backend.videos == [media]
 
 
+def test_cuda_oom_adaptively_splits_15_minute_chunk(
+    tmp_path,
+    monkeypatch,
+):
+    media = tmp_path / "long.mp4"
+    media.write_bytes(b"video")
+    monkeypatch.setattr(run_subtitle, "SUBTITLE_TEMP", tmp_path / "chunks")
+    monkeypatch.setattr(
+        run_subtitle,
+        "_probe_media_duration",
+        lambda path: 901,
+    )
+    extracted = []
+
+    def fake_extract(source, output, start, duration):
+        extracted.append((start, duration))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"wav")
+
+    monkeypatch.setattr(run_subtitle, "_extract_audio_chunk", fake_extract)
+
+    class OomOnceBackend:
+        def __init__(self):
+            self.calls = 0
+            self.releases = 0
+
+        def transcribe(self, path):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("CUDA out of memory")
+            return (
+                [{
+                    "id": 1,
+                    "time": "00:00:00,000 --> 00:00:01,000",
+                    "text": "[S01] ok",
+                }],
+                "en",
+            )
+
+        def release_transient_memory(self):
+            self.releases += 1
+
+    backend = OomOnceBackend()
+    cues, language = run_subtitle._transcribe_with_chunks(media, backend)
+
+    assert extracted == [
+        (0, 900),
+        (0, 450),
+        (450, 450),
+        (900, 1),
+    ]
+    assert [cue["time"] for cue in cues] == [
+        "00:00:00,000 --> 00:00:01,000",
+        "00:07:30,000 --> 00:07:31,000",
+        "00:15:00,000 --> 00:15:01,000",
+    ]
+    assert backend.releases == 4
+    assert language == "en"
+
+
 def test_process_video_sends_merged_timeline_to_llm_once(
     tmp_path,
     monkeypatch,

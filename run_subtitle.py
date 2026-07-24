@@ -32,6 +32,7 @@ import video_meta  # noqa: E402
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm"}
 ASR_CHUNK_SECONDS = 15 * 60
+MIN_ASR_CHUNK_SECONDS = 3 * 60
 
 
 def _low_video_directories() -> list[Path]:
@@ -210,15 +211,48 @@ def _extract_audio_chunk(
 
 
 def _transcribe_with_chunks(media: Path, backend) -> tuple[list[dict], str]:
-    """每 15 分鐘執行 MOSS，最後合併成單一完整時間軸。"""
+    """每 15 分鐘執行 MOSS；CUDA OOM 時自動二分後合併時間軸。"""
     duration = _probe_media_duration(media)
-    if duration is None or duration <= ASR_CHUNK_SECONDS:
+    if duration is None:
         try:
             return backend.transcribe(media)
         finally:
             release = getattr(backend, "release_transient_memory", None)
             if callable(release):
                 release()
+
+    def is_cuda_oom(exc: Exception) -> bool:
+        message = str(exc).casefold()
+        return "cuda out of memory" in message or (
+            "cuda" in message and "allocate" in message
+        )
+
+    if duration <= ASR_CHUNK_SECONDS:
+        try:
+            try:
+                return backend.transcribe(media)
+            finally:
+                release = getattr(
+                    backend,
+                    "release_transient_memory",
+                    None,
+                )
+                if callable(release):
+                    release()
+        except Exception as exc:
+            if (
+                not is_cuda_oom(exc)
+                or duration <= MIN_ASR_CHUNK_SECONDS
+            ):
+                raise
+            print(
+                f"  整段 ASR 發生 CUDA OOM，改用 "
+                f"{duration / 120:.1f} 分鐘子段重試",
+                flush=True,
+            )
+            safe_chunk_seconds = duration / 2
+    else:
+        safe_chunk_seconds = ASR_CHUNK_SECONDS
 
     part_count = math.ceil(duration / ASR_CHUNK_SECONDS)
     print(
@@ -228,17 +262,33 @@ def _transcribe_with_chunks(media: Path, backend) -> tuple[list[dict], str]:
     )
     merged: list[dict] = []
     languages: list[str] = []
-    for index in range(part_count):
-        start = index * ASR_CHUNK_SECONDS
-        part_duration = min(ASR_CHUNK_SECONDS, duration - start)
-        chunk = _chunk_audio_path(media, index + 1)
+    chunk_sequence = 0
+
+    def transcribe_range(start: float, part_duration: float) -> None:
+        nonlocal chunk_sequence, safe_chunk_seconds
+        if part_duration > safe_chunk_seconds + 0.001:
+            first_duration = min(safe_chunk_seconds, part_duration)
+            transcribe_range(start, first_duration)
+            transcribe_range(
+                start + first_duration,
+                part_duration - first_duration,
+            )
+            return
+
+        chunk_sequence += 1
+        chunk = _chunk_audio_path(media, chunk_sequence)
         try:
             print(
-                f"  ASR 分段 {index + 1}/{part_count}："
-                f"{srt_time(start)}–{srt_time(start + part_duration)}",
+                f"  ASR 子段：{srt_time(start)}–"
+                f"{srt_time(start + part_duration)}",
                 flush=True,
             )
-            _extract_audio_chunk(media, chunk, start, part_duration)
+            _extract_audio_chunk(
+                media,
+                chunk,
+                start,
+                part_duration,
+            )
             try:
                 cues, language = backend.transcribe(chunk)
             finally:
@@ -249,11 +299,39 @@ def _transcribe_with_chunks(media: Path, backend) -> tuple[list[dict], str]:
                 )
                 if callable(release):
                     release()
-            merged.extend(_offset_cues(cues, start, len(merged) + 1))
-            if language and language not in languages:
-                languages.append(language)
+        except Exception as exc:
+            if (
+                not is_cuda_oom(exc)
+                or part_duration <= MIN_ASR_CHUNK_SECONDS
+            ):
+                raise
+            safe_chunk_seconds = min(
+                safe_chunk_seconds,
+                part_duration / 2,
+            )
+            print(
+                f"  [OOM 自適應] {part_duration / 60:.1f} 分鐘仍過大，"
+                f"改用 {safe_chunk_seconds / 60:.1f} 分鐘子段",
+                flush=True,
+            )
+            transcribe_range(start, part_duration)
+            return
         finally:
             chunk.unlink(missing_ok=True)
+
+        merged.extend(_offset_cues(cues, start, len(merged) + 1))
+        if language and language not in languages:
+            languages.append(language)
+
+    for index in range(part_count):
+        start = index * ASR_CHUNK_SECONDS
+        part_duration = min(ASR_CHUNK_SECONDS, duration - start)
+        print(
+            f"  ASR 分段 {index + 1}/{part_count}："
+            f"{srt_time(start)}–{srt_time(start + part_duration)}",
+            flush=True,
+        )
+        transcribe_range(start, part_duration)
     print(
         f"  ASR 分段合併完成：{len(merged)} 段字幕，"
         "接著統一交給 LLM 校正與翻譯",
