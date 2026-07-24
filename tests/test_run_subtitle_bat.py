@@ -21,6 +21,10 @@ def test_download_batch_checks_moss_environment():
         'if /i "%~1"=="--retry-subtitles" set "NO_PAUSE=1"'
         in content
     )
+    assert (
+        'if /i "%~1"=="--repair-over-1080" set "NO_PAUSE=1"'
+        in content
+    )
 
 
 def test_download_batch_is_ascii_crlf_for_windows_cmd():

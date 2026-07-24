@@ -8,8 +8,18 @@ import shutil
 import subprocess
 import urllib.request
 import urllib.parse
+from datetime import datetime
 import yt_dlp
 import video_meta
+
+MAX_VIDEO_WIDTH = 1920
+MAX_VIDEO_HEIGHT = 1080
+HIGH_VIDEO_FORMAT = (
+    "bestvideo[width<=1920][height<=1080]+bestaudio/"
+    "bestvideo[width<=1080][height<=1920]+bestaudio/"
+    "best[width<=1920][height<=1080]/"
+    "best[width<=1080][height<=1920]"
+)
 
 if sys.platform == 'win32':
     try:
@@ -18,8 +28,48 @@ if sys.platform == 'win32':
     except Exception:
         pass
 
-def direct_fetch_pornhub_mp4_stream(webpage_url):
-    """備用原生解析器：當 yt-dlp 因版本較舊報 410 錯誤時，直接分析網頁結構擷取最高畫質 MP4 串流 URL"""
+def select_pornhub_mp4_url(html, max_quality=1080, prefer_lowest=False):
+    """從 Pornhub 頁面選出不超過指定解析度的 MP4 直連。"""
+    candidates = []
+    for quality, url in re.findall(
+        r'"quality_(\d+)p"\s*:\s*"([^"]+)"',
+        html,
+    ):
+        candidates.append((int(quality), url))
+
+    for block in re.findall(r"\{[^{}]*\}", html, re.DOTALL):
+        quality_match = re.search(
+            r'"quality"\s*:\s*"?(\d+)(?:p)?"?',
+            block,
+        )
+        url_match = re.search(r'"videoUrl"\s*:\s*"([^"]+)"', block)
+        if quality_match and url_match:
+            candidates.append(
+                (int(quality_match.group(1)), url_match.group(1))
+            )
+
+    eligible = [
+        (quality, url)
+        for quality, url in candidates
+        if quality <= max_quality
+    ]
+    if not eligible:
+        return None
+    quality, url = (
+        min(eligible, key=lambda item: item[0])
+        if prefer_lowest
+        else max(eligible, key=lambda item: item[0])
+    )
+    del quality
+    return url.replace("\\/", "/").replace("\\u0026", "&")
+
+
+def direct_fetch_pornhub_mp4_stream(
+    webpage_url,
+    max_quality=1080,
+    prefer_lowest=False,
+):
+    """備用解析器也嚴格限制畫質，避免 yt-dlp 失敗時偷抓回 4K。"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -32,19 +82,11 @@ def direct_fetch_pornhub_mp4_stream(webpage_url):
         with urllib.request.urlopen(req, timeout=15) as resp:
             html = resp.read().decode('utf-8', errors='ignore')
             
-        m = re.search(r'var\s+flashvars_\d+\s*=\s*({.*?});', html, re.DOTALL)
-        if not m:
-            m = re.search(r'mediaDefinitions\s*:\s*(\[.*?\]),', html, re.DOTALL)
-            
-        if m:
-            json_str = m.group(1)
-            quality_urls = re.findall(r'"quality_(\d+p)"\s*:\s*"([^"]+)"', json_str)
-            if not quality_urls:
-                quality_urls = re.findall(r'"videoUrl"\s*:\s*"([^"]+)"', json_str)
-                
-            if quality_urls:
-                best_url = quality_urls[0][1].replace('\\/', '/') if isinstance(quality_urls[0], tuple) else quality_urls[0].replace('\\/', '/')
-                return best_url
+        return select_pornhub_mp4_url(
+            html,
+            max_quality=max_quality,
+            prefer_lowest=prefer_lowest,
+        )
     except Exception as e:
         print(f"  [!] 原生備用解析器抓取失敗: {e}")
     return None
@@ -89,6 +131,56 @@ def has_video_stream(path):
     return result.returncode == 0 and "video" in result.stdout.split()
 
 
+def probe_video_dimensions(path):
+    """回傳第一條 video stream 的 (width, height)，無法確認時回傳 None。"""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "json",
+                os.path.abspath(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        payload = json.loads(result.stdout or "{}")
+        stream = (payload.get("streams") or [])[0]
+        width = int(stream["width"])
+        height = int(stream["height"])
+        return width, height
+    except (
+        FileNotFoundError,
+        subprocess.SubprocessError,
+        ValueError,
+        KeyError,
+        IndexError,
+        json.JSONDecodeError,
+    ):
+        return None
+
+
+def is_within_1080p_dimensions(width, height):
+    """接受橫式 1920×1080 與直式 1080×1920 的等效 1080P 範圍。"""
+    return (
+        width <= MAX_VIDEO_WIDTH
+        and height <= MAX_VIDEO_HEIGHT
+    ) or (
+        width <= MAX_VIDEO_HEIGHT
+        and height <= MAX_VIDEO_WIDTH
+    )
+
+
+def is_video_within_1080p(path):
+    dimensions = probe_video_dimensions(path)
+    if dimensions is None:
+        return None
+    return is_within_1080p_dimensions(*dimensions)
+
+
 def remove_invalid_video(path, label):
     """移除沒有 video stream 的空殼，讓該九宮格重新下載。"""
     stream_state = has_video_stream(path) if os.path.exists(path) else None
@@ -100,6 +192,93 @@ def remove_invalid_video(path, label):
     except OSError as exc:
         print(f"   [!] 無法移除無效的 {label}：{exc}")
     return True
+
+
+def _backup_over_1080_video(video_path):
+    """把超標原檔移到 ignored temp 備份，避免重下載前遺失。"""
+    relative_parent = os.path.relpath(
+        os.path.dirname(os.path.abspath(video_path)),
+        ROOT,
+    )
+    backup_dir = os.path.join(
+        ROOT,
+        "temp",
+        "over-1080-backup",
+        relative_parent,
+    )
+    os.makedirs(backup_dir, exist_ok=True)
+    destination = os.path.join(backup_dir, os.path.basename(video_path))
+    if os.path.exists(destination):
+        stem, ext = os.path.splitext(destination)
+        destination = (
+            f"{stem}.{datetime.now():%Y%m%d-%H%M%S}{ext}"
+        )
+    shutil.move(video_path, destination)
+    return destination
+
+
+def prepare_over_1080_redownloads():
+    """備份現有超標影片、還原九宮格，回傳只需重下載的九宮格。"""
+    selected_grids = []
+    search_dirs = [
+        os.path.join(ROOT, "videos"),
+        os.path.join(ROOT, "temp", "pipeline", "videos"),
+    ]
+    for directory in search_dirs:
+        for video_path in sorted(glob.glob(os.path.join(directory, "*.mp4"))):
+            if os.path.basename(video_path).startswith("."):
+                continue
+            dimensions = probe_video_dimensions(video_path)
+            if (
+                dimensions is None
+                or is_within_1080p_dimensions(*dimensions)
+            ):
+                continue
+
+            archived_grid = _archived_grid_for_video(video_path)
+            local_grid = os.path.join(
+                ROOT,
+                "videos",
+                os.path.basename(archived_grid),
+            )
+            source_grid = (
+                archived_grid
+                if os.path.exists(archived_grid)
+                else local_grid
+            )
+            if (
+                not os.path.exists(source_grid)
+                or not get_video_url_from_image(source_grid)
+            ):
+                print(
+                    f"[!] 發現 {dimensions[0]}×{dimensions[1]} 超標影片，"
+                    f"但找不到含 URL 的九宮格，為安全起見先保留："
+                    f"{os.path.basename(video_path)}"
+                )
+                continue
+
+            backup_path = _backup_over_1080_video(video_path)
+            if os.path.abspath(source_grid) != os.path.abspath(local_grid):
+                os.makedirs(os.path.dirname(local_grid), exist_ok=True)
+                shutil.move(source_grid, local_grid)
+            if local_grid not in selected_grids:
+                selected_grids.append(local_grid)
+
+            partial_hardsub = os.path.join(
+                os.path.dirname(video_path),
+                f".{os.path.splitext(os.path.basename(video_path))[0]}"
+                ".hardsub.tmp.mp4",
+            )
+            if os.path.exists(partial_hardsub):
+                os.remove(partial_hardsub)
+                print(
+                    "   [CLEAN] 已移除停止工作留下的未完成硬字幕暫存檔"
+                )
+            print(
+                f"[REQUEUE] {dimensions[0]}×{dimensions[1]} 已備份至 "
+                f"{backup_path}，九宮格已排入 1080P 重下載"
+            )
+    return selected_grids
 
 
 class SubtitleWorker:
@@ -383,14 +562,27 @@ def upgrade_media_web_meta(jpg_path, mp4_path, video_url, info=None):
     except Exception as exc:
         print(f"   [!] 補齊 WEB_META 失敗（不影響影片）：{exc}")
 
-def process_single_directory(target_dir, is_low_quality, subtitle_worker):
+def process_single_directory(
+    target_dir,
+    is_low_quality,
+    subtitle_worker,
+    selected_jpgs=None,
+):
     """處理單一目錄 (low_videos/ 或 videos/) 中 JPG 圖片內嵌 EXIF 網址的下載邏輯"""
     # 從名字為順序開始下載 (字母/數字自然排序)
-    jpg_files = sorted(glob.glob(os.path.join(target_dir, "*.jpg")))
+    jpg_files = (
+        sorted(selected_jpgs)
+        if selected_jpgs is not None
+        else sorted(glob.glob(os.path.join(target_dir, "*.jpg")))
+    )
     if not jpg_files:
         return
 
-    mode_label = "最低解析度/動態30秒取樣" if is_low_quality else "最高畫質"
+    mode_label = (
+        "最低解析度/動態30秒取樣"
+        if is_low_quality
+        else "最高 1080P"
+    )
     print(f"[+] 開始為 [{target_dir}/] 依檔名順序讀取圖片內嵌 EXIF 網址並進行 {mode_label} 下載 (共 {len(jpg_files)} 張預覽圖)...\n")
 
     success_count = 0
@@ -499,7 +691,11 @@ def process_single_directory(target_dir, is_low_quality, subtitle_worker):
         print(f"   - 暫存路徑: {staged_video_file}")
         print(f"   - 完成路徑: {final_video_file}")
 
-        fmt_spec = 'worstvideo+worstaudio/worst' if is_low_quality else 'bestvideo+bestaudio/best'
+        fmt_spec = (
+            "worstvideo+worstaudio/worst"
+            if is_low_quality
+            else HIGH_VIDEO_FORMAT
+        )
         temp_dir_abs = os.path.abspath("temp")
         os.makedirs(temp_dir_abs, exist_ok=True)
         temp_thumb_template = os.path.join(temp_dir_abs, f"thumb_{idx}_%(id)s.%(ext)s")
@@ -544,12 +740,23 @@ def process_single_directory(target_dir, is_low_quality, subtitle_worker):
             download_success = (
                 os.path.exists(staged_video_file)
                 and has_video_stream(staged_video_file) is True
+                and (
+                    is_low_quality
+                    or is_video_within_1080p(staged_video_file) is True
+                )
             )
             if not download_success:
                 print(
-                    "   [!] yt-dlp 結束但暫存 MP4 不存在或沒有 video stream。"
+                    "   [!] yt-dlp 結束但影片無效，或解析度超過 1080P。"
                 )
                 remove_invalid_video(staged_video_file, "yt-dlp 暫存影片")
+                if (
+                    os.path.exists(staged_video_file)
+                    and not is_low_quality
+                    and is_video_within_1080p(staged_video_file) is False
+                ):
+                    os.remove(staged_video_file)
+                    print("   [LIMIT] 已移除超過 1080P 的下載暫存檔")
                 raise RuntimeError("yt-dlp 未產生有效 video stream")
         except Exception as e:
             err_str = str(e)
@@ -568,7 +775,11 @@ def process_single_directory(target_dir, is_low_quality, subtitle_worker):
                 direct_mp4 = None
             else:
                 print(f"   [FALLBACK] 嘗試啟動 Pornhub 原生備用解析器繞過異常...")
-                direct_mp4 = direct_fetch_pornhub_mp4_stream(video_url)
+                direct_mp4 = direct_fetch_pornhub_mp4_stream(
+                    video_url,
+                    max_quality=1080,
+                    prefer_lowest=is_low_quality,
+                )
             if direct_mp4:
                 print(f"   [+] 成功解析直連 MP4 串流，發起 FFmpeg 極速下載 (帶認證 Header，暫存於 temp/)...")
                 temp_ffmpeg_file = os.path.join(temp_dir_abs, f"ffmpeg_{idx}_{video_file_basename}")
@@ -611,6 +822,10 @@ def process_single_directory(target_dir, is_low_quality, subtitle_worker):
                         res_ff.returncode == 0
                         and os.path.exists(temp_ffmpeg_file)
                         and has_video_stream(temp_ffmpeg_file) is True
+                        and (
+                            is_low_quality
+                            or is_video_within_1080p(temp_ffmpeg_file) is True
+                        )
                     ):
                         shutil.move(temp_ffmpeg_file, staged_video_file)
                         download_success = True
@@ -639,7 +854,10 @@ def process_single_directory(target_dir, is_low_quality, subtitle_worker):
 
     print(f"[*] [{target_dir}/] 處理完成: 成功下載 {success_count} 部 | 已存在/跳過 {skipped_count} 部")
 
-def run_download_process(retry_subtitles=False):
+def run_download_process(
+    retry_subtitles=False,
+    repair_over_1080=False,
+):
     """主下載流程控制"""
     print(f"==================================================")
     print(f"   Pornhub 雙畫質原影片下載器 (純 EXIF 圖片讀取版)")
@@ -648,10 +866,24 @@ def run_download_process(retry_subtitles=False):
     os.makedirs("low_videos", exist_ok=True)
     os.makedirs("videos", exist_ok=True)
 
+    over_1080_jpgs = (
+        []
+        if retry_subtitles
+        else prepare_over_1080_redownloads()
+    )
     low_jpgs = glob.glob(os.path.join("low_videos", "*.jpg"))
     high_jpgs = glob.glob(os.path.join("videos", "*.jpg"))
 
-    if not retry_subtitles and not low_jpgs and not high_jpgs:
+    if repair_over_1080 and not over_1080_jpgs:
+        print("[OK] 沒有發現需要重下載的超過 1080P 影片。")
+        return 0
+
+    if (
+        not retry_subtitles
+        and not repair_over_1080
+        and not low_jpgs
+        and not high_jpgs
+    ):
         print(f"[!] low_videos/ 與 videos/ 資料夾中均找不到任何被移入的九宮格 JPG 圖片！")
         print(f"[i] 請將預覽圖片移動至 low_videos/ (最低畫質/極速) 或 videos/ (最高畫質) 後再次執行。")
         return 0
@@ -683,7 +915,7 @@ def run_download_process(retry_subtitles=False):
                 )
             print(f"[*] 字幕修復模式共排入 {queued} 支影片")
         # 【階段一】優先處理 low_videos/ 目錄 (最低畫質)
-        if not retry_subtitles and low_jpgs:
+        if not retry_subtitles and not repair_over_1080 and low_jpgs:
             print("==================================================")
             print(" [階段 1/2] 開始處理 low_videos/ (最低解析度/動態30秒取樣)")
             print("==================================================")
@@ -692,7 +924,7 @@ def run_download_process(retry_subtitles=False):
                 subtitle_worker=subtitle_worker,
             )
 
-        if not retry_subtitles:
+        if not retry_subtitles and not repair_over_1080:
             enqueue_official_subtitle_retries(
                 "videos",
                 False,
@@ -700,13 +932,21 @@ def run_download_process(retry_subtitles=False):
             )
 
         # 【階段二】處理完 low_videos/ 後，處理 videos/ 目錄 (最高畫質)
-        if not retry_subtitles and high_jpgs:
+        selected_high_jpgs = (
+            over_1080_jpgs if repair_over_1080 else high_jpgs
+        )
+        if not retry_subtitles and selected_high_jpgs:
             print("\n==================================================")
             print(" [階段 2/2] 開始處理 videos/ (最高畫質下載)")
             print("==================================================")
             process_single_directory(
                 "videos", is_low_quality=False,
                 subtitle_worker=subtitle_worker,
+                selected_jpgs=(
+                    selected_high_jpgs
+                    if repair_over_1080
+                    else None
+                ),
             )
     finally:
         print("\n[*] 下載佇列完成，等待背景字幕管線處理剩餘影片...")
@@ -726,7 +966,15 @@ if __name__ == "__main__":
         action="store_true",
         help="只重跑舊 SRT、failed Meta 與未完成字幕，不下載新影片",
     )
+    parser.add_argument(
+        "--repair-over-1080",
+        action="store_true",
+        help="只備份並重下載現有超過等效 1080P 的影片",
+    )
     args = parser.parse_args()
     raise SystemExit(
-        run_download_process(retry_subtitles=args.retry_subtitles)
+        run_download_process(
+            retry_subtitles=args.retry_subtitles,
+            repair_over_1080=args.repair_over_1080,
+        )
     )

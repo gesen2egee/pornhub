@@ -5,6 +5,35 @@ from PIL import Image
 import run_download
 
 
+def test_1080p_limit_accepts_landscape_and_portrait():
+    assert run_download.is_within_1080p_dimensions(1920, 1080)
+    assert run_download.is_within_1080p_dimensions(1080, 1920)
+    assert run_download.is_within_1080p_dimensions(810, 1440)
+    assert not run_download.is_within_1080p_dimensions(3840, 2160)
+    assert not run_download.is_within_1080p_dimensions(2160, 3840)
+    assert not run_download.is_within_1080p_dimensions(2560, 1080)
+
+
+def test_pornhub_fallback_selects_highest_not_over_1080():
+    html = (
+        '"quality_2160p":"https:\\/\\/cdn\\/4k.mp4",'
+        '"quality_720p":"https:\\/\\/cdn\\/720.mp4",'
+        '"quality_1080p":"https:\\/\\/cdn\\/1080.mp4"'
+    )
+    assert run_download.select_pornhub_mp4_url(html) == (
+        "https://cdn/1080.mp4"
+    )
+    assert run_download.select_pornhub_mp4_url(
+        html,
+        prefer_lowest=True,
+    ) == "https://cdn/720.mp4"
+
+
+def test_pornhub_fallback_rejects_only_4k_source():
+    html = '"quality_2160p":"https:\\/\\/cdn\\/4k.mp4"'
+    assert run_download.select_pornhub_mp4_url(html) is None
+
+
 def test_upgrade_writes_same_web_meta_to_video_and_grid(tmp_path, monkeypatch):
     jpg = tmp_path / "grid.jpg"
     mp4 = tmp_path / "video.mp4"

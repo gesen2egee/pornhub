@@ -8,6 +8,7 @@ set "ROOT=%~dp0"
 set "PYTHON=%ROOT%.venv\Scripts\python.exe"
 set "MOSS_PYTHON=%ROOT%moss\.venv\Scripts\python.exe"
 if /i "%~1"=="--retry-subtitles" set "NO_PAUSE=1"
+if /i "%~1"=="--repair-over-1080" set "NO_PAUSE=1"
 
 if not exist "%PYTHON%" (
     echo [INFO] Creating the Python 3.12 download environment...
