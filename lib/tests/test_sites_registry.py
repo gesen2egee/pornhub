@@ -27,6 +27,16 @@ def test_match_known_hosts():
     assert sites.get_adapter_for_url("https://jable.tv/videos/abc-123/").name == "jable"
     assert sites.get_adapter_for_url("https://91porn.com/view_video.php?viewkey=x").name == "91porn"
     assert sites.get_adapter_for_url("https://hanime.tv/videos/hentai/foo").name == "hanime"
+    assert sites.get_adapter_for_url("https://beeg.com/1234567").name == "beeg"
+    assert sites.get_adapter_for_url("https://www.drtuber.com/video/1/x").name == "drtuber"
+    assert sites.get_adapter_for_url("https://www.redtube.com/12345").name == "redtube"
+    assert sites.get_adapter_for_url("https://www.youporn.com/watch/1/x").name == "youporn"
+    assert sites.get_adapter_for_url("https://www.tube8.com/x/1/").name == "tube8"
+    assert sites.get_adapter_for_url("https://www.alphaporno.com/videos/1/x").name == "alphaporno"
+    assert sites.get_adapter_for_url("https://www.empflix.com/videos/1/x").name == "empflix"
+    assert sites.get_adapter_for_url(
+        "https://www.eroprofile.com/m/videos/view/abc"
+    ).name == "eroprofile"
     assert sites.get_adapter_for_url("https://unknown.example/v/1").name == "generic"
 
 

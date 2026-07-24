@@ -9,33 +9,57 @@ import yt_dlp
 from sites.base import SiteAdapter
 
 
+_BAD_STREAM_EXTS = (".svg", ".jpg", ".jpeg", ".png", ".webp", ".gif", ".ico")
+
+
+def _is_playable_stream_url(url: str | None) -> bool:
+    if not url or not isinstance(url, str):
+        return False
+    low = url.lower().split("?", 1)[0]
+    return not any(low.endswith(ext) for ext in _BAD_STREAM_EXTS)
+
+
 def _stream_from_info(info: dict[str, Any] | None) -> tuple[str | None, dict[str, Any]]:
     if not info:
         return None, {}
-    url = info.get("url")
     headers = dict(info.get("http_headers") or {})
-    if url:
+    url = info.get("url")
+    if _is_playable_stream_url(url):
         return str(url), headers
-    # requested_formats / formats fallback: first with url
+    # Prefer formats with a video codec / known video ext
     for key in ("requested_formats", "formats"):
-        for fmt in info.get(key) or []:
-            if fmt and fmt.get("url"):
+        candidates = [f for f in (info.get(key) or []) if f and f.get("url")]
+        for fmt in candidates:
+            ext = str(fmt.get("ext") or "").lower()
+            vcodec = str(fmt.get("vcodec") or "none")
+            if ext in {"svg", "jpg", "jpeg", "png", "webp", "gif"}:
+                continue
+            if vcodec == "none" and ext not in {"mp4", "webm", "m3u8", "mpd", "ts"}:
+                continue
+            if _is_playable_stream_url(fmt.get("url")):
+                return str(fmt["url"]), dict(fmt.get("http_headers") or headers)
+        for fmt in candidates:
+            if _is_playable_stream_url(fmt.get("url")):
                 return str(fmt["url"]), dict(fmt.get("http_headers") or headers)
     return None, headers
 
 
 def _build_format(purpose: str, prefer_lowest: bool) -> str:
+    # Prefer real video containers; avoid thumbnails/svg/poster images.
+    video_filter = "[vcodec!=none][ext!=svg][ext!=jpg][ext!=png][ext!=webp]"
     if prefer_lowest or purpose == "download_low":
-        return "worstvideo+worstaudio/worst"
+        return (
+            f"worstvideo{video_filter}+worstaudio/worst{video_filter}/worst"
+        )
     if purpose == "download_full":
-        return "bestvideo*+bestaudio/best"
+        return f"bestvideo*{video_filter}+bestaudio/best{video_filter}/best"
     if purpose == "info":
         return (
-            "bestvideo[height<=720][protocol!=m3u8_native]"
-            "/best[height<=720][protocol!=m3u8_native]"
-            "/bestvideo[height<=720]/best"
+            f"bestvideo[height<=720]{video_filter}[protocol!=m3u8_native]"
+            f"/best[height<=720]{video_filter}[protocol!=m3u8_native]"
+            f"/bestvideo[height<=720]{video_filter}/best{video_filter}/best"
         )
-    return "best"
+    return f"best{video_filter}/best"
 
 
 def resolve_playable(

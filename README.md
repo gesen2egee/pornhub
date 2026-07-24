@@ -137,6 +137,7 @@ OPENROUTER_API_KEY
 列表／搜尋／分頁／下載透過 `lib/sites/` registry。本輪內建：
 
 - **Tier 1：** Eporner（關鍵字預設）、Pornhub、XVideos、xHamster、XNXX、SpankBang  
+- **Tier 2：** Beeg、DrTuber、RedTube、YouPorn、Tube8、AlphaPorno、EMPFlix、EroProfile  
 - **Tier 3：** MissAV、Jable.tv、91porn（`SITE_91PORN_COOKIES` = Netscape cookies.txt）、hanime.tv  
 
 下載僅走 yt-dlp 與各站 adapter hooks，**不再**使用 Pornhub HTML 直連 fallback。社群 plugin 僅 clone 至 `tasks/plugins-research/` 供研究，不安裝進 venv。
