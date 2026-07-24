@@ -1,4 +1,4 @@
-"""使用 MOSS 產生、翻譯並內嵌字幕。"""
+"""使用 MOSS 產生、翻譯並輸出硬字幕或相容 SRT。"""
 
 from __future__ import annotations
 
@@ -99,6 +99,12 @@ def _subtitle_complete(video: Path) -> bool:
         meta.get("original_srt_present")
         and meta.get("translated_srt_present")
     )
+
+
+def _uses_hard_subtitle(video: Path) -> bool:
+    """LOW 目錄使用硬字幕；一般 videos 使用外掛 SRT。"""
+    parent = video.parent.resolve()
+    return any(parent == path.resolve() for path in _low_video_directories())
 
 
 def _probe_media_duration(media: Path) -> float | None:
@@ -345,11 +351,26 @@ def _ffmpeg_filter_value(value: str) -> str:
 
 
 def _strip_speaker_labels_from_srt(content: str) -> str:
-    """只供畫面燒錄使用；影片 Meta 仍保存完整說話者標籤。"""
+    """供畫面燒錄與播放器 SRT 使用；Meta 仍保存完整說話者標籤。"""
     return "".join(
         SPEAKER_LABEL_PATTERN.sub("", line)
         for line in content.splitlines(keepends=True)
     )
+
+
+def _compatible_srt(content: str) -> str:
+    """輸出 Windows／電視播放器普遍相容的 UTF-8 BOM + CRLF SRT 內容。"""
+    normalized = _strip_speaker_labels_from_srt(content)
+    return normalized.replace("\r\n", "\n").replace("\r", "\n").replace(
+        "\n", "\r\n"
+    )
+
+
+def _write_compatible_srt(path: Path, content: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_compatible_srt(content), encoding="utf-8-sig", newline="")
+    print(f"  [SRT] 已輸出播放器相容字幕：{path}", flush=True)
+    return path
 
 
 def _write_burn_subtitle(video: Path, translated_srt: str) -> Path:
@@ -446,6 +467,8 @@ def process_video(
     force: bool,
     media_input: Path | None = None,
     audio_enhanced: bool = False,
+    hard_subtitle: bool = True,
+    export_srt: bool = False,
 ) -> Path:
     legacy_srt = _subtitle_path(video)
     output_video = video
@@ -465,6 +488,10 @@ def process_video(
         and existing_status.get("outcome") != "failed"
         and not force
     ):
+        if export_srt and not legacy_srt.exists():
+            existing_translation = existing_meta.get("translated_srt") or ""
+            if existing_translation.strip():
+                _write_compatible_srt(legacy_srt, existing_translation)
         print("  影片內已有字幕 Meta，直接略過", flush=True)
         return video
     if legacy_srt.exists() and not force:
@@ -500,7 +527,7 @@ def process_video(
             subtitle_outcome = "empty"
             print("  2/3 無字幕，將空字幕狀態寫入影片 Meta", flush=True)
 
-    if translated_srt and translated_srt.strip():
+    if hard_subtitle and translated_srt and translated_srt.strip():
         burn_srt = _write_burn_subtitle(video, translated_srt)
         remove_burn_srt = True
 
@@ -514,6 +541,10 @@ def process_video(
                 mark_audio_enhanced=audio_enhanced,
             )
         else:
+            if media_input != output_video:
+                os.replace(media_input, output_video)
+                media_input = output_video
+                print("  [音訊] 已套用增強音軌，影片畫面未重新編碼", flush=True)
             result = output_video
         try:
             base_comment = existing_meta.get("raw_comment") or ""
@@ -534,10 +565,15 @@ def process_video(
             print("  [META] 已寫入 MOSS 原文與繁中字幕", flush=True)
         except Exception as exc:
             print(f"  [!] 寫入字幕 metadata 失敗：{exc}", flush=True)
+        if export_srt:
+            if translated_srt and translated_srt.strip():
+                _write_compatible_srt(legacy_srt, translated_srt)
+            else:
+                legacy_srt.unlink(missing_ok=True)
     finally:
         if remove_burn_srt and burn_srt is not None:
             burn_srt.unlink(missing_ok=True)
-    if legacy_srt.exists() and metadata_written:
+    if legacy_srt.exists() and metadata_written and not export_srt:
         legacy_srt.unlink()
         print(f"  [遷移] 舊 SRT 已寫入影片 Meta 並移除：{legacy_srt}", flush=True)
     return result
@@ -548,7 +584,7 @@ def main() -> int:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="重新產生字幕 Meta，並重新製作硬字幕影片",
+        help="重新產生字幕 Meta，並依目錄重製硬字幕或外掛 SRT",
     )
     parser.add_argument("--limit", type=int, default=0, help="只處理前 N 部影片，0 表示全部")
     parser.add_argument(
@@ -569,7 +605,17 @@ def main() -> int:
     pending = [
         video
         for video in videos
-        if args.force or not _subtitle_complete(video)
+        if (
+            args.force
+            or not _subtitle_complete(video)
+            or (
+                not _uses_hard_subtitle(video)
+                and bool(
+                    (_read_video_meta(video).get("translated_srt") or "").strip()
+                )
+                and not _subtitle_path(video).exists()
+            )
+        )
     ]
     skipped = len(videos) - len(pending)
     if args.limit > 0:
@@ -580,7 +626,12 @@ def main() -> int:
     )
     if args.dry_run:
         for video in pending:
-            print(f"{video} -> 硬字幕覆蓋原始影片 + 影片內字幕 Meta")
+            output = (
+                "繁中硬字幕 + 影片內字幕 Meta"
+                if _uses_hard_subtitle(video)
+                else "不重編碼影片 + 同名相容 SRT + 影片內字幕 Meta"
+            )
+            print(f"{video} -> {output}")
         return 0
     if not pending:
         print("沒有需要處理的影片。")
@@ -621,6 +672,7 @@ def main() -> int:
         model_name = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
         for video in pending:
             media = prepared_media.get(video)
+            hard_subtitle = _uses_hard_subtitle(video)
             try:
                 process_video(
                     video,
@@ -630,6 +682,8 @@ def main() -> int:
                     args.force,
                     media_input=media.media_input if media else video,
                     audio_enhanced=media.enhanced if media else False,
+                    hard_subtitle=hard_subtitle,
+                    export_srt=not hard_subtitle,
                 )
             except Exception as exc:
                 failures += 1

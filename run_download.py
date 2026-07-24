@@ -519,26 +519,36 @@ def get_video_url_from_image(jpg_path):
     return None
 
 
-def has_completed_subtitle(video_path):
-    """只有非 failed 的雙字幕 Meta 才是完整成品。"""
+def has_completed_subtitle(video_path, require_srt=False):
+    """只有非 failed 的雙字幕 Meta，及必要外掛 SRT，才是完整成品。"""
     try:
         meta = video_meta.read_mp4_meta(video_path)
         status = meta.get("subtitle_status") or {}
         if status.get("outcome") == "failed":
             return False
-        return bool(
+        meta_complete = bool(
             meta.get("original_srt_present")
             and meta.get("translated_srt_present")
         )
+        translated = meta.get("translated_srt") or ""
+        srt_complete = (
+            not require_srt
+            or not translated.strip()
+            or os.path.exists(os.path.splitext(video_path)[0] + ".srt")
+        )
+        return meta_complete and srt_complete
     except Exception:
         return False
 
 
-def needs_subtitle_retry(video_path):
+def needs_subtitle_retry(video_path, require_srt=None):
     """舊 SRT、failed Meta 或缺少雙字幕 Meta 都需要重新處理。"""
-    if os.path.exists(os.path.splitext(video_path)[0] + ".srt"):
-        return True
-    return not has_completed_subtitle(video_path)
+    if require_srt is None:
+        parent_name = os.path.basename(
+            os.path.dirname(os.path.abspath(video_path))
+        ).casefold()
+        require_srt = parent_name not in {"low_videos", "low_video"}
+    return not has_completed_subtitle(video_path, require_srt=require_srt)
 
 
 def _archived_grid_for_video(video_path):

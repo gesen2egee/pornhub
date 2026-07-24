@@ -34,8 +34,8 @@ pip install -r requirements.txt
    - 將圖檔移至 `videos/` 下載時，下載出的原影片維持**原始影片標題**：`videos/影片標題.mp4`！
 3. **下載與完整字幕雙管線 (`run_download`)**：
    - 將滿意的九宮格圖片移至 `videos/` 或 `low_videos/` 後，雙擊 **[run_download.bat](file:///c:/workspace/pornhub/run_download.bat)**。
-   - 下載程序會持續抓下一支，獨立字幕程序則立即接手已下載影片，完成音訊判斷／增強、MOSS、翻譯、硬字幕與 Meta。
-   - 影片先下載至 `temp/pipeline/`，完成字幕、硬字幕與 Meta 後才移入 `videos/` 或 `low_videos/`。
+   - 下載程序會持續抓下一支，獨立字幕程序則立即接手已下載影片，完成音訊判斷／增強、MOSS、翻譯與 Meta。
+   - 影片先下載至 `temp/pipeline/`；`videos/` 完成同名相容 SRT，`low_videos/` 完成硬字幕後，才移入正式目錄。
    - `videos/` 的九宮格在整支影片完整成功後移至 `downloaded/`；`low_videos/` 的九宮格永遠保留原位。
 4. **下載即跳過開頭純色/黑邊 (Stream Direct Skip)**：
    - 在發起下載前 0.05 秒自動採樣分析遠端串流。若開頭純色/黑邊於 `0.5s ~ 10.0s` 之間，直接在下載時傳入前置跳過選項。
@@ -81,7 +81,7 @@ install_moss.bat
 
 字幕已整合至唯一入口 `run_download.bat`，不再提供獨立字幕 BAT。下載與字幕分屬兩個長駐程序：前一支下載完成便立即排入字幕佇列，同時下載程序繼續抓下一支；MOSS 模型只載入一次供整批影片共用。
 
-字幕完成後不再保留獨立 SRT；MOSS 原文與繁中翻譯完整存入影片 Meta，Meta 內保留 `[S01]`、`[S02]` 說話者標籤。`low_videos/` 與一般 `videos/` 都由 FFmpeg 將繁中字幕直接燒入畫面，但畫面字幕會移除所有 `[Sxx]` 標籤。燒錄所需 SRT 只會短暫建立於已忽略的 `tasks/subtitle-temp/`，成功或失敗後都會清理。舊資料若已有同名 SRT，或影片內已有完整雙字幕 Meta（包含空字幕區段），未來執行會直接略過。
+MOSS 原文與繁中翻譯都會完整存入影片 Meta，Meta 內保留 `[S01]`、`[S02]` 說話者標籤。一般 `videos/` 不重編碼畫面，會輸出同名 UTF-8 BOM、CRLF 外掛 SRT，並移除 `[Sxx]` 標籤以提高播放器相容性；`low_videos/` 則由 FFmpeg 將同一份繁中字幕直接燒入畫面。燒錄用的暫存 SRT 位於已忽略的 `tasks/subtitle-temp/`，成功或失敗後都會清理。影片內已有完整雙字幕 Meta 但缺少一般影片外掛 SRT 時，會直接由 Meta 補建，不會重新呼叫 ASR 或翻譯。
 
 硬字幕預設會比畫面底部提高約半個字體高度，降低被播放器進度條遮住的機會。
 

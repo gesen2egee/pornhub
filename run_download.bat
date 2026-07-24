@@ -59,6 +59,7 @@ echo.
 echo [INFO] Download and subtitle workers run in parallel.
 echo [INFO] Each completed download is queued for the full subtitle pipeline.
 echo [INFO] Finished videos move from temp into their final folders.
+echo [INFO] videos keep original frames with sidecar SRT; low_videos use hard subtitles.
 echo [INFO] videos grids move to downloaded; low_videos grids stay in place.
 echo.
 

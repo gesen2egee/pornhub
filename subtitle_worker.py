@@ -76,14 +76,23 @@ def archive_grid(grid: Path, archive_dir: Path) -> Path | None:
     return destination
 
 
-def finalize_video(video: Path, final_video: Path) -> Path:
-    """字幕與 Meta 完整後，才把暫存影片移入正式資料夾。"""
+def finalize_video(
+    video: Path,
+    final_video: Path,
+    move_srt: bool = False,
+) -> Path:
+    """字幕與 Meta 完整後，才把影片及需要的外掛 SRT 移入正式資料夾。"""
     if video == final_video:
         return final_video
     final_video.parent.mkdir(parents=True, exist_ok=True)
     if final_video.exists():
         raise RuntimeError(f"正式影片路徑已存在，拒絕覆寫：{final_video}")
     shutil.move(str(video), str(final_video))
+    staged_srt = video.with_suffix(".srt")
+    final_srt = final_video.with_suffix(".srt")
+    if move_srt and staged_srt.exists():
+        os.replace(staged_srt, final_srt)
+        print(f"  [完成] 外掛字幕已移至正式路徑：{final_srt}", flush=True)
     print(f"  [完成] 影片已移至正式路徑：{final_video}", flush=True)
     return final_video
 
@@ -161,6 +170,7 @@ class SubtitleRuntime:
         grid = Path(job["grid"]).resolve()
         archive_dir = Path(job["archive_dir"]).resolve()
         should_archive_grid = bool(job.get("archive_grid"))
+        is_low_quality = bool(job.get("is_low_quality"))
         if job.get("is_low_quality") and self.configured_max_tokens is None:
             os.environ["MOSS_MAX_NEW_TOKENS"] = "1024"
         elif self.configured_max_tokens is None:
@@ -173,7 +183,16 @@ class SubtitleRuntime:
 
         if run_subtitle._subtitle_complete(video):
             print("[字幕管線] 已有舊 SRT 或影片字幕 Meta，直接略過字幕", flush=True)
-            finalize_video(video, final_video)
+            if not is_low_quality and not video.with_suffix(".srt").exists():
+                translated = run_subtitle._read_video_meta(video).get(
+                    "translated_srt"
+                )
+                if translated and translated.strip():
+                    run_subtitle._write_compatible_srt(
+                        video.with_suffix(".srt"),
+                        translated,
+                    )
+            finalize_video(video, final_video, move_srt=not is_low_quality)
             finish_grid(grid, archive_dir, should_archive_grid)
             return
         legacy_srt = run_subtitle._subtitle_path(video)
@@ -197,6 +216,8 @@ class SubtitleRuntime:
                 False,
                 media_input=media.media_input if media else video,
                 audio_enhanced=media.enhanced if media else False,
+                hard_subtitle=is_low_quality,
+                export_srt=not is_low_quality,
             )
             subtitle_meta = run_subtitle._read_video_meta(video)
             if not (
@@ -219,7 +240,7 @@ class SubtitleRuntime:
             for item in prepared.values():
                 item.cleanup()
 
-        finalize_video(video, final_video)
+        finalize_video(video, final_video, move_srt=not is_low_quality)
         finish_grid(grid, archive_dir, should_archive_grid)
 
 
