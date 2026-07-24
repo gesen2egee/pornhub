@@ -126,6 +126,126 @@ def test_failed_meta_requires_retry(tmp_path, monkeypatch):
     assert not run_subtitle._subtitle_complete(video)
 
 
+def test_chunked_asr_merges_timestamps_into_full_timeline(
+    tmp_path,
+    monkeypatch,
+):
+    media = tmp_path / "long.mp4"
+    media.write_bytes(b"video")
+    monkeypatch.setattr(run_subtitle, "SUBTITLE_TEMP", tmp_path / "chunks")
+    monkeypatch.setattr(
+        run_subtitle,
+        "_probe_media_duration",
+        lambda path: 1801,
+    )
+
+    extracted = []
+
+    def fake_extract(source, output, start, duration):
+        extracted.append((start, duration))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"wav")
+
+    monkeypatch.setattr(run_subtitle, "_extract_audio_chunk", fake_extract)
+
+    class ChunkBackend:
+        def __init__(self):
+            self.inputs = []
+
+        def transcribe(self, path):
+            self.inputs.append(path)
+            return (
+                [{
+                    "id": 1,
+                    "time": "00:00:01,000 --> 00:00:02,500",
+                    "text": "[S01] hello",
+                }],
+                "en",
+            )
+
+    backend = ChunkBackend()
+    cues, language = run_subtitle._transcribe_with_chunks(media, backend)
+
+    assert extracted == [(0, 900), (900, 900), (1800, 1)]
+    assert len(backend.inputs) == 3
+    assert cues[0]["id"] == 1
+    assert cues[0]["time"] == "00:00:01,000 --> 00:00:02,500"
+    assert cues[1]["id"] == 2
+    assert cues[1]["time"] == "00:15:01,000 --> 00:15:02,500"
+    assert cues[2]["id"] == 3
+    assert cues[2]["time"] == "00:30:01,000 --> 00:30:02,500"
+    assert language == "en"
+    assert not list((tmp_path / "chunks").glob("*.wav"))
+
+
+def test_short_media_uses_single_asr_call(tmp_path, monkeypatch):
+    media = tmp_path / "short.mp4"
+    media.write_bytes(b"video")
+    backend = FakeBackend()
+    monkeypatch.setattr(
+        run_subtitle,
+        "_probe_media_duration",
+        lambda path: 899,
+    )
+
+    cues, language = run_subtitle._transcribe_with_chunks(media, backend)
+
+    assert cues == []
+    assert language == "en"
+    assert backend.videos == [media]
+
+
+def test_process_video_sends_merged_timeline_to_llm_once(
+    tmp_path,
+    monkeypatch,
+):
+    video = tmp_path / "long.mp4"
+    video.write_bytes(b"video")
+    merged = [
+        {
+            "id": 1,
+            "time": "00:14:59,000 --> 00:15:00,000",
+            "text": "[S01] first",
+        },
+        {
+            "id": 2,
+            "time": "00:15:01,000 --> 00:15:02,000",
+            "text": "[S01] second",
+        },
+    ]
+    llm_calls = []
+    monkeypatch.setattr(
+        run_subtitle,
+        "_transcribe_with_chunks",
+        lambda media, backend: (merged, "en"),
+    )
+    monkeypatch.setattr(
+        run_subtitle,
+        "translate_cues",
+        lambda cues, *args: llm_calls.append(list(cues)) or cues,
+    )
+    monkeypatch.setattr(
+        run_subtitle,
+        "_burn_hard_subtitle",
+        lambda *args, **kwargs: video,
+    )
+    monkeypatch.setattr(
+        run_subtitle.video_meta,
+        "merge_write_mp4_meta",
+        lambda *args, **kwargs: None,
+    )
+
+    run_subtitle.process_video(
+        video,
+        FakeBackend(),
+        "key",
+        "model",
+        True,
+    )
+
+    assert llm_calls == [merged]
+
+
 def test_empty_embedded_subtitle_meta_is_considered_complete(tmp_path, monkeypatch):
     video = tmp_path / "sample.mp4"
     video.write_bytes(b"video")

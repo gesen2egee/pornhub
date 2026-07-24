@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import subprocess
 import sys
@@ -14,7 +15,7 @@ VIDEOS = ROOT / "videos"
 SUBTITLE_TEMP = ROOT / "tasks" / "subtitle-temp"
 
 sys.path.insert(0, str(ROOT))
-from asr_backends import create_backend  # noqa: E402
+from asr_backends import create_backend, srt_time  # noqa: E402
 from audio_enhance_stage import (  # noqa: E402
     ENHANCE_MARKER,
     auto_enhance_enabled,
@@ -30,6 +31,7 @@ import video_meta  # noqa: E402
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm"}
+ASR_CHUNK_SECONDS = 15 * 60
 
 
 def _low_video_directories() -> list[Path]:
@@ -96,6 +98,154 @@ def _subtitle_complete(video: Path) -> bool:
         meta.get("original_srt_present")
         and meta.get("translated_srt_present")
     )
+
+
+def _probe_media_duration(media: Path) -> float | None:
+    ffprobe = os.getenv("FFPROBE_EXE", "ffprobe")
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=nw=1:nk=1",
+                str(media),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        duration = float(result.stdout.strip())
+    except (FileNotFoundError, subprocess.SubprocessError, ValueError):
+        return None
+    return duration if duration > 0 else None
+
+
+def _parse_srt_time(value: str) -> float:
+    hours, minutes, remainder = value.strip().split(":")
+    seconds, milliseconds = remainder.replace(".", ",").split(",")
+    return (
+        int(hours) * 3600
+        + int(minutes) * 60
+        + int(seconds)
+        + int(milliseconds) / 1000
+    )
+
+
+def _offset_cues(
+    cues: list[dict],
+    offset_seconds: float,
+    first_id: int,
+) -> list[dict]:
+    """把分段內相對時間換算成全片時間並重新連續編號。"""
+    merged: list[dict] = []
+    for index, cue in enumerate(cues, start=first_id):
+        start_text, end_text = str(cue["time"]).split("-->", 1)
+        start = _parse_srt_time(start_text) + offset_seconds
+        end = _parse_srt_time(end_text) + offset_seconds
+        item = dict(cue)
+        item["id"] = index
+        item["time"] = f"{srt_time(start)} --> {srt_time(end)}"
+        merged.append(item)
+    return merged
+
+
+def _chunk_audio_path(media: Path, index: int) -> Path:
+    SUBTITLE_TEMP.mkdir(parents=True, exist_ok=True)
+    return SUBTITLE_TEMP / (
+        f"{media.stem[:40]}-{abs(hash(media.resolve())):x}"
+        f".asr-part-{index:03d}.wav"
+    )
+
+
+def _extract_audio_chunk(
+    media: Path,
+    output: Path,
+    start: float,
+    duration: float,
+) -> None:
+    ffmpeg = os.getenv("FFMPEG_EXE", "ffmpeg")
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        str(start),
+        "-t",
+        str(duration),
+        "-i",
+        str(media),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        str(output),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("找不到 ffmpeg，無法建立 ASR 分段。") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("FFmpeg 建立 15 分鐘 ASR 分段超時。") from exc
+    if result.returncode != 0 or not output.exists():
+        details = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"FFmpeg 建立 ASR 分段失敗：{details[-1000:]}")
+
+
+def _transcribe_with_chunks(media: Path, backend) -> tuple[list[dict], str]:
+    """每 15 分鐘執行 MOSS，最後合併成單一完整時間軸。"""
+    duration = _probe_media_duration(media)
+    if duration is None or duration <= ASR_CHUNK_SECONDS:
+        return backend.transcribe(media)
+
+    part_count = math.ceil(duration / ASR_CHUNK_SECONDS)
+    print(
+        f"  MOSS 分段 ASR：片長 {duration / 60:.1f} 分鐘，"
+        f"共 {part_count} 段，每段最多 15 分鐘",
+        flush=True,
+    )
+    merged: list[dict] = []
+    languages: list[str] = []
+    for index in range(part_count):
+        start = index * ASR_CHUNK_SECONDS
+        part_duration = min(ASR_CHUNK_SECONDS, duration - start)
+        chunk = _chunk_audio_path(media, index + 1)
+        try:
+            print(
+                f"  ASR 分段 {index + 1}/{part_count}："
+                f"{srt_time(start)}–{srt_time(start + part_duration)}",
+                flush=True,
+            )
+            _extract_audio_chunk(media, chunk, start, part_duration)
+            cues, language = backend.transcribe(chunk)
+            merged.extend(_offset_cues(cues, start, len(merged) + 1))
+            if language and language not in languages:
+                languages.append(language)
+        finally:
+            chunk.unlink(missing_ok=True)
+    print(
+        f"  ASR 分段合併完成：{len(merged)} 段字幕，"
+        "接著統一交給 LLM 校正與翻譯",
+        flush=True,
+    )
+    return merged, ",".join(languages) or "multilingual"
 
 
 def _ffmpeg_filter_value(value: str) -> str:
@@ -235,7 +385,7 @@ def process_video(
         if backend is None or not api_key:
             raise RuntimeError("缺少 ASR backend 或 OpenRouter API key。")
         print(f"  1/3 {backend.display_name} 辨識", flush=True)
-        cues, language = backend.transcribe(media_input)
+        cues, language = _transcribe_with_chunks(media_input, backend)
         print(f"  語言：{language}；字幕段落：{len(cues)}", flush=True)
         original_srt = format_srt(cues)
         if cues:
