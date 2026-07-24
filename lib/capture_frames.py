@@ -9,12 +9,12 @@ import urllib.request
 import urllib.parse
 import shutil
 import datetime
-import yt_dlp
 import video_meta
+import sites
 from project_paths import PREVIEW_IMAGES_DIR, TEMP_DIR
 from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageStat
 
-EPORNER_DEFAULT_URL = "https://www.eporner.com/country-top/tw/"
+EPORNER_DEFAULT_URL = sites.EPORNER_DEFAULT_URL
 DEFAULT_PREVIEW_OUTPUT = str(PREVIEW_IMAGES_DIR)
 
 if sys.platform == 'win32':
@@ -39,22 +39,9 @@ def log_event(text, output_dir=DEFAULT_PREVIEW_OUTPUT):
         print(f"[!] 寫入 Log 失敗: {e}")
 
 def get_start_page_from_url(url):
-    """從一般 query 或 Eporner 路徑中解析起始頁碼。"""
-    if not url:
-        return 1
-    m = re.search(r'[?&]page=(\d+)', url)
-    if m:
-        return int(m.group(1))
-
-    parsed = urllib.parse.urlsplit(url)
-    hostname = (parsed.hostname or "").lower()
-    if hostname == "eporner.com" or hostname.endswith(".eporner.com"):
-        segments = [segment for segment in parsed.path.split("/") if segment]
-        if len(segments) >= 3 and segments[-1].isdigit():
-            return int(segments[-1])
-        if len(segments) >= 4 and segments[-2].isdigit():
-            return int(segments[-2])
-    return 1
+    """依站點 adapter 解析起始頁碼。"""
+    adapter = sites.get_adapter_for_url(url or "")
+    return adapter.get_start_page(url or "")
 
 def generate_output_folder_name(
     target,
@@ -66,26 +53,7 @@ def generate_output_folder_name(
     start_page = get_start_page_from_url(target)
     end_page = start_page + max(1, int(pages)) - 1
     page_tag = f"p{start_page}" if start_page == end_page else f"p{start_page}-{end_page}"
-    
-    tag = "eporner"
-    if not target or target.strip().rstrip("/") == EPORNER_DEFAULT_URL.rstrip("/"):
-        tag = "eporner"
-    elif os.path.isfile(target):
-        tag = "file_links"
-    else:
-        if "search=" in target or "query=" in target:
-            m = re.search(r'(?:search|query)=([^&]+)', target)
-            if m:
-                raw_kw = urllib.parse.unquote(m.group(1))
-                tag = "search_" + re.sub(r'[^\w\u4e00-\u9fa5]', '_', raw_kw)
-        elif not target.startswith("http://") and not target.startswith("https://"):
-            tag = "search_" + re.sub(r'[^\w\u4e00-\u9fa5]', '_', target.strip())
-        elif "viewkey=" in target:
-            tag = "video"
-        else:
-            tag = "list"
-            
-    tag = tag.strip("_")
+    tag = sites.folder_tag_for_target(target).strip("_")
     folder_name = f"{timestamp}_{tag}_{page_tag}"
     full_path = os.path.join(base_output_dir, folder_name)
     os.makedirs(full_path, exist_ok=True)
@@ -116,185 +84,30 @@ def calculate_9_timestamps(duration):
     return [int(ts) for ts in timestamps]
 
 def build_page_url(url, page_num):
-    """依網站規則構建分頁 URL，Eporner 使用路徑頁碼。"""
-    parsed = urllib.parse.urlsplit(url)
-    hostname = (parsed.hostname or "").lower()
-    if hostname == "eporner.com" or hostname.endswith(".eporner.com"):
-        segments = [segment for segment in parsed.path.split("/") if segment]
-        page_index = None
-        if len(segments) >= 3 and segments[-1].isdigit():
-            page_index = len(segments) - 1
-        elif len(segments) >= 4 and segments[-2].isdigit():
-            page_index = len(segments) - 2
-
-        if page_index is not None:
-            if page_num <= 1:
-                segments.pop(page_index)
-            else:
-                segments[page_index] = str(page_num)
-        elif page_num > 1:
-            # 有篩選條件時頁碼位於倒數第二段；無篩選時位於最後一段。
-            if len(segments) >= 3:
-                segments.insert(len(segments) - 1, str(page_num))
-            else:
-                segments.append(str(page_num))
-
-        path = "/" + "/".join(segments) + "/"
-        return urllib.parse.urlunsplit(
-            (parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment)
-        )
-
-    if page_num <= 1 and 'page=' not in url:
-        return url
-        
-    if re.search(r'[?&]page=\d+', url):
-        return re.sub(r'([?&]page=)\d+', r'\g<1>' + str(page_num), url)
-    elif '?' in url:
-        return f"{url}&page={page_num}"
-    else:
-        return f"{url}?page={page_num}"
+    """依站點 adapter 構建分頁 URL。"""
+    adapter = sites.get_adapter_for_url(url)
+    return adapter.build_page_url(url, page_num)
 
 def extract_single_page_urls(target_url):
     """提取單一網頁主要列表中的影片網址"""
     print(f"[*] 正在分析網頁，擷取頁面中的影片清單: {target_url} ...")
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Cookie': 'age_verified=1; platform=pc',
-        'Referer': f"{urllib.parse.urlsplit(target_url).scheme}://{urllib.parse.urlsplit(target_url).netloc}/"
-    }
-    try:
-        req = urllib.request.Request(target_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            html = resp.read().decode('utf-8', errors='ignore')
-            
-        main_block = html
-        hostname = (urllib.parse.urlsplit(target_url).hostname or "").lower()
-        is_eporner = hostname == "eporner.com" or hostname.endswith(".eporner.com")
-        if not is_eporner:
-            m = re.search(r'<ul[^>]*id="videoSearchResult"[^>]*>(.*?)</ul>', html, re.DOTALL)
-            if not m:
-                m = re.search(r'<ul[^>]*class="[^"]*videos[^"]*"[^>]*>(.*?)</ul>', html, re.DOTALL)
-            if m:
-                main_block = m.group(1)
-
-        viewkeys = re.findall(r'href="/view_video.php\?viewkey=([a-zA-Z0-9]+)"', main_block)
-        if not viewkeys:
-            viewkeys = re.findall(r'viewkey=([a-zA-Z0-9]+)', main_block)
-
-        if viewkeys:
-            seen = set()
-            unique_keys = [k for k in viewkeys if not (k in seen or seen.add(k))]
-            urls = [f"https://www.pornhub.com/view_video.php?viewkey={k}" for k in unique_keys]
-            print(f"[+] 從網頁主要列表中成功精確分析出 {len(urls)} 部影片！")
-            return urls
-
-        eporner_paths = re.findall(
-            r'href=["\'](/(?:video-[^"\'?#]+|hd-porn/[^"\'?#]+))',
-            main_block,
-            re.IGNORECASE,
-        )
-        if eporner_paths:
-            seen = set()
-            urls = [
-                urllib.parse.urljoin("https://www.eporner.com/", path)
-                for path in eporner_paths
-                if not (path in seen or seen.add(path))
-            ]
-            print(f"[+] 從 Eporner 網頁成功分析出 {len(urls)} 部影片！")
-            return urls
-    except Exception:
-        pass
-
-    # 若原生 HTTP 遭受 Cloudflare 防護阻擋 (403)，無縫切換至引擎深度解析
-    ydl_opts = {'extract_flat': True, 'quiet': True}
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            res = ydl.extract_info(target_url, download=False)
-            if 'entries' in res:
-                urls = []
-                for entry in res['entries']:
-                    u = entry.get('url') or entry.get('webpage_url')
-                    if u and (u.startswith("http://") or u.startswith("https://")):
-                        urls.append(u)
-                if urls:
-                    seen = set()
-                    unique_urls = [u for u in urls if not (u in seen or seen.add(u))]
-                    print(f"[+] 透過專業解析引擎成功擷取出 {len(unique_urls)} 部影片！")
-            return unique_urls
-    except Exception as e:
-        print(f"[!] 網頁影片清單解析失敗: {e}")
-
-    parsed_target = urllib.parse.urlsplit(target_url)
-    hostname = (parsed_target.hostname or "").lower()
-    if hostname == "eporner.com" or hostname.endswith(".eporner.com"):
-        if not re.match(r"^/(?:video-|hd-porn/|embed/)", parsed_target.path):
-            return []
-    return [target_url]
+    adapter = sites.get_adapter_for_url(target_url)
+    urls = adapter.extract_list_urls(target_url)
+    if urls:
+        print(f"[+] 透過 {adapter.name} 成功分析出 {len(urls)} 部影片！")
+        return urls
+    print(f"[!] 網頁影片清單解析失敗: {adapter.name}")
+    if adapter.is_single_video_url(target_url):
+        return [target_url]
+    return []
 
 
 def extract_urls_from_target(target, pages=1):
     """從目標 (網頁 URL、關鍵字搜尋、檔案或單一影片 URL) 解析出所有影片 URL 列表 (支援多頁爬取)"""
-    if not target:
-        target = EPORNER_DEFAULT_URL
-        
-    # 判斷是否為關鍵字 (非 http/https 網址且非本地檔案)
-    if not os.path.isfile(target) and not (target.startswith("http://") or target.startswith("https://")):
-        keyword = target.strip()
-        encoded_keyword = urllib.parse.quote(keyword, safe="")
-        target = f"https://www.eporner.com/tag/{encoded_keyword}/top-rated/"
-        print(f"[*] 檢測到關鍵字 [{keyword}]，改用 Eporner Tag 搜尋: {target}")
-    elif ("video/search" in target or "search=" in target) and ("o=" not in target or "t=" not in target):
-        delimiter = "&" if "?" in target else "?"
-        if "o=" not in target:
-            target += f"{delimiter}o=mv"
-            delimiter = "&"
-        if "t=" not in target:
-            target += f"{delimiter}t=a"
-        print(f"[*] 搜尋網址自動補充預設排序與時間篩選參數: {target}")
-
-    parsed_target = urllib.parse.urlsplit(target)
-    hostname = (parsed_target.hostname or "").lower()
-    if hostname == "eporner.com" or hostname.endswith(".eporner.com"):
-        if re.match(r"^/(?:video-|hd-porn/|embed/)", parsed_target.path):
-            return [target]
-
-    if os.path.isfile(target):
-        print(f"[*] 讀取文字檔中的網址清單: {target}")
-        with open(target, 'r', encoding='utf-8') as f:
-            urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-        return urls
-
-    if 'viewkey=' in target and ('view_video.php' in target or 'pornhub.com' in target) and not ('video' in target and 'o=' in target):
-        m = re.search(r'viewkey=([a-zA-Z0-9]+)', target)
-        if m:
-            return [f"https://www.pornhub.com/view_video.php?viewkey={m.group(1)}"]
-
-    all_urls = []
-    seen = set()
-    total_pages = max(1, int(pages))
-    start_page = get_start_page_from_url(target)
-    end_page = start_page + total_pages - 1
-    
-    for idx, p in enumerate(range(start_page, end_page + 1), 1):
-        page_target = build_page_url(target, p)
-        if total_pages > 1 or start_page > 1:
-            print(f"\n[+] 正在連續處理第 [{idx}/{total_pages}] 頁 (網頁 page={p}): {page_target}")
-            
-        page_urls = extract_single_page_urls(page_target)
-        for u in page_urls:
-            if u not in seen:
-                seen.add(u)
-                all_urls.append(u)
-
-    if total_pages > 1 or start_page > 1:
-        print(f"\n[+] 跨頁連續抓取完成！(處理頁碼 page={start_page}~{end_page}) 共計精確獲得 {len(all_urls)} 部影片！")
-        
-    return all_urls
+    return sites.extract_urls_from_target(target, pages=pages)
 
 def extract_video_info(video_url, quality="720p"):
-    """使用 yt-dlp 獲取影片時長、標題、串流 URL、HTTP Headers 與詳細診斷屬性"""
+    """透過共用 resolve_playable 獲取時長、標題、串流 URL、Headers 與 WEB_META"""
     if quality == "best":
         fmt = "bestvideo[protocol!=m3u8_native]/best[protocol!=m3u8_native]/bestvideo/best"
     elif quality.endswith('p') and quality[:-1].isdigit():
@@ -303,48 +116,49 @@ def extract_video_info(video_url, quality="720p"):
     else:
         fmt = quality
 
-    ydl_opts = {
-        'format': fmt,
-        'quiet': True,
-        'no_warnings': True,
-    }
-    
     print(f"[*] 正在解析影片資訊 ({quality} 畫質): {video_url} ...")
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(video_url, download=False)
-    info.setdefault('webpage_url', video_url)
-        
-    duration = info.get('duration')
-    title = info.get('title', 'video_frames')
-    stream_url = info.get('url')
-    http_headers = info.get('http_headers', {})
-    
-    format_id = info.get('format_id', 'unknown')
-    ext = info.get('ext', 'unknown')
-    protocol = info.get('protocol', 'unknown')
-    width = info.get('width', 0)
-    height = info.get('height', 0)
-    vcodec = info.get('vcodec', 'unknown')
-    acodec = info.get('acodec', 'unknown')
-    
+    adapter = sites.get_adapter_for_url(video_url)
+    resolved = sites.resolve_playable(
+        adapter,
+        video_url,
+        purpose="info",
+        prefer_lowest=False,
+        base_ydl_opts={"format": fmt},
+    )
+    info = resolved.get("info") or {}
+    info.setdefault("webpage_url", video_url)
+    stream_url = resolved.get("stream_url")
+    http_headers = resolved.get("http_headers") or {}
+
+    duration = info.get("duration")
+    title = info.get("title", "video_frames")
+    format_id = info.get("format_id", "unknown")
+    ext = info.get("ext", "unknown")
+    protocol = info.get("protocol", "unknown")
+    width = info.get("width", 0)
+    height = info.get("height", 0)
+    vcodec = info.get("vcodec", "unknown")
+    acodec = info.get("acodec", "unknown")
+
     diagnostic_info = {
-        'format_id': format_id,
-        'ext': ext,
-        'protocol': protocol,
-        'resolution': f"{width}x{height}",
-        'codecs': f"{vcodec}/{acodec}"
+        "format_id": format_id,
+        "ext": ext,
+        "protocol": protocol,
+        "resolution": f"{width}x{height}",
+        "codecs": f"{vcodec}/{acodec}",
+        "source": resolved.get("source"),
     }
-    
+
     if not stream_url:
         raise ValueError("無法獲取影片串流 URL")
-        
+
     return {
-        'title': title,
-        'duration': duration,
-        'stream_url': stream_url,
-        'http_headers': http_headers,
-        'diagnostic_info': diagnostic_info,
-        'web_meta': video_meta.build_web_meta(info),
+        "title": title,
+        "duration": duration,
+        "stream_url": stream_url,
+        "http_headers": http_headers,
+        "diagnostic_info": diagnostic_info,
+        "web_meta": video_meta.build_web_meta(info),
     }
 
 def capture_single_frame(timestamp, stream_url, http_headers, output_file):

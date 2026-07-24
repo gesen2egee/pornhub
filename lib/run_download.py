@@ -11,6 +11,7 @@ import urllib.parse
 from datetime import datetime
 import yt_dlp
 import video_meta
+import sites
 from project_paths import (
     DOWNLOADED_DIR,
     LIB_DIR,
@@ -34,69 +35,6 @@ if sys.platform == 'win32':
     except Exception:
         pass
 
-def select_pornhub_mp4_url(html, max_quality=1080, prefer_lowest=False):
-    """從 Pornhub 頁面選出不超過指定解析度的 MP4 直連。"""
-    candidates = []
-    for quality, url in re.findall(
-        r'"quality_(\d+)p"\s*:\s*"([^"]+)"',
-        html,
-    ):
-        candidates.append((int(quality), url))
-
-    for block in re.findall(r"\{[^{}]*\}", html, re.DOTALL):
-        quality_match = re.search(
-            r'"quality"\s*:\s*"?(\d+)(?:p)?"?',
-            block,
-        )
-        url_match = re.search(r'"videoUrl"\s*:\s*"([^"]+)"', block)
-        if quality_match and url_match:
-            candidates.append(
-                (int(quality_match.group(1)), url_match.group(1))
-            )
-
-    eligible = [
-        (quality, url)
-        for quality, url in candidates
-        if quality <= max_quality
-    ]
-    if not eligible:
-        return None
-    quality, url = (
-        min(eligible, key=lambda item: item[0])
-        if prefer_lowest
-        else max(eligible, key=lambda item: item[0])
-    )
-    del quality
-    return url.replace("\\/", "/").replace("\\u0026", "&")
-
-
-def direct_fetch_pornhub_mp4_stream(
-    webpage_url,
-    max_quality=1080,
-    prefer_lowest=False,
-):
-    """備用解析器也嚴格限制畫質，避免 yt-dlp 失敗時偷抓回 4K。"""
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Cookie': 'age_verified=1; platform=pc',
-        'Referer': 'https://cn.pornhub.com/'
-    }
-    try:
-        req = urllib.request.Request(webpage_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            html = resp.read().decode('utf-8', errors='ignore')
-            
-        return select_pornhub_mp4_url(
-            html,
-            max_quality=max_quality,
-            prefer_lowest=prefer_lowest,
-        )
-    except Exception as e:
-        print(f"  [!] 原生備用解析器抓取失敗: {e}")
-    return None
-
 from PIL import Image
 
 
@@ -108,7 +46,6 @@ ARCHIVE_DIR = str(DOWNLOADED_DIR)
 WORK_TEMP_DIR = str(TEMP_DIR)
 DOWNLOAD_SOCKET_TIMEOUT = 30
 DOWNLOAD_RETRIES = 3
-FALLBACK_DOWNLOAD_TIMEOUT = 2 * 60 * 60
 
 
 def _pipeline_dir(target_dir):
@@ -551,14 +488,6 @@ def is_http_video_url(url):
     return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
 
 
-def is_pornhub_url(url):
-    """判斷網址是否適用 Pornhub 專用的原生備用解析器。"""
-    if not is_http_video_url(url):
-        return False
-    hostname = (urllib.parse.urlparse(url.strip()).hostname or "").lower()
-    return hostname == "pornhub.com" or hostname.endswith(".pornhub.com")
-
-
 def get_video_url_from_image(jpg_path):
     """直接從九宮格 JPG 圖片檔案的 EXIF Metadata (ImageDescription 0x010e) 中讀取影片 URL"""
     try:
@@ -699,12 +628,14 @@ def upgrade_media_web_meta(jpg_path, mp4_path, video_url, info=None):
     """補齊影片與九宮格 WEB_META；失敗不影響下載結果。"""
     try:
         if info is None:
-            with yt_dlp.YoutubeDL({
-                "quiet": True,
-                "no_warnings": True,
-                "skip_download": True,
-            }) as ydl:
-                info = ydl.extract_info(video_url, download=False)
+            adapter = sites.get_adapter_for_url(video_url)
+            resolved = sites.resolve_playable(
+                adapter,
+                video_url,
+                purpose="info",
+                prefer_lowest=False,
+            )
+            info = resolved.get("info")
         info = dict(info or {})
         info.setdefault("webpage_url", video_url)
         web_meta = video_meta.build_web_meta(info)
@@ -870,6 +801,8 @@ def process_single_directory(
         os.makedirs(temp_dir_abs, exist_ok=True)
         temp_thumb_template = os.path.join(temp_dir_abs, f"thumb_{idx}_%(id)s.%(ext)s")
 
+        purpose = "download_low" if is_low_quality else "download_full"
+        adapter = sites.get_adapter_for_url(video_url)
         ydl_opts = {
             'format': fmt_spec,
             'paths': {
@@ -888,6 +821,7 @@ def process_single_directory(
             'extractor_retries': DOWNLOAD_RETRIES,
             'file_access_retries': DOWNLOAD_RETRIES,
         }
+        ydl_opts.update(adapter.ydl_opts(purpose))
         if not is_low_quality:
             ydl_opts["format_sort"] = HIGH_VIDEO_FORMAT_SORT
 
@@ -907,20 +841,73 @@ def process_single_directory(
 
         download_success = False
         try:
-            download_with_416_recovery(
-                video_url,
-                ydl_opts,
-                temp_dir_abs,
-                video_file_basename,
-            )
-            download_success = (
-                os.path.exists(staged_video_file)
-                and has_video_stream(staged_video_file) is True
-                and (
-                    is_low_quality
-                    or is_video_within_1080p(staged_video_file) is True
+            # Optional adapter stream (Tier 3): direct ffmpeg path when yt-dlp alone is insufficient.
+            stream = adapter.resolve_stream(video_url, prefer_lowest=is_low_quality)
+            if stream and stream.get("url"):
+                print(f"   [i] 使用 {adapter.name} resolve_stream 下載")
+                temp_ffmpeg_file = os.path.join(
+                    temp_dir_abs, f"stream_{idx}_{video_file_basename}"
                 )
-            )
+                headers = stream.get("http_headers") or {}
+                ua = headers.get("User-Agent", "Mozilla/5.0")
+                header_lines = "".join(
+                    f"{k}: {v}\r\n"
+                    for k, v in headers.items()
+                    if k.lower() != "user-agent"
+                )
+                ff_cmd = [
+                    "ffmpeg",
+                    "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
+                    "-allowed_segment_extensions", "ALL",
+                    "-rw_timeout", str(DOWNLOAD_SOCKET_TIMEOUT * 1_000_000),
+                    "-user_agent", ua,
+                    "-y",
+                ]
+                if header_lines:
+                    ff_cmd.extend(["-headers", header_lines])
+                if is_low_quality:
+                    hdr_str = header_lines
+                    duration = probe_stream_duration(stream["url"], hdr_str)
+                    start, end = get_low_video_sample_range(duration)
+                    ff_cmd.extend([
+                        "-ss", str(start),
+                        "-i", stream["url"],
+                        "-t", str(end - start),
+                        "-c", "copy",
+                        temp_ffmpeg_file,
+                    ])
+                else:
+                    ff_cmd.extend(["-i", stream["url"], "-c", "copy", temp_ffmpeg_file])
+                res_ff = subprocess.run(ff_cmd, timeout=2 * 60 * 60)
+                if (
+                    res_ff.returncode == 0
+                    and os.path.exists(temp_ffmpeg_file)
+                    and has_video_stream(temp_ffmpeg_file) is True
+                    and (
+                        is_low_quality
+                        or is_video_within_1080p(temp_ffmpeg_file) is True
+                    )
+                ):
+                    shutil.move(temp_ffmpeg_file, staged_video_file)
+                    download_success = True
+                elif os.path.exists(temp_ffmpeg_file):
+                    remove_invalid_video(temp_ffmpeg_file, "adapter stream 暫存")
+
+            if not download_success:
+                download_with_416_recovery(
+                    video_url,
+                    ydl_opts,
+                    temp_dir_abs,
+                    video_file_basename,
+                )
+                download_success = (
+                    os.path.exists(staged_video_file)
+                    and has_video_stream(staged_video_file) is True
+                    and (
+                        is_low_quality
+                        or is_video_within_1080p(staged_video_file) is True
+                    )
+                )
             if not download_success:
                 print(
                     "   [!] yt-dlp 結束但影片無效，或解析度超過 1080P。"
@@ -945,75 +932,6 @@ def process_single_directory(
                     print("    pip install --upgrade yt-dlp")
                     print("=" * 65)
                     prompted_upgrade = True
-            
-            if not is_pornhub_url(video_url):
-                print("   [SKIP FALLBACK] 此來源不是 Pornhub，不使用 Pornhub 專用備用解析器。")
-                direct_mp4 = None
-            else:
-                print(f"   [FALLBACK] 嘗試啟動 Pornhub 原生備用解析器繞過異常...")
-                direct_mp4 = direct_fetch_pornhub_mp4_stream(
-                    video_url,
-                    max_quality=1080,
-                    prefer_lowest=is_low_quality,
-                )
-            if direct_mp4:
-                print("   [+] 成功解析直連 MP4 串流，發起 FFmpeg 極速下載（暫存於 output/00_temp）...")
-                temp_ffmpeg_file = os.path.join(temp_dir_abs, f"ffmpeg_{idx}_{video_file_basename}")
-                ff_headers = (
-                    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n"
-                    "Referer: https://www.pornhub.com/\r\n"
-                    "Cookie: age_verified=1; platform=pc\r\n"
-                )
-                ff_base_opts = [
-                    "ffmpeg",
-                    "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
-                    "-allowed_segment_extensions", "ALL",
-                    "-rw_timeout", str(DOWNLOAD_SOCKET_TIMEOUT * 1_000_000),
-                    "-headers", ff_headers,
-                    "-y"
-                ]
-                if is_low_quality:
-                    duration = probe_stream_duration(direct_mp4, ff_headers)
-                    start, end = get_low_video_sample_range(duration)
-                    print(f"   [i] LOW VIDEO 取樣區間：{start}–{end} 秒")
-                    ffmpeg_cmd = ff_base_opts + [
-                        "-ss", str(start),
-                        "-i", direct_mp4,
-                        "-t", str(end - start),
-                        "-c", "copy",
-                        temp_ffmpeg_file,
-                    ]
-                else:
-                    ffmpeg_cmd = ff_base_opts + ["-i", direct_mp4, "-c", "copy", temp_ffmpeg_file]
-                try:
-                    fallback_timeout = positive_env_seconds(
-                        "DOWNLOAD_JOB_TIMEOUT_SECONDS",
-                        FALLBACK_DOWNLOAD_TIMEOUT,
-                    )
-                    res_ff = subprocess.run(
-                        ffmpeg_cmd,
-                        timeout=fallback_timeout,
-                    )
-                    if (
-                        res_ff.returncode == 0
-                        and os.path.exists(temp_ffmpeg_file)
-                        and has_video_stream(temp_ffmpeg_file) is True
-                        and (
-                            is_low_quality
-                            or is_video_within_1080p(temp_ffmpeg_file) is True
-                        )
-                    ):
-                        shutil.move(temp_ffmpeg_file, staged_video_file)
-                        download_success = True
-                    elif os.path.exists(temp_ffmpeg_file):
-                        remove_invalid_video(
-                            temp_ffmpeg_file,
-                            "FFmpeg 暫存影片",
-                        )
-                except subprocess.TimeoutExpired:
-                    print(
-                        "   [!] FFmpeg 單支下載超時，保留暫存並繼續下一支。"
-                    )
 
         if download_success:
             print(f"  [OK] 影片下載至暫存 -> {os.path.basename(staged_video_file)}")
@@ -1049,7 +967,7 @@ def run_download_process(
 ):
     """主下載流程控制"""
     print(f"==================================================")
-    print(f"   Pornhub 雙畫質原影片下載器 (純 EXIF 圖片讀取版)")
+    print(f"   多站雙畫質原影片下載器 (EXIF URL + site registry)")
     print(f"==================================================")
 
     ensure_output_directories()

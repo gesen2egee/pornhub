@@ -132,6 +132,15 @@ OPENROUTER_API_KEY
 - `ASMR_ENHANCER_DEVICE`：`auto`、`cpu` 或 `cuda`
 - `AUDIO_ENHANCE_REPORT`：覆蓋分析報告路徑
 
+## 多站支援
+
+列表／搜尋／分頁／下載透過 `lib/sites/` registry。本輪內建：
+
+- **Tier 1：** Eporner（關鍵字預設）、Pornhub、XVideos、xHamster、XNXX、SpankBang  
+- **Tier 3：** MissAV、Jable.tv、91porn（`SITE_91PORN_COOKIES` = Netscape cookies.txt）、hanime.tv  
+
+下載僅走 yt-dlp 與各站 adapter hooks，**不再**使用 Pornhub HTML 直連 fallback。社群 plugin 僅 clone 至 `tasks/plugins-research/` 供研究，不安裝進 venv。
+
 ## Python 與測試
 
 直接執行程式：
@@ -141,10 +150,16 @@ lib\.venv\Scripts\python.exe lib\capture_frames.py "影片網址"
 lib\.venv\Scripts\python.exe lib\run_download.py
 ```
 
-執行測試：
+執行單元測試：
 
 ```powershell
 lib\.venv\Scripts\python.exe -m pytest -q lib\tests
+```
+
+多站真實連線 smoke（產物在 `tasks/tests/site-smoke/`，失敗會 skip）：
+
+```powershell
+lib\.venv\Scripts\python.exe -m pytest -q tasks\tests\test_sites_smoke.py -m site_smoke
 ```
 
 查看或匯出影片 Meta：
