@@ -95,9 +95,25 @@ def _translate_batch(
     api_key: str,
     model: str,
     session: requests.Session,
+    context_before: list[dict[str, Any]] | None = None,
+    context_after: list[dict[str, Any]] | None = None,
 ) -> dict[int, str]:
     minimal_input = [{"id": cue["id"], "text": cue["text"]} for cue in cues]
-    user_payload = json.dumps(minimal_input, ensure_ascii=False, separators=(",", ":"))
+    user_payload = json.dumps(
+        {
+            "context_before": [
+                {"id": cue["id"], "text": cue["text"]}
+                for cue in (context_before or [])
+            ],
+            "items": minimal_input,
+            "context_after": [
+                {"id": cue["id"], "text": cue["text"]}
+                for cue in (context_after or [])
+            ],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     body = {
         "model": model,
         "messages": [
@@ -113,6 +129,9 @@ def _translate_batch(
                     "翻譯結果只保留繁體中文，不要輸出校正原文。"
                     "保留原意、語氣、成人內容與說話者情緒，不要摘要、解釋或審查；"
                     "原文不確定時不要自行捏造內容。"
+                    "user 會提供 context_before、items、context_after；"
+                    "前後文只用於統一人名、語氣、指涉與用詞，"
+                    "只翻譯 items，禁止輸出前後文項目。"
                     "只能回傳 JSON array，每個元素只能有 id 與 text，id 必須完全保留。"
                     "不要使用 Markdown、不要加前後說明。"
                 ),
@@ -191,7 +210,18 @@ def translate_cues(
     with requests.Session() as session:
         for start in range(0, len(translated_cues), batch_size):
             batch = translated_cues[start : start + batch_size]
-            translations = _translate_batch(batch, api_key, model, session)
+            context_before = translated_cues[max(0, start - 8):start]
+            context_after = translated_cues[
+                start + len(batch):start + len(batch) + 8
+            ]
+            translations = _translate_batch(
+                batch,
+                api_key,
+                model,
+                session,
+                context_before,
+                context_after,
+            )
             for cue in translated_cues[start : start + len(batch)]:
                 body = SPEAKER_LABEL_PATTERN.sub(
                     "",
