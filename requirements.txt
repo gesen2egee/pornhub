@@ -4,3 +4,4 @@ numpy
 curl_cffi
 mutagen
 requests
+pytest

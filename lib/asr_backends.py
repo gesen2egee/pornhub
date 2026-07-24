@@ -8,9 +8,10 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from project_paths import MOSS_DIR
 
-ROOT = Path(__file__).resolve().parent
-MOSS_CACHE = ROOT / "moss" / "model-cache"
+
+MOSS_CACHE = MOSS_DIR / "model-cache"
 DEFAULT_MOSS_MODEL = "openmoss/MOSS-Transcribe-Diarize"
 DEFAULT_MOSS_PROMPT = (
     "請將音訊轉寫為文字，每一段需以起始時間戳和說話人編號"

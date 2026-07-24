@@ -1,26 +1,24 @@
-# 專案產出的圖片、影片與 JSON mapping
-preview_map.json
-previews/
-videos/
-low_videos/
-downloaded/
-
-# 工作任務與日誌紀錄
-tasks/
+# 產出與工作資料
+/output/
+/tasks/
 *.log
-
-# 壓縮封存檔
 *.zip
 
-# 暫存檔與快取
-temp/
-.temp_*/
-__pycache__/
-*.pyc
-/.venv/
-/confucius4_tts/
+# Python 執行環境、模型與第三方原始碼
+/lib/.venv/
+/lib/moss/.venv/
+/lib/moss/asmr-enhancer/
+/lib/moss/audio-model-cache/
+/lib/moss/model-cache/
+/lib/confucius4_tts/
 
-# IDE & 系統暫存
+# 暫存檔與快取
+**/__pycache__/
+**/.pytest_cache/
+*.pyc
+.temp_*/
+
+# IDE 與系統暫存
 .vscode/
 .idea/
 .worktrees/

@@ -9,10 +9,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+from project_paths import (
+    LIB_DIR,
+    PREVIEW_VIDEOS_DIR,
+    TASKS_DIR,
+    VIDEOS_DIR,
+)
 
-ROOT = Path(__file__).resolve().parent
-VIDEOS = ROOT / "videos"
-SUBTITLE_TEMP = ROOT / "tasks" / "subtitle-temp"
+ROOT = LIB_DIR
+VIDEOS = VIDEOS_DIR
+SUBTITLE_TEMP = TASKS_DIR / "subtitle-temp"
 
 sys.path.insert(0, str(ROOT))
 from asr_backends import create_backend, srt_time  # noqa: E402
@@ -31,7 +37,7 @@ import video_meta  # noqa: E402
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm"}
-ASR_CHUNK_SECONDS = 15 * 60
+ASR_CHUNK_SECONDS = 7.5 * 60
 MIN_ASR_CHUNK_SECONDS = 3 * 60
 
 
@@ -40,7 +46,7 @@ def _low_video_directories() -> list[Path]:
     configured_dir = os.getenv("LOW_VIDEO_DIR")
     if configured_dir:
         directories.append(Path(configured_dir))
-    directories.extend([ROOT / "low_videos", ROOT / "low_video"])
+    directories.append(PREVIEW_VIDEOS_DIR)
     return directories
 
 
@@ -210,14 +216,14 @@ def _extract_audio_chunk(
     except FileNotFoundError as exc:
         raise RuntimeError("找不到 ffmpeg，無法建立 ASR 分段。") from exc
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("FFmpeg 建立 15 分鐘 ASR 分段超時。") from exc
+        raise RuntimeError("FFmpeg 建立 7.5 分鐘 ASR 分段超時。") from exc
     if result.returncode != 0 or not output.exists():
         details = (result.stderr or result.stdout).strip()
         raise RuntimeError(f"FFmpeg 建立 ASR 分段失敗：{details[-1000:]}")
 
 
 def _transcribe_with_chunks(media: Path, backend) -> tuple[list[dict], str]:
-    """每 15 分鐘執行 MOSS；CUDA OOM 時自動二分後合併時間軸。"""
+    """每 7.5 分鐘執行 MOSS；CUDA OOM 時自動二分後合併時間軸。"""
     duration = _probe_media_duration(media)
     if duration is None:
         try:
@@ -263,7 +269,7 @@ def _transcribe_with_chunks(media: Path, backend) -> tuple[list[dict], str]:
     part_count = math.ceil(duration / ASR_CHUNK_SECONDS)
     print(
         f"  MOSS 分段 ASR：片長 {duration / 60:.1f} 分鐘，"
-        f"共 {part_count} 段，每段最多 15 分鐘",
+        f"共 {part_count} 段，每段最多 7.5 分鐘",
         flush=True,
     )
     merged: list[dict] = []
@@ -590,7 +596,7 @@ def main() -> int:
     parser.add_argument(
         "--low-only",
         action="store_true",
-        help="只處理 low_videos／LOW_VIDEO_DIR，不處理一般 videos",
+        help="只處理 output/02_preview_videos，不處理正式影片",
     )
     parser.add_argument("--dry-run", action="store_true", help="只列出待處理影片，不呼叫模型/API")
     args = parser.parse_args()
@@ -600,7 +606,7 @@ def main() -> int:
 
     videos = _find_videos(low_only=args.low_only)
     if not videos:
-        print("low_videos、low_video、videos 都沒有可處理的影片。")
+        print("output/02_preview_videos 與 output/03_videos 都沒有可處理的影片。")
         return 0 if args.dry_run else 1
     pending = [
         video

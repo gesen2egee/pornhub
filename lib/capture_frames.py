@@ -11,9 +11,11 @@ import shutil
 import datetime
 import yt_dlp
 import video_meta
+from project_paths import PREVIEW_IMAGES_DIR, TEMP_DIR
 from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageStat
 
 EPORNER_DEFAULT_URL = "https://www.eporner.com/country-top/tw/"
+DEFAULT_PREVIEW_OUTPUT = str(PREVIEW_IMAGES_DIR)
 
 if sys.platform == 'win32':
     try:
@@ -22,7 +24,7 @@ if sys.platform == 'win32':
     except Exception:
         pass
 
-def log_event(text, output_dir="previews"):
+def log_event(text, output_dir=DEFAULT_PREVIEW_OUTPUT):
     """寫入 log 紀錄至 process.log"""
     os.makedirs(output_dir, exist_ok=True)
     log_file = os.path.join(output_dir, "process.log")
@@ -54,7 +56,11 @@ def get_start_page_from_url(url):
             return int(segments[-2])
     return 1
 
-def generate_output_folder_name(target, pages=1, base_output_dir="previews"):
+def generate_output_folder_name(
+    target,
+    pages=1,
+    base_output_dir=DEFAULT_PREVIEW_OUTPUT,
+):
     """根據時間、搜尋關鍵字/URL 標籤及頁數區間生成動態子資料夾名稱"""
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     start_page = get_start_page_from_url(target)
@@ -415,7 +421,7 @@ def check_images_has_duplicates(pil_images, threshold=2.5):
                 
     return False, -1, -1, 0, 0, 0.0
 
-def create_3x3_grid_image(image_data_list, title, duration, video_url, stream_url, diag_info, output_file, output_root="previews", web_meta=None):
+def create_3x3_grid_image(image_data_list, title, duration, video_url, stream_url, diag_info, output_file, output_root=DEFAULT_PREVIEW_OUTPUT, web_meta=None):
     """
     將 9 張截圖圖片合成為 3x3 九宮格圖片，並標註時間標籤（超大綠色標籤 + 3px 黑色邊框、右上角）
     """
@@ -570,7 +576,7 @@ def process_single_video(video_url, args, index=1, total=1):
     # 檔名加入 4 位數順序編號 (例如 0001-影片標題.jpg)
     final_output_file = os.path.join(args.output, f"{index:04d}-{safe_title}.jpg")
     
-    temp_dir = os.path.join("temp", f".temp_{safe_title}")
+    temp_dir = os.path.join(str(TEMP_DIR), f".temp_{safe_title}")
     os.makedirs(temp_dir, exist_ok=True)
 
     timestamps = calculate_9_timestamps(duration)
@@ -622,7 +628,12 @@ def main():
     parser.add_argument("target", nargs="?", default=EPORNER_DEFAULT_URL, help="影片網址、網站列表/分類/搜尋 URL、Eporner 關鍵字或包含網址的 txt 檔案路徑")
     parser.add_argument("-p", "--pages", type=int, default=1, help="連續擷取的頁數 (預設: 1 頁)")
     parser.add_argument("-q", "--quality", default="720p", help="畫質選擇 (預設: 720p, 可選 best, 1080p, 480p 等)")
-    parser.add_argument("-o", "--output", default="previews", help="輸出根目錄 (預設: previews)")
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=DEFAULT_PREVIEW_OUTPUT,
+        help="輸出根目錄（預設：output/01_preview_images）",
+    )
     parser.add_argument("-w", "--workers", type=int, default=9, help="每部影片並行截圖線程數 (預設: 9 線程同步發起)")
     parser.add_argument("-m", "--max-videos", type=int, default=0, help="最多處理的影片數量 (預設: 0 代表無限制，全數處理)")
     

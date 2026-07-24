@@ -7,9 +7,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from project_paths import CONFUCIUS_DIR
 
-ROOT = Path(__file__).resolve().parent
-RUNTIME_DIR = ROOT / "confucius4_tts"
+
+RUNTIME_DIR = CONFUCIUS_DIR
 SOURCE_DIR = RUNTIME_DIR / "source"
 EXPECTED_COMMIT = "186983518e9e8ab9af69cabdda3436a76d6ccdfb"
 

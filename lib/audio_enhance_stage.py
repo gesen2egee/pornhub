@@ -17,14 +17,16 @@ from typing import Any
 
 import numpy as np
 
+from project_paths import LIB_DIR, MOSS_DIR, MOSS_VENV_DIR, TASKS_DIR
 
-ROOT = Path(__file__).resolve().parent
+
+ROOT = LIB_DIR
 DEFAULT_CLASSIFIER_MODEL = "MIT/ast-finetuned-audioset-10-10-0.4593"
 DEFAULT_CLASSIFIER_REVISION = "f826b80d28226b62986cc218e5cec390b1096902"
-DEFAULT_ENHANCER_SCRIPT = ROOT / "moss" / "asmr-enhancer" / "asmr_enhancer.py"
-DEFAULT_MODEL_CACHE = ROOT / "moss" / "audio-model-cache"
-DEFAULT_REPORT = ROOT / "tasks" / "audio-enhance-latest.json"
-DEFAULT_STAGE_PYTHON = ROOT / "moss" / ".venv" / "Scripts" / "python.exe"
+DEFAULT_ENHANCER_SCRIPT = MOSS_DIR / "asmr-enhancer" / "asmr_enhancer.py"
+DEFAULT_MODEL_CACHE = MOSS_DIR / "audio-model-cache"
+DEFAULT_REPORT = TASKS_DIR / "audio-enhance-latest.json"
+DEFAULT_STAGE_PYTHON = MOSS_VENV_DIR / "Scripts" / "python.exe"
 ENHANCE_MARKER = "ASMR Enhancer auto v1"
 MUSIC_TITLE_PATTERN = re.compile(r"\b(pmv|dance|music|song|mv)\b", re.IGNORECASE)
 
@@ -298,7 +300,7 @@ def _enhancer_script() -> Path:
     )
     if not script.is_file():
         raise RuntimeError(
-            f"找不到 ASMR Enhancer：{script}。請重新執行 install_moss.bat。"
+            f"找不到 ASMR Enhancer：{script}。請重新執行 00_setup_or_update.bat。"
         )
     return script
 
@@ -454,9 +456,9 @@ def prepare_audio_media(videos: list[Path]) -> dict[Path, PreparedMedia]:
     python = Path(os.getenv("AUDIO_STAGE_PYTHON", str(DEFAULT_STAGE_PYTHON)))
     if not python.is_file():
         raise RuntimeError(
-            f"找不到字幕音訊處理環境：{python}。請先執行 install_moss.bat。"
+            f"找不到字幕音訊處理環境：{python}。請先執行 00_setup_or_update.bat。"
         )
-    task_directory = ROOT / "tasks" / "audio-stage"
+    task_directory = TASKS_DIR / "audio-stage"
     task_directory.mkdir(parents=True, exist_ok=True)
     token = f"{os.getpid()}-{uuid.uuid4().hex}"
     manifest = task_directory / f"{token}.input.json"

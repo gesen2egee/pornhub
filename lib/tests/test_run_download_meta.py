@@ -1,8 +1,23 @@
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 import run_download
+
+
+@pytest.fixture(autouse=True)
+def isolate_pipeline_paths(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        run_download,
+        "WORK_TEMP_DIR",
+        str(tmp_path / "temp"),
+    )
+    monkeypatch.setattr(
+        run_download,
+        "ARCHIVE_DIR",
+        str(tmp_path / "downloaded"),
+    )
 
 
 def test_1080p_limit_accepts_landscape_and_portrait():

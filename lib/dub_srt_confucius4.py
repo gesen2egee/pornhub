@@ -12,20 +12,20 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from project_paths import CONFUCIUS_DIR, PREVIEW_VIDEOS_DIR, TASKS_DIR
 from translate_srt_openrouter import parse_srt
 
 
-ROOT = Path(__file__).resolve().parent
-RUNTIME_DIR = ROOT / "confucius4_tts"
+RUNTIME_DIR = CONFUCIUS_DIR
 SOURCE_DIR = RUNTIME_DIR / "source"
 CONFIG_PATH = SOURCE_DIR / "config" / "inference_config.yaml"
 MODEL_CACHE = RUNTIME_DIR / "model-cache"
-DEFAULT_INPUT = ROOT / "low_videos" / "demucs_translated"
-DEFAULT_OUTPUT = ROOT / "low_videos" / "demucs_translated_zh"
+DEFAULT_INPUT = PREVIEW_VIDEOS_DIR / "demucs_translated"
+DEFAULT_OUTPUT = PREVIEW_VIDEOS_DIR / "demucs_translated_zh"
 DEFAULT_REFERENCE_MANIFEST = (
-    ROOT / "tasks" / "demucs-moss-retry" / "status.jsonl"
+    TASKS_DIR / "demucs-moss-retry" / "status.jsonl"
 )
-TEMP_ROOT = ROOT / "tasks" / "confucius4_tts_dub"
+TEMP_ROOT = TASKS_DIR / "confucius4_tts_dub"
 VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".webm"}
 
 

@@ -174,7 +174,7 @@ def test_chunked_asr_merges_timestamps_into_full_timeline(
     monkeypatch.setattr(
         run_subtitle,
         "_probe_media_duration",
-        lambda path: 1801,
+        lambda path: 901,
     )
 
     extracted = []
@@ -208,15 +208,15 @@ def test_chunked_asr_merges_timestamps_into_full_timeline(
     backend = ChunkBackend()
     cues, language = run_subtitle._transcribe_with_chunks(media, backend)
 
-    assert extracted == [(0, 900), (900, 900), (1800, 1)]
+    assert extracted == [(0, 450.0), (450.0, 450.0), (900.0, 1.0)]
     assert len(backend.inputs) == 3
     assert backend.releases == 3
     assert cues[0]["id"] == 1
     assert cues[0]["time"] == "00:00:01,000 --> 00:00:02,500"
     assert cues[1]["id"] == 2
-    assert cues[1]["time"] == "00:15:01,000 --> 00:15:02,500"
+    assert cues[1]["time"] == "00:07:31,000 --> 00:07:32,500"
     assert cues[2]["id"] == 3
-    assert cues[2]["time"] == "00:30:01,000 --> 00:30:02,500"
+    assert cues[2]["time"] == "00:15:01,000 --> 00:15:02,500"
     assert language == "en"
     assert not list((tmp_path / "chunks").glob("*.wav"))
 
@@ -228,7 +228,7 @@ def test_short_media_uses_single_asr_call(tmp_path, monkeypatch):
     monkeypatch.setattr(
         run_subtitle,
         "_probe_media_duration",
-        lambda path: 899,
+        lambda path: 449,
     )
 
     cues, language = run_subtitle._transcribe_with_chunks(media, backend)
@@ -238,7 +238,7 @@ def test_short_media_uses_single_asr_call(tmp_path, monkeypatch):
     assert backend.videos == [media]
 
 
-def test_cuda_oom_adaptively_splits_15_minute_chunk(
+def test_cuda_oom_adaptively_splits_7_5_minute_chunk(
     tmp_path,
     monkeypatch,
 ):
@@ -248,7 +248,7 @@ def test_cuda_oom_adaptively_splits_15_minute_chunk(
     monkeypatch.setattr(
         run_subtitle,
         "_probe_media_duration",
-        lambda path: 901,
+        lambda path: 451,
     )
     extracted = []
 
@@ -284,15 +284,15 @@ def test_cuda_oom_adaptively_splits_15_minute_chunk(
     cues, language = run_subtitle._transcribe_with_chunks(media, backend)
 
     assert extracted == [
-        (0, 900),
-        (0, 450),
-        (450, 450),
-        (900, 1),
+        (0, 450.0),
+        (0, 225.0),
+        (225.0, 225.0),
+        (450.0, 1.0),
     ]
     assert [cue["time"] for cue in cues] == [
         "00:00:00,000 --> 00:00:01,000",
+        "00:03:45,000 --> 00:03:46,000",
         "00:07:30,000 --> 00:07:31,000",
-        "00:15:00,000 --> 00:15:01,000",
     ]
     assert backend.releases == 4
     assert language == "en"

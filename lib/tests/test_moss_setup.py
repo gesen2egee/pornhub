@@ -6,7 +6,7 @@ import pytest
 from moss_setup import download_snapshot, ensure_cuda
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_ensure_cuda_rejects_missing_cuda():
@@ -53,7 +53,7 @@ def test_download_snapshot_rejects_missing_result(tmp_path):
 
 
 def test_installer_pins_cuda_wheel_and_moss_commit():
-    content = (ROOT / "install_moss.bat").read_text(encoding="utf-8")
+    content = (ROOT / "00_setup_or_update.bat").read_text(encoding="ascii")
 
     assert "https://download.pytorch.org/whl/cu128" in content
     assert "9990574e6ac62390a21bcce25a914d66ac92c25e" in content
@@ -61,5 +61,5 @@ def test_installer_pins_cuda_wheel_and_moss_commit():
     assert "pyloudnorm" in content
     assert "xmlans/asmr-enhancer" in content
     assert "where git" in content
-    assert 'py -3.12 -m venv "%ROOT%moss\\.venv"' in content
-    assert '"%PYTHON%" "%ROOT%moss_setup.py"' in content
+    assert 'py -3.12 -m venv "%MOSS_ROOT%\\.venv"' in content
+    assert '"%MOSS_PYTHON%" "%LIB%\\moss_setup.py"' in content

@@ -9,9 +9,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+from project_paths import CONFUCIUS_DIR
 
-ROOT = Path(__file__).resolve().parent
-RUNTIME_DIR = ROOT / "confucius4_tts"
+
+RUNTIME_DIR = CONFUCIUS_DIR
 SOURCE_DIR = RUNTIME_DIR / "source"
 CONFIG_PATH = SOURCE_DIR / "config" / "inference_config.yaml"
 MODEL_CACHE = RUNTIME_DIR / "model-cache"

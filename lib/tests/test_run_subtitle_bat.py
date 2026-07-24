@@ -1,8 +1,8 @@
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
-DOWNLOAD_BATCH = ROOT / "run_download.bat"
+ROOT = Path(__file__).resolve().parents[2]
+DOWNLOAD_BATCH = ROOT / "02_run_download.bat"
 
 
 def test_only_integrated_download_batch_remains():
@@ -12,11 +12,11 @@ def test_only_integrated_download_batch_remains():
 
 def test_download_batch_checks_moss_environment():
     content = DOWNLOAD_BATCH.read_text(encoding="utf-8")
-    assert 'set "MOSS_PYTHON=%ROOT%moss\\.venv\\Scripts\\python.exe"' in content
-    assert "install_moss.bat" in content
-    assert "Download and subtitle workers run in parallel" in content
+    assert 'set "MOSS_PYTHON=%ROOT%lib\\moss\\.venv\\Scripts\\python.exe"' in content
+    assert "00_setup_or_update.bat" in content
+    assert "Downloads and subtitles run in parallel" in content
     assert 'if /i "%~1"=="--check"' in content
-    assert '"%ROOT%run_download.py" %*' in content
+    assert '"%PYTHON%" "%SCRIPT%" %*' in content
     assert (
         'if /i "%~1"=="--retry-subtitles" set "NO_PAUSE=1"'
         in content

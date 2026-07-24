@@ -7,9 +7,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from project_paths import MOSS_DIR
 
-ROOT = Path(__file__).resolve().parent
-MOSS_CACHE = ROOT / "moss" / "model-cache"
+
+MOSS_CACHE = MOSS_DIR / "model-cache"
 DEFAULT_MODEL_ID = "openmoss/MOSS-Transcribe-Diarize"
 
 

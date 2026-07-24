@@ -11,6 +11,16 @@ import urllib.parse
 from datetime import datetime
 import yt_dlp
 import video_meta
+from project_paths import (
+    DOWNLOADED_DIR,
+    LIB_DIR,
+    MOSS_VENV_DIR,
+    OUTPUT_ROOT,
+    PREVIEW_VIDEOS_DIR,
+    TEMP_DIR,
+    VIDEOS_DIR,
+    ensure_output_directories,
+)
 
 MAX_VIDEO_WIDTH = 1920
 MAX_VIDEO_HEIGHT = 1080
@@ -90,11 +100,24 @@ def direct_fetch_pornhub_mp4_stream(
 from PIL import Image
 
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_MOSS_PYTHON = os.path.join(ROOT, "moss", ".venv", "Scripts", "python.exe")
+ROOT = str(LIB_DIR)
+DEFAULT_MOSS_PYTHON = str(MOSS_VENV_DIR / "Scripts" / "python.exe")
+LOW_VIDEO_DIR = str(PREVIEW_VIDEOS_DIR)
+VIDEO_DIR = str(VIDEOS_DIR)
+ARCHIVE_DIR = str(DOWNLOADED_DIR)
+WORK_TEMP_DIR = str(TEMP_DIR)
 DOWNLOAD_SOCKET_TIMEOUT = 30
 DOWNLOAD_RETRIES = 3
 FALLBACK_DOWNLOAD_TIMEOUT = 2 * 60 * 60
+
+
+def _pipeline_dir(target_dir):
+    """依正式目錄名稱建立固定的下載／字幕暫存路徑。"""
+    return os.path.join(
+        WORK_TEMP_DIR,
+        "pipeline",
+        os.path.basename(os.path.normpath(target_dir)),
+    )
 
 
 def is_http_416_error(error):
@@ -247,14 +270,13 @@ def remove_invalid_video(path, label):
 
 
 def _backup_over_1080_video(video_path):
-    """把超標原檔移到 ignored temp 備份，避免重下載前遺失。"""
+    """把超標原檔移到 output/00_temp 備份，避免重下載前遺失。"""
     relative_parent = os.path.relpath(
         os.path.dirname(os.path.abspath(video_path)),
-        ROOT,
+        str(OUTPUT_ROOT),
     )
     backup_dir = os.path.join(
-        ROOT,
-        "temp",
+        WORK_TEMP_DIR,
         "over-1080-backup",
         relative_parent,
     )
@@ -284,8 +306,8 @@ def prepare_over_1080_redownloads():
     """備份現有超標影片、還原九宮格，回傳只需重下載的九宮格。"""
     selected_grids = []
     search_dirs = [
-        os.path.join(ROOT, "videos"),
-        os.path.join(ROOT, "temp", "pipeline", "videos"),
+        VIDEO_DIR,
+        _pipeline_dir(VIDEO_DIR),
     ]
     for directory in search_dirs:
         for video_path in sorted(glob.glob(os.path.join(directory, "*.mp4"))):
@@ -301,9 +323,9 @@ def prepare_over_1080_redownloads():
             archived_grid = _archived_grid_for_video(video_path)
             local_grid = _grid_for_video_in_directory(
                 video_path,
-                os.path.join(ROOT, "videos"),
+                VIDEO_DIR,
             ) or os.path.join(
-                ROOT, "videos", os.path.basename(archived_grid)
+                VIDEO_DIR, os.path.basename(archived_grid)
             )
             source_grid = (
                 archived_grid
@@ -343,21 +365,21 @@ def prepare_over_1080_redownloads():
                 f"{backup_path}，九宮格已排入 1080P 重下載"
             )
 
-    backup_root = os.path.join(ROOT, "temp", "over-1080-backup")
+    backup_root = os.path.join(WORK_TEMP_DIR, "over-1080-backup")
     for backup_video in glob.glob(
         os.path.join(backup_root, "**", "*.mp4"),
         recursive=True,
     ):
         basename = os.path.basename(backup_video)
-        if os.path.exists(os.path.join(ROOT, "videos", basename)):
+        if os.path.exists(os.path.join(VIDEO_DIR, basename)):
             continue
         if os.path.exists(
-            os.path.join(ROOT, "temp", "pipeline", "videos", basename)
+            os.path.join(_pipeline_dir(VIDEO_DIR), basename)
         ):
             continue
         local_grid = _grid_for_video_in_directory(
             backup_video,
-            os.path.join(ROOT, "videos"),
+            VIDEO_DIR,
         )
         if (
             local_grid
@@ -378,7 +400,7 @@ class SubtitleWorker:
         python = os.getenv("MOSS_PYTHON", DEFAULT_MOSS_PYTHON)
         if not os.path.exists(python):
             raise RuntimeError(
-                f"找不到 MOSS 字幕環境：{python}。請先執行 install_moss.bat。"
+                f"找不到 MOSS 字幕環境：{python}。請先執行 00_setup_or_update.bat。"
             )
         worker_env = os.environ.copy()
         worker_env["PYTHONUTF8"] = "1"
@@ -423,7 +445,7 @@ class SubtitleWorker:
             "video": os.path.abspath(video_path),
             "final_video": os.path.abspath(final_video_path),
             "grid": os.path.abspath(grid_path),
-            "archive_dir": os.path.abspath("downloaded"),
+            "archive_dir": ARCHIVE_DIR,
             "archive_grid": (
                 not bool(is_low_quality)
                 if archive_grid is None
@@ -547,18 +569,18 @@ def needs_subtitle_retry(video_path, require_srt=None):
         parent_name = os.path.basename(
             os.path.dirname(os.path.abspath(video_path))
         ).casefold()
-        require_srt = parent_name not in {"low_videos", "low_video"}
+        require_srt = parent_name != PREVIEW_VIDEOS_DIR.name.casefold()
     return not has_completed_subtitle(video_path, require_srt=require_srt)
 
 
 def _archived_grid_for_video(video_path):
     stem = os.path.splitext(os.path.basename(video_path))[0].casefold()
-    for grid in glob.glob(os.path.join("downloaded", "*.jpg")):
+    for grid in glob.glob(os.path.join(ARCHIVE_DIR, "*.jpg")):
         grid_stem = os.path.splitext(os.path.basename(grid))[0]
         normalized = re.sub(r"^\d{4}-", "", grid_stem).casefold()
         if normalized == stem:
             return grid
-    return os.path.join("downloaded", f"{stem}.jpg")
+    return os.path.join(ARCHIVE_DIR, f"{stem}.jpg")
 
 
 def enqueue_official_subtitle_retries(
@@ -567,9 +589,7 @@ def enqueue_official_subtitle_retries(
     subtitle_worker,
 ):
     """把正式資料夾中的舊 SRT／failed 影片重新移回字幕暫存。"""
-    pipeline_dir = os.path.abspath(
-        os.path.join("temp", "pipeline", target_dir)
-    )
+    pipeline_dir = _pipeline_dir(target_dir)
     os.makedirs(pipeline_dir, exist_ok=True)
     queued = 0
     for final_video in sorted(glob.glob(os.path.join(target_dir, "*.mp4"))):
@@ -607,10 +627,8 @@ def enqueue_staged_subtitle_retries(
     is_low_quality,
     subtitle_worker,
 ):
-    """只重跑模式也接手先前留在 temp/pipeline 的影片。"""
-    pipeline_dir = os.path.abspath(
-        os.path.join("temp", "pipeline", target_dir)
-    )
+    """只重跑模式也接手先前留在 output/00_temp/pipeline 的影片。"""
+    pipeline_dir = _pipeline_dir(target_dir)
     queued = 0
     for staged_video in sorted(
         glob.glob(os.path.join(pipeline_dir, "*.mp4"))
@@ -668,7 +686,7 @@ def process_single_directory(
     subtitle_worker,
     selected_jpgs=None,
 ):
-    """處理單一目錄 (low_videos/ 或 videos/) 中 JPG 圖片內嵌 EXIF 網址的下載邏輯"""
+    """處理預覽或正式影片目錄中 JPG 內嵌 EXIF 網址的下載邏輯。"""
     # 從名字為順序開始下載 (字母/數字自然排序)
     jpg_files = (
         sorted(selected_jpgs)
@@ -696,21 +714,19 @@ def process_single_directory(
         raw_name_no_ext = os.path.splitext(image_name)[0]
         base_name_without_num = re.sub(r'^\d{4}-', '', raw_name_no_ext)
         
-        # low_videos 檔名與九宮格同名(保留數字編號)；videos 則去除前綴數字
+        # 預覽影片與九宮格同名；正式影片則移除前綴編號。
         if is_low_quality:
             video_file_basename = raw_name_no_ext + ".mp4"
         else:
             video_file_basename = base_name_without_num + ".mp4"
             
         final_video_file = os.path.join(target_dir, video_file_basename)
-        pipeline_dir_abs = os.path.abspath(
-            os.path.join("temp", "pipeline", target_dir)
-        )
+        pipeline_dir_abs = _pipeline_dir(target_dir)
         os.makedirs(pipeline_dir_abs, exist_ok=True)
         staged_video_file = os.path.join(
             pipeline_dir_abs, video_file_basename
         )
-        os.makedirs("downloaded", exist_ok=True)
+        os.makedirs(ARCHIVE_DIR, exist_ok=True)
         video_url = get_video_url_from_image(jpg_path)
         remove_invalid_video(staged_video_file, "暫存影片")
         remove_invalid_video(final_video_file, "正式影片")
@@ -770,7 +786,7 @@ def process_single_directory(
             if video_url:
                 upgrade_media_web_meta(jpg_path, final_video_file, video_url)
             shutil.move(final_video_file, staged_video_file)
-            print("   [STAGE] 舊未完成影片已移至 temp/pipeline 繼續處理")
+            print("   [STAGE] 舊未完成影片已移至 output/00_temp/pipeline 繼續處理")
             subtitle_worker.enqueue(
                 staged_video_file,
                 final_video_file,
@@ -797,7 +813,7 @@ def process_single_directory(
             if is_low_quality
             else HIGH_VIDEO_FORMAT
         )
-        temp_dir_abs = os.path.abspath("temp")
+        temp_dir_abs = WORK_TEMP_DIR
         os.makedirs(temp_dir_abs, exist_ok=True)
         temp_thumb_template = os.path.join(temp_dir_abs, f"thumb_{idx}_%(id)s.%(ext)s")
 
@@ -822,7 +838,7 @@ def process_single_directory(
         if not is_low_quality:
             ydl_opts["format_sort"] = HIGH_VIDEO_FORMAT_SORT
 
-        # videos 模式 (最高畫質) 內嵌縮圖封面
+        # 正式影片模式（最高畫質）內嵌縮圖封面。
         if not is_low_quality:
             ydl_opts['writethumbnail'] = True
             ydl_opts['postprocessors'] = [{
@@ -832,7 +848,7 @@ def process_single_directory(
         else:
             ydl_opts['writethumbnail'] = False
 
-        # low_videos 模式：超過 60 秒下載 30-60 秒，否則下載 0-30 秒
+        # 預覽影片模式：超過 60 秒下載 30–60 秒，否則下載 0–30 秒。
         if is_low_quality:
             ydl_opts['download_ranges'] = low_video_download_ranges
 
@@ -888,7 +904,7 @@ def process_single_directory(
                     prefer_lowest=is_low_quality,
                 )
             if direct_mp4:
-                print(f"   [+] 成功解析直連 MP4 串流，發起 FFmpeg 極速下載 (帶認證 Header，暫存於 temp/)...")
+                print("   [+] 成功解析直連 MP4 串流，發起 FFmpeg 極速下載（暫存於 output/00_temp）...")
                 temp_ffmpeg_file = os.path.join(temp_dir_abs, f"ffmpeg_{idx}_{video_file_basename}")
                 ff_headers = (
                     "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n"
@@ -975,16 +991,15 @@ def run_download_process(
     print(f"   Pornhub 雙畫質原影片下載器 (純 EXIF 圖片讀取版)")
     print(f"==================================================")
 
-    os.makedirs("low_videos", exist_ok=True)
-    os.makedirs("videos", exist_ok=True)
+    ensure_output_directories()
 
     over_1080_jpgs = (
         []
         if retry_subtitles
         else prepare_over_1080_redownloads()
     )
-    low_jpgs = glob.glob(os.path.join("low_videos", "*.jpg"))
-    high_jpgs = glob.glob(os.path.join("videos", "*.jpg"))
+    low_jpgs = glob.glob(os.path.join(LOW_VIDEO_DIR, "*.jpg"))
+    high_jpgs = glob.glob(os.path.join(VIDEO_DIR, "*.jpg"))
 
     if repair_over_1080 and not over_1080_jpgs:
         print("[OK] 沒有發現需要重下載的超過 1080P 影片。")
@@ -996,11 +1011,14 @@ def run_download_process(
         and not low_jpgs
         and not high_jpgs
     ):
-        print(f"[!] low_videos/ 與 videos/ 資料夾中均找不到任何被移入的九宮格 JPG 圖片！")
-        print(f"[i] 請將預覽圖片移動至 low_videos/ (最低畫質/極速) 或 videos/ (最高畫質) 後再次執行。")
+        print("[!] output/02_preview_videos 與 output/03_videos 都找不到九宮格 JPG！")
+        print("[i] 請將九宮格移入對應目錄後再次執行。")
         return 0
 
-    print(f"[+] 檢測到 low_videos/ ({len(low_jpgs)} 張圖片) | videos/ ({len(high_jpgs)} 張圖片)\n")
+    print(
+        f"[+] 檢測到 02_preview_videos ({len(low_jpgs)} 張) | "
+        f"03_videos ({len(high_jpgs)} 張)\n"
+    )
 
     download_failures = 0
     try:
@@ -1013,8 +1031,8 @@ def run_download_process(
         if retry_subtitles:
             queued = 0
             for target_dir, is_low in (
-                ("low_videos", True),
-                ("videos", False),
+                (LOW_VIDEO_DIR, True),
+                (VIDEO_DIR, False),
             ):
                 queued += enqueue_staged_subtitle_retries(
                     target_dir,
@@ -1027,33 +1045,33 @@ def run_download_process(
                     subtitle_worker,
                 )
             print(f"[*] 字幕修復模式共排入 {queued} 支影片")
-        # 【階段一】優先處理 low_videos/ 目錄 (最低畫質)
+        # 【階段一】優先處理預覽影片目錄（最低畫質）
         if not retry_subtitles and not repair_over_1080 and low_jpgs:
             print("==================================================")
-            print(" [階段 1/2] 開始處理 low_videos/ (最低解析度/動態30秒取樣)")
+            print(" [階段 1/2] 開始處理 02_preview_videos（最低解析度／動態30秒取樣）")
             print("==================================================")
             download_failures += process_single_directory(
-                "low_videos", is_low_quality=True,
+                LOW_VIDEO_DIR, is_low_quality=True,
                 subtitle_worker=subtitle_worker,
             ) or 0
 
         if not retry_subtitles and not repair_over_1080:
             enqueue_official_subtitle_retries(
-                "videos",
+                VIDEO_DIR,
                 False,
                 subtitle_worker,
             )
 
-        # 【階段二】處理完 low_videos/ 後，處理 videos/ 目錄 (最高畫質)
+        # 【階段二】處理正式影片目錄（最高畫質）
         selected_high_jpgs = (
             over_1080_jpgs if repair_over_1080 else high_jpgs
         )
         if not retry_subtitles and selected_high_jpgs:
             print("\n==================================================")
-            print(" [階段 2/2] 開始處理 videos/ (最高畫質下載)")
+            print(" [階段 2/2] 開始處理 03_videos（最高畫質下載）")
             print("==================================================")
             download_failures += process_single_directory(
-                "videos", is_low_quality=False,
+                VIDEO_DIR, is_low_quality=False,
                 subtitle_worker=subtitle_worker,
                 selected_jpgs=(
                     selected_high_jpgs
