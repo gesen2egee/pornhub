@@ -87,8 +87,15 @@ def _has_embedded_subtitle_meta(video: Path) -> bool:
 
 
 def _subtitle_complete(video: Path) -> bool:
-    """未來以影片 Meta 為主；舊同名 SRT 直接視為已完成。"""
-    return _subtitle_path(video).exists() or _has_embedded_subtitle_meta(video)
+    """只有終態影片 Meta 才算完成；舊 SRT 必須先硬編碼遷移。"""
+    meta = _read_video_meta(video)
+    status = meta.get("subtitle_status") or {}
+    if status.get("outcome") == "failed":
+        return False
+    return bool(
+        meta.get("original_srt_present")
+        and meta.get("translated_srt_present")
+    )
 
 
 def _ffmpeg_filter_value(value: str) -> str:
@@ -207,6 +214,7 @@ def process_video(
     subtitle_outcome = "translated"
     burn_srt: Path | None = None
     remove_burn_srt = False
+    metadata_written = False
     print(f"\n處理：{video.name}", flush=True)
     if (
         existing_meta.get("original_srt_present")
@@ -221,6 +229,7 @@ def process_video(
             flush=True,
         )
         translated_srt = legacy_srt.read_text(encoding="utf-8-sig")
+        original_srt = ""
         subtitle_outcome = "legacy_srt"
     else:
         if backend is None or not api_key:
@@ -277,12 +286,16 @@ def process_video(
                 ),
                 base_comment=base_comment,
             )
+            metadata_written = True
             print("  [META] 已寫入 MOSS 原文與繁中字幕", flush=True)
         except Exception as exc:
             print(f"  [!] 寫入字幕 metadata 失敗：{exc}", flush=True)
     finally:
         if remove_burn_srt and burn_srt is not None:
             burn_srt.unlink(missing_ok=True)
+    if legacy_srt.exists() and metadata_written:
+        legacy_srt.unlink()
+        print(f"  [遷移] 舊 SRT 已寫入影片 Meta 並移除：{legacy_srt}", flush=True)
     return result
 
 
@@ -329,7 +342,10 @@ def main() -> int:
         print("沒有需要處理的影片。")
         return 0
 
-    needs_asr = bool(pending)
+    needs_asr = any(
+        not _subtitle_path(video).exists()
+        for video in pending
+    )
     api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY")
     if needs_asr and not api_key:
         print("錯誤：找不到 OPENROUTER_API_KEY 環境變數。", file=sys.stderr)

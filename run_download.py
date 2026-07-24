@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import argparse
 import json
 import glob
 import shutil
@@ -128,6 +129,7 @@ class SubtitleWorker:
         final_video_path,
         grid_path,
         is_low_quality=False,
+        archive_grid=None,
     ):
         if self.closed or self.process.stdin is None:
             raise RuntimeError("字幕工作者已關閉。")
@@ -135,12 +137,29 @@ class SubtitleWorker:
             raise RuntimeError(
                 f"字幕工作者已提前結束，ExitCode={self.process.returncode}。"
             )
+        staged_srt = os.path.splitext(video_path)[0] + ".srt"
+        final_srt = os.path.splitext(final_video_path)[0] + ".srt"
+        if (
+            os.path.abspath(staged_srt) != os.path.abspath(final_srt)
+            and os.path.exists(final_srt)
+            and not os.path.exists(staged_srt)
+        ):
+            shutil.move(final_srt, staged_srt)
+            print(
+                f"   [MIGRATE] 舊 SRT 已移至字幕暫存："
+                f"{os.path.basename(staged_srt)}",
+                flush=True,
+            )
         job = {
             "video": os.path.abspath(video_path),
             "final_video": os.path.abspath(final_video_path),
             "grid": os.path.abspath(grid_path),
             "archive_dir": os.path.abspath("downloaded"),
-            "archive_grid": not bool(is_low_quality),
+            "archive_grid": (
+                not bool(is_low_quality)
+                if archive_grid is None
+                else bool(archive_grid)
+            ),
             "is_low_quality": bool(is_low_quality),
         }
         self.process.stdin.write(json.dumps(job, ensure_ascii=False) + "\n")
@@ -232,18 +251,114 @@ def get_video_url_from_image(jpg_path):
 
 
 def has_completed_subtitle(video_path):
-    """影片內已有字幕 Meta 或舊同名 SRT 時視為完整成品。"""
-    legacy_srt = os.path.splitext(video_path)[0] + ".srt"
-    if os.path.exists(legacy_srt):
-        return True
+    """只有非 failed 的雙字幕 Meta 才是完整成品。"""
     try:
         meta = video_meta.read_mp4_meta(video_path)
+        status = meta.get("subtitle_status") or {}
+        if status.get("outcome") == "failed":
+            return False
         return bool(
             meta.get("original_srt_present")
             and meta.get("translated_srt_present")
         )
     except Exception:
         return False
+
+
+def needs_subtitle_retry(video_path):
+    """舊 SRT、failed Meta 或缺少雙字幕 Meta 都需要重新處理。"""
+    if os.path.exists(os.path.splitext(video_path)[0] + ".srt"):
+        return True
+    return not has_completed_subtitle(video_path)
+
+
+def _archived_grid_for_video(video_path):
+    stem = os.path.splitext(os.path.basename(video_path))[0].casefold()
+    for grid in glob.glob(os.path.join("downloaded", "*.jpg")):
+        grid_stem = os.path.splitext(os.path.basename(grid))[0]
+        normalized = re.sub(r"^\d{4}-", "", grid_stem).casefold()
+        if normalized == stem:
+            return grid
+    return os.path.join("downloaded", f"{stem}.jpg")
+
+
+def enqueue_official_subtitle_retries(
+    target_dir,
+    is_low_quality,
+    subtitle_worker,
+):
+    """把正式資料夾中的舊 SRT／failed 影片重新移回字幕暫存。"""
+    pipeline_dir = os.path.abspath(
+        os.path.join("temp", "pipeline", target_dir)
+    )
+    os.makedirs(pipeline_dir, exist_ok=True)
+    queued = 0
+    for final_video in sorted(glob.glob(os.path.join(target_dir, "*.mp4"))):
+        if not needs_subtitle_retry(final_video):
+            continue
+        staged_video = os.path.join(
+            pipeline_dir,
+            os.path.basename(final_video),
+        )
+        if os.path.exists(staged_video):
+            print(
+                f"   [RETRY SKIP] 暫存影片已存在："
+                f"{os.path.basename(staged_video)}"
+            )
+            continue
+        shutil.move(final_video, staged_video)
+        grid = (
+            os.path.splitext(final_video)[0] + ".jpg"
+            if is_low_quality
+            else _archived_grid_for_video(final_video)
+        )
+        subtitle_worker.enqueue(
+            staged_video,
+            final_video,
+            grid,
+            is_low_quality=is_low_quality,
+            archive_grid=False,
+        )
+        queued += 1
+    return queued
+
+
+def enqueue_staged_subtitle_retries(
+    target_dir,
+    is_low_quality,
+    subtitle_worker,
+):
+    """只重跑模式也接手先前留在 temp/pipeline 的影片。"""
+    pipeline_dir = os.path.abspath(
+        os.path.join("temp", "pipeline", target_dir)
+    )
+    queued = 0
+    for staged_video in sorted(
+        glob.glob(os.path.join(pipeline_dir, "*.mp4"))
+    ):
+        final_video = os.path.abspath(
+            os.path.join(target_dir, os.path.basename(staged_video))
+        )
+        if os.path.exists(final_video):
+            print(
+                f"   [RETRY CONFLICT] 正式與暫存影片同時存在，跳過："
+                f"{os.path.basename(staged_video)}"
+            )
+            continue
+        grid = (
+            os.path.splitext(final_video)[0] + ".jpg"
+            if is_low_quality
+            else _archived_grid_for_video(final_video)
+        )
+        subtitle_worker.enqueue(
+            staged_video,
+            final_video,
+            grid,
+            is_low_quality=is_low_quality,
+            archive_grid=False,
+        )
+        queued += 1
+    return queued
 
 
 def upgrade_media_web_meta(jpg_path, mp4_path, video_url, info=None):
@@ -524,7 +639,7 @@ def process_single_directory(target_dir, is_low_quality, subtitle_worker):
 
     print(f"[*] [{target_dir}/] 處理完成: 成功下載 {success_count} 部 | 已存在/跳過 {skipped_count} 部")
 
-def run_download_process():
+def run_download_process(retry_subtitles=False):
     """主下載流程控制"""
     print(f"==================================================")
     print(f"   Pornhub 雙畫質原影片下載器 (純 EXIF 圖片讀取版)")
@@ -536,7 +651,7 @@ def run_download_process():
     low_jpgs = glob.glob(os.path.join("low_videos", "*.jpg"))
     high_jpgs = glob.glob(os.path.join("videos", "*.jpg"))
 
-    if not low_jpgs and not high_jpgs:
+    if not retry_subtitles and not low_jpgs and not high_jpgs:
         print(f"[!] low_videos/ 與 videos/ 資料夾中均找不到任何被移入的九宮格 JPG 圖片！")
         print(f"[i] 請將預覽圖片移動至 low_videos/ (最低畫質/極速) 或 videos/ (最高畫質) 後再次執行。")
         return 0
@@ -550,8 +665,25 @@ def run_download_process():
         return 2
 
     try:
+        if retry_subtitles:
+            queued = 0
+            for target_dir, is_low in (
+                ("low_videos", True),
+                ("videos", False),
+            ):
+                queued += enqueue_staged_subtitle_retries(
+                    target_dir,
+                    is_low,
+                    subtitle_worker,
+                )
+                queued += enqueue_official_subtitle_retries(
+                    target_dir,
+                    is_low,
+                    subtitle_worker,
+                )
+            print(f"[*] 字幕修復模式共排入 {queued} 支影片")
         # 【階段一】優先處理 low_videos/ 目錄 (最低畫質)
-        if low_jpgs:
+        if not retry_subtitles and low_jpgs:
             print("==================================================")
             print(" [階段 1/2] 開始處理 low_videos/ (最低解析度/動態30秒取樣)")
             print("==================================================")
@@ -560,8 +692,15 @@ def run_download_process():
                 subtitle_worker=subtitle_worker,
             )
 
+        if not retry_subtitles:
+            enqueue_official_subtitle_retries(
+                "videos",
+                False,
+                subtitle_worker,
+            )
+
         # 【階段二】處理完 low_videos/ 後，處理 videos/ 目錄 (最高畫質)
-        if high_jpgs:
+        if not retry_subtitles and high_jpgs:
             print("\n==================================================")
             print(" [階段 2/2] 開始處理 videos/ (最高畫質下載)")
             print("==================================================")
@@ -581,4 +720,13 @@ def run_download_process():
     return 0
 
 if __name__ == "__main__":
-    raise SystemExit(run_download_process())
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--retry-subtitles",
+        action="store_true",
+        help="只重跑舊 SRT、failed Meta 與未完成字幕，不下載新影片",
+    )
+    args = parser.parse_args()
+    raise SystemExit(
+        run_download_process(retry_subtitles=args.retry_subtitles)
+    )

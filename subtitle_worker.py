@@ -32,6 +32,7 @@ except Exception:
 RESULT_MARKER = "__SUBTITLE_JOB_RESULT__"
 DEFAULT_LOW_JOB_TIMEOUT = 15 * 60
 DEFAULT_JOB_TIMEOUT = 2 * 60 * 60
+DEFAULT_HIGH_MAX_TOKENS = 8192
 
 
 def _positive_timeout(name: str, default: int) -> int:
@@ -95,7 +96,7 @@ def finish_grid(
     if should_archive:
         archive_grid(grid, archive_dir)
     elif grid.exists():
-        print(f"  [保留] low video 九宮格保留原位：{grid}", flush=True)
+        print(f"  [保留] 九宮格保留原位：{grid}", flush=True)
 
 
 class SubtitleRuntime:
@@ -163,7 +164,9 @@ class SubtitleRuntime:
         if job.get("is_low_quality") and self.configured_max_tokens is None:
             os.environ["MOSS_MAX_NEW_TOKENS"] = "1024"
         elif self.configured_max_tokens is None:
-            os.environ.pop("MOSS_MAX_NEW_TOKENS", None)
+            os.environ["MOSS_MAX_NEW_TOKENS"] = str(
+                DEFAULT_HIGH_MAX_TOKENS
+            )
         else:
             os.environ["MOSS_MAX_NEW_TOKENS"] = self.configured_max_tokens
         print(f"\n[字幕管線] 接手：{video.name}", flush=True)
@@ -173,7 +176,8 @@ class SubtitleRuntime:
             finalize_video(video, final_video)
             finish_grid(grid, archive_dir, should_archive_grid)
             return
-        if not self.api_key:
+        legacy_srt = run_subtitle._subtitle_path(video)
+        if not legacy_srt.exists() and not self.api_key:
             raise RuntimeError("找不到 OPENROUTER_API_KEY 環境變數。")
 
         prepared = {}
@@ -184,9 +188,10 @@ class SubtitleRuntime:
                 print("[字幕管線] 自動判斷音訊是否需要增強", flush=True)
                 prepared = prepare_audio_media([video])
                 media = prepared.get(video)
+            backend = None if legacy_srt.exists() else self._load_backend()
             run_subtitle.process_video(
                 video,
-                self._load_backend(),
+                backend,
                 self.api_key,
                 self.model_name,
                 False,

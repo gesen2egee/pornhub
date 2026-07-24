@@ -70,11 +70,60 @@ def test_process_video_uses_selected_backend(tmp_path, monkeypatch):
     assert "base_comment" in meta_calls[0][1]
 
 
-def test_legacy_srt_is_considered_complete(tmp_path):
+def test_legacy_srt_requires_hardcode_migration(tmp_path):
     video = tmp_path / "sample.mp4"
     video.write_bytes(b"video")
     video.with_suffix(".srt").write_text("existing", encoding="utf-8")
-    assert run_subtitle._subtitle_complete(video)
+    assert not run_subtitle._subtitle_complete(video)
+
+
+def test_legacy_srt_is_hardcoded_migrated_and_removed(
+    tmp_path,
+    monkeypatch,
+):
+    video = tmp_path / "sample.mp4"
+    legacy = video.with_suffix(".srt")
+    video.write_bytes(b"video")
+    legacy.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n舊字幕\n",
+        encoding="utf-8-sig",
+    )
+    burn_calls = []
+    meta_calls = []
+    monkeypatch.setattr(run_subtitle, "_read_video_meta", lambda path: {})
+    monkeypatch.setattr(
+        run_subtitle,
+        "_burn_hard_subtitle",
+        lambda *args, **kwargs: burn_calls.append(args) or video,
+    )
+    monkeypatch.setattr(
+        run_subtitle.video_meta,
+        "merge_write_mp4_meta",
+        lambda path, **kwargs: meta_calls.append(kwargs),
+    )
+
+    run_subtitle.process_video(video, None, None, "model", False)
+
+    assert len(burn_calls) == 1
+    assert not legacy.exists()
+    assert meta_calls[0]["original_srt"] == ""
+    assert "舊字幕" in meta_calls[0]["translated_srt"]
+    assert meta_calls[0]["subtitle_status"]["outcome"] == "legacy_srt"
+
+
+def test_failed_meta_requires_retry(tmp_path, monkeypatch):
+    video = tmp_path / "sample.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(
+        run_subtitle,
+        "_read_video_meta",
+        lambda path: {
+            "subtitle_status": {"outcome": "failed"},
+            "original_srt_present": True,
+            "translated_srt_present": True,
+        },
+    )
+    assert not run_subtitle._subtitle_complete(video)
 
 
 def test_empty_embedded_subtitle_meta_is_considered_complete(tmp_path, monkeypatch):

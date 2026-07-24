@@ -147,3 +147,54 @@ def test_probe_unavailable_does_not_delete_video(tmp_path, monkeypatch):
 
     assert not run_download.remove_invalid_video(video, "測試影片")
     assert video.exists()
+
+
+def test_failed_meta_is_not_complete(monkeypatch):
+    monkeypatch.setattr(
+        run_download.video_meta,
+        "read_mp4_meta",
+        lambda path: {
+            "subtitle_status": {"outcome": "failed"},
+            "original_srt_present": True,
+            "translated_srt_present": True,
+        },
+    )
+    assert not run_download.has_completed_subtitle("sample.mp4")
+
+
+def test_official_failed_video_moves_back_to_pipeline(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "videos"
+    target.mkdir()
+    video = target / "sample.mp4"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(
+        run_download,
+        "needs_subtitle_retry",
+        lambda path: True,
+    )
+
+    class Worker:
+        calls = []
+
+        def enqueue(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    worker = Worker()
+    count = run_download.enqueue_official_subtitle_retries(
+        "videos",
+        False,
+        worker,
+    )
+
+    staged = tmp_path / "temp" / "pipeline" / "videos" / "sample.mp4"
+    assert count == 1
+    assert staged.exists()
+    assert not video.exists()
+    args, kwargs = worker.calls[0]
+    assert Path(args[0]).resolve() == staged
+    assert Path(args[1]).resolve() == video
+    assert kwargs["archive_grid"] is False

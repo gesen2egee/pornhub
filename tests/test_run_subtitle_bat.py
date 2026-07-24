@@ -16,6 +16,11 @@ def test_download_batch_checks_moss_environment():
     assert "install_moss.bat" in content
     assert "Download and subtitle workers run in parallel" in content
     assert 'if /i "%~1"=="--check"' in content
+    assert '"%ROOT%run_download.py" %*' in content
+    assert (
+        'if /i "%~1"=="--retry-subtitles" set "NO_PAUSE=1"'
+        in content
+    )
 
 
 def test_download_batch_is_ascii_crlf_for_windows_cmd():

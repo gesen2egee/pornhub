@@ -219,6 +219,36 @@ def test_low_job_has_shorter_bounded_timeout(monkeypatch):
     assert subtitle_worker.subtitle_job_timeout({"is_low_quality": False}) == 34
 
 
+def test_high_video_defaults_to_8192_tokens(tmp_path, monkeypatch):
+    video = tmp_path / "sample.mp4"
+    final_video = tmp_path / "videos" / "sample.mp4"
+    grid = tmp_path / "sample.jpg"
+    video.write_bytes(b"video")
+    grid.write_bytes(b"grid")
+    monkeypatch.delenv("MOSS_MAX_NEW_TOKENS", raising=False)
+    monkeypatch.setattr(
+        subtitle_worker.run_subtitle,
+        "_subtitle_complete",
+        lambda path: True,
+    )
+    runtime = make_runtime()
+    runtime.configured_max_tokens = None
+
+    runtime.process({
+        "video": str(video),
+        "final_video": str(final_video),
+        "grid": str(grid),
+        "archive_dir": str(tmp_path / "downloaded"),
+        "archive_grid": False,
+        "is_low_quality": False,
+    })
+
+    assert (
+        subtitle_worker.os.environ["MOSS_MAX_NEW_TOKENS"]
+        == str(subtitle_worker.DEFAULT_HIGH_MAX_TOKENS)
+    )
+
+
 def test_invalid_timeout_uses_default(monkeypatch):
     monkeypatch.setenv("SUBTITLE_LOW_JOB_TIMEOUT_SECONDS", "invalid")
     assert (
