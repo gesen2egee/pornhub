@@ -1,7 +1,7 @@
 # Design: 多站成人資源支援（registry + 薄適配）
 
 **日期：** 2026-07-24  
-**狀態：** Draft for review  
+**狀態：** Ready for user review  
 **範圍：** 站點 registry、列表／分頁／搜尋、預覽與 META、low 影片下載 smoke；社群 plugin 研究後精簡內建。
 
 ---
@@ -97,6 +97,12 @@ class SiteAdapter:
     def extract_list_urls(self, page_url: str) -> list[str]: ...
     def ydl_opts(self, purpose: str) -> dict: ...
     # purpose: "list" | "info" | "download_low" | "download_full"
+
+    # 可選 hooks（預設 NotImplemented / 回傳 None → 走通用路徑）
+    def extract_info(self, video_url: str, purpose: str) -> dict | None: ...
+    def resolve_stream(self, video_url: str, prefer_lowest: bool) -> dict | None:
+        # 可回傳 {"url": stream_or_m3u8, "http_headers": {...}, "info": partial_info}
+        ...
 ```
 
 **預設行為（base）：**
@@ -104,7 +110,18 @@ class SiteAdapter:
 - `build_page_url`：query `page=`
 - `extract_list_urls`：先站點 HTML 規則（若覆寫），否則 `yt-dlp extract_flat`
 - `ydl_opts`：`{}`（沿用全域設定）
+- `extract_info` / `resolve_stream`：回傳 `None`（不攔截）
 - 關鍵字非 URL：用 **default adapter = Eporner** 的 `search_url`
+
+**單片 info／下載呼叫順序（固定）：**
+
+1. 若 adapter 實作 `extract_info` 且回傳 dict → 用於 META／時長／標題（可與下載分開）。  
+2. 下載：若 adapter 實作 `resolve_stream` 且回傳可下載 `url` → 以該串流 + headers 交給既有 ffmpeg／yt-dlp URL 下載路徑（含 low 區間）。  
+3. 否則：`yt-dlp` + `adapter.ydl_opts(purpose)`（**Tier 1 主路徑**；Tier 3 優先靠 headers／referer／format 讓 yt-dlp 過）。  
+4. 僅 Pornhub：既有 HTML MP4 fallback。  
+5. 仍失敗 → 該片失敗；smoke 則 **skip** 並寫 status（不擴成每站完整下載器）。
+
+**Tier 3 內建邊界：** 研究 plugin 後，優先把「能讓 yt-dlp 成功的 opts + 列表 HTML」內建；僅當 yt-dlp 仍無法解析時，才在該 adapter 實作 `resolve_stream`／`extract_info`（m3u8 + Referer 等），**禁止** runtime import research 目錄。
 
 **解析優先序：**
 
@@ -132,11 +149,11 @@ class SiteAdapter:
 
 | 站 | 研究來源（clone 至 tasks） | 內建方向 |
 |----|---------------------------|----------|
-| **MissAV** | `yt-dlp-plugin-yellow`（或同等 yellow 系） | 影片頁 m3u8／API 模式精簡進 adapter + ydl_opts（headers/referer） |
+| **MissAV** | `yt-dlp-plugin-yellow`（或同等 yellow 系） | 優先 ydl_opts（headers/referer）；不足再 `resolve_stream`（m3u8） |
 | **Jable.tv** | 同上 | 同上 |
-| **91porn** | 同上 | 可選 cookies 路徑 env；無 cookies 時 smoke 可 skip |
-| **hanime.tv** | `hanime-plugin` 或同等 | 必要 API／token 流程精簡內建 |
-| **HentaiHaven / hstream.moe** | 若與 hanime 同源邏輯 | 可共用 base；否則本輪可 skip 並記錄 |
+| **91porn** | 同上 | cookies：`SITE_91PORN_COOKIES`；未設定 smoke skip（`needs_cookies`） |
+| **hanime.tv** | `hanime-plugin` 或同等 | 優先 opts；不足再 extract_info／resolve_stream |
+| **HentaiHaven / hstream.moe** | 若與 hanime 同源邏輯 | optional；同源則共用 base，否則 skip 並記錄 |
 
 **研究流程（實作前）：**
 
@@ -163,9 +180,9 @@ class SiteAdapter:
 ### run_download
 
 - 自 JPG 讀 URL 後 `get_adapter_for_url`。  
-- yt-dlp 呼叫合併 `ydl_opts("download_low"|"download_full")`。  
+- 下載依 §3 **呼叫順序**：`resolve_stream` → yt-dlp+`ydl_opts` → 僅 Pornhub HTML fallback。  
 - `is_pornhub_url` + `direct_fetch_pornhub_mp4_stream` 保留，不泛化到他站。  
-- META 升級：`upgrade_media_web_meta` 同樣帶 adapter opts 做 extract_info。
+- META 升級：優先 adapter `extract_info`；否則 `YoutubeDL` + `ydl_opts("info")` 再 `build_web_meta`。
 
 ### video_meta
 
