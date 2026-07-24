@@ -10,6 +10,7 @@
 00_setup_or_update.bat  建立／更新完整執行環境
 01_run_capture.bat      產生九宮格預覽圖
 02_run_download.bat     下載影片並同步處理字幕
+03_open_muse.bat        開啟 Muse 圖形介面
 .gitignore
 README.md
 requirements.txt
@@ -62,9 +63,27 @@ BAT 使用 ASCII 指令內容、CRLF 換行及 `chcp 65001`，可避免繁中 Wi
 00_setup_or_update.bat --check
 01_run_capture.bat --check
 02_run_download.bat --check
+03_open_muse.bat --check
 ```
 
 ## 使用流程
+
+### 圖形介面（推薦）
+
+完成第一次安裝後，雙擊：
+
+```bat
+03_open_muse.bat
+```
+
+Muse 會在瀏覽器開啟 `http://127.0.0.1:8765/`，所有操作與偏好都只保留在本機。介面把完整流程整理成四步：
+
+1. **探索：** 同時選擇多個網站，以關鍵字或網址搜尋。
+2. **預覽：** 把候選內容移到獨立分頁比較，依片長、來源與狀態篩選排序。
+3. **佇列：** 決定建立 30 秒預覽或完整影片，接上既有下載與字幕管線。
+4. **收藏：** 播放本機影片、顯示同名繁中軟字幕，並記住續播進度。
+
+右上角可切換日／夜間與繁中／英文。縮圖模糊、隱私畫面（快捷鍵 `P`）和播放進度都只存在目前電腦。關閉 `03_open_muse.bat` 的命令視窗即可停止本機介面。
 
 ### 1. 產生九宮格
 

@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="zh-Hant" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Muse — 私人影片研究台</title>
+  <meta name="description" content="多網站搜尋、預覽、下載與字幕整合介面">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要內容</a>
+
+  <div class="privacy-screen" id="privacyScreen" hidden>
+    <div class="privacy-mark">M</div>
+    <p data-i18n="privacyTitle">畫面已暫時隱藏</p>
+    <button class="button button-primary" data-action="privacy-off" data-i18n="resume">繼續使用</button>
+    <span data-i18n="privacyHint">按 P 或 Esc 返回</span>
+  </div>
+
+  <header class="topbar">
+    <a class="brand" href="#" aria-label="Muse 首頁">
+      <span class="brand-mark">M</span>
+      <span class="brand-copy">
+        <strong>Muse</strong>
+        <small data-i18n="brandTagline">私人影片研究台</small>
+      </span>
+    </a>
+    <div class="header-status" aria-live="polite">
+      <span class="status-dot"></span>
+      <span data-i18n="localOnly">僅在本機運作</span>
+    </div>
+    <div class="header-actions">
+      <button class="icon-button" data-action="toggle-blur" title="切換縮圖模糊" aria-label="切換縮圖模糊">
+        <span class="icon-glyph">◉</span>
+      </button>
+      <button class="segmented-button" data-action="locale" aria-label="切換語言">
+        <span class="locale-zh active">中</span><span class="locale-en">EN</span>
+      </button>
+      <button class="icon-button" data-action="theme" title="切換日夜模式" aria-label="切換日夜模式">
+        <span class="theme-icon">☾</span>
+      </button>
+      <button class="avatar-button" data-action="settings" aria-label="開啟設定">設定</button>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow" data-i18n="heroEyebrow">DISCOVER · REVIEW · KEEP</p>
+        <h1 data-i18n="heroTitle">從靈感到收藏，<br><em>只要四步。</em></h1>
+        <p data-i18n="heroDescription">一次搜尋多個來源，在工作分頁裡比較預覽，再把真正想看的內容送進下載與字幕流程。</p>
+      </div>
+
+      <div class="search-console">
+        <div class="search-row">
+          <span class="search-symbol" aria-hidden="true">⌕</span>
+          <input id="searchInput" type="search" autocomplete="off" data-i18n-placeholder="searchPlaceholder" placeholder="輸入關鍵字、貼上影片或列表網址">
+          <button class="button button-primary search-button" data-action="search">
+            <span data-i18n="search">搜尋</span>
+            <kbd>↵</kbd>
+          </button>
+        </div>
+        <div class="search-options">
+          <button class="site-picker-trigger" data-action="site-picker" aria-expanded="false">
+            <span class="stacked-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+            <span id="siteSummary" data-i18n="siteSummary">6 個推薦來源</span>
+            <span>⌄</span>
+          </button>
+          <div class="site-picker" id="sitePicker" hidden>
+            <div class="picker-head">
+              <strong data-i18n="chooseSources">選擇搜尋來源</strong>
+              <button class="text-button" data-action="recommended-sites" data-i18n="recommended">只選推薦</button>
+            </div>
+            <div id="siteOptions" class="site-options"></div>
+          </div>
+          <span class="option-divider"></span>
+          <label class="compact-field">
+            <span data-i18n="pages">頁數</span>
+            <select id="pageCount">
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+            </select>
+          </label>
+          <span class="option-hint" data-i18n="searchHint">來源越多，搜尋時間越長</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="workflow" aria-label="工作流程">
+      <button class="workflow-step active" data-view="discover">
+        <span class="step-number">01</span>
+        <span><strong data-i18n="stepDiscover">探索</strong><small data-i18n="stepDiscoverNote">跨站搜尋</small></span>
+      </button>
+      <span class="flow-line"></span>
+      <button class="workflow-step" data-view="preview">
+        <span class="step-number">02</span>
+        <span><strong data-i18n="stepPreview">預覽</strong><small data-i18n="stepPreviewNote">比較篩選</small></span>
+        <span class="count-badge" id="previewCount">0</span>
+      </button>
+      <span class="flow-line"></span>
+      <button class="workflow-step" data-view="queue">
+        <span class="step-number">03</span>
+        <span><strong data-i18n="stepQueue">佇列</strong><small data-i18n="stepQueueNote">確認品質</small></span>
+        <span class="count-badge" id="queueCount">0</span>
+      </button>
+      <span class="flow-line"></span>
+      <button class="workflow-step" data-view="library">
+        <span class="step-number">04</span>
+        <span><strong data-i18n="stepLibrary">收藏</strong><small data-i18n="stepLibraryNote">播放字幕</small></span>
+      </button>
+    </section>
+
+    <section class="workspace">
+      <div class="workspace-head">
+        <div class="workspace-title">
+          <div class="view-tabs" role="tablist">
+            <button class="view-tab active" data-view="discover" role="tab" aria-selected="true" data-i18n="allResults">全部結果</button>
+            <button class="view-tab" data-view="preview" role="tab" aria-selected="false">
+              <span data-i18n="previewTabs">預覽分頁</span>
+              <span class="tab-count" id="previewTabCount">0</span>
+            </button>
+            <button class="view-tab" data-view="queue" role="tab" aria-selected="false">
+              <span data-i18n="downloadQueue">下載佇列</span>
+              <span class="tab-count" id="queueTabCount">0</span>
+            </button>
+            <button class="view-tab" data-view="library" role="tab" aria-selected="false" data-i18n="myLibrary">我的收藏</button>
+          </div>
+          <p id="resultSummary" aria-live="polite" data-i18n="emptySummary">準備好後，從上方開始搜尋</p>
+        </div>
+        <div class="workspace-tools">
+          <div class="density-control" role="group" aria-label="顯示密度">
+            <button class="active" data-density="comfortable" aria-label="舒適卡片">▦</button>
+            <button data-density="compact" aria-label="緊密卡片">▤</button>
+          </div>
+          <label class="sort-control">
+            <span data-i18n="sort">排序</span>
+            <select id="sortSelect">
+              <option value="relevance" data-i18n="sortRelevance">最相關</option>
+              <option value="newest" data-i18n="sortNewest">最新</option>
+              <option value="views" data-i18n="sortViews">最多觀看</option>
+              <option value="durationAsc" data-i18n="sortShortest">最短</option>
+              <option value="durationDesc" data-i18n="sortLongest">最長</option>
+              <option value="title" data-i18n="sortTitle">標題</option>
+            </select>
+          </label>
+          <button class="button button-secondary" data-action="filters" aria-expanded="false">
+            <span class="filter-symbol">≡</span>
+            <span data-i18n="filters">篩選</span>
+            <span class="filter-count" id="filterCount" hidden>0</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="active-filter-row" id="activeFilters" hidden></div>
+      <aside class="filter-panel" id="filterPanel" hidden>
+        <div class="filter-group filter-search-group">
+          <strong data-i18n="filterKeyword">結果內關鍵字</strong>
+          <input id="withinQuery" class="filter-input" type="search" data-i18n-placeholder="filterKeywordPlaceholder" placeholder="標題、標籤或作者">
+        </div>
+        <div class="filter-group">
+          <strong data-i18n="source">來源</strong>
+          <select id="sourceFilter" class="filter-input">
+            <option value="all" data-i18n="allSources">全部來源</option>
+          </select>
+        </div>
+        <div class="filter-group">
+          <strong data-i18n="duration">片長</strong>
+          <div class="chip-row" id="durationChips">
+            <button class="filter-chip active" data-duration="all" data-i18n="any">不限</button>
+            <button class="filter-chip" data-duration="short">&lt; 10m</button>
+            <button class="filter-chip" data-duration="medium">10–30m</button>
+            <button class="filter-chip" data-duration="long">30m+</button>
+          </div>
+        </div>
+        <div class="filter-group">
+          <strong data-i18n="availability">狀態</strong>
+          <label class="check-row"><input id="subtitleOnly" type="checkbox"><span data-i18n="hasSubtitle">已有軟字幕</span></label>
+          <label class="check-row"><input id="hideUnknown" type="checkbox"><span data-i18n="hideUnknown">隱藏未知片長</span></label>
+        </div>
+        <button class="text-button danger" data-action="clear-filters" data-i18n="clearFilters">清除全部篩選</button>
+      </aside>
+
+      <div class="bulk-bar" id="bulkBar" hidden>
+        <span><strong id="selectedCount">0</strong> <span data-i18n="selected">個已選</span></span>
+        <button class="text-button" data-action="clear-selection" data-i18n="clearSelection">取消選取</button>
+        <span class="bulk-spacer"></span>
+        <button class="button button-secondary" data-action="move-preview" data-i18n="addPreview">加入預覽</button>
+        <button class="button button-primary" data-action="move-queue" data-i18n="addQueue">加入佇列</button>
+      </div>
+
+      <div id="contentArea">
+        <div class="empty-state" id="emptyState">
+          <div class="empty-visual">
+            <span></span><span></span><span></span>
+            <i>⌕</i>
+          </div>
+          <h2 data-i18n="emptyTitle">你的研究桌面已準備好</h2>
+          <p data-i18n="emptyDescription">輸入關鍵字並選擇來源；結果會留在本機，不會建立雲端帳號或同步紀錄。</p>
+          <div class="quick-searches">
+            <span data-i18n="trySearch">試試：</span>
+            <button data-query="asmr">ASMR</button>
+            <button data-query="story">Story</button>
+            <button data-query="massage">Massage</button>
+          </div>
+        </div>
+        <div class="loading-state" id="loadingState" hidden>
+          <div class="loading-orbit"><span></span></div>
+          <h2 data-i18n="searching">正在搜尋多個來源</h2>
+          <p id="loadingMessage" data-i18n="searchingNote">先回來的結果會優先整理，請稍候。</p>
+          <div class="skeleton-grid">
+            <i></i><i></i><i></i><i></i>
+          </div>
+        </div>
+        <div class="media-grid" id="mediaGrid" hidden></div>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+
+  <dialog class="player-dialog" id="playerDialog">
+    <div class="dialog-head">
+      <div>
+        <span class="source-pill" id="playerSource">LOCAL</span>
+        <h2 id="playerTitle">Preview</h2>
+      </div>
+      <button class="icon-button" data-action="close-player" aria-label="關閉播放器">×</button>
+    </div>
+    <div class="player-stage">
+      <video id="videoPlayer" controls playsinline preload="metadata">
+        <track id="subtitleTrack" kind="subtitles" srclang="zh-Hant" label="繁體中文">
+      </video>
+      <div class="player-fallback" id="playerFallback" hidden>
+        <span>↗</span>
+        <p data-i18n="remotePlaybackNote">此來源無法直接在瀏覽器播放，可開啟原始頁面或先加入動態預覽。</p>
+        <a class="button button-primary" id="sourceLink" target="_blank" rel="noreferrer" data-i18n="openSource">開啟來源</a>
+      </div>
+    </div>
+    <div class="dialog-actions">
+      <span id="subtitleStatus" class="subtitle-status"></span>
+      <span class="dialog-spacer"></span>
+      <button class="button button-secondary" data-action="dialog-preview" data-i18n="movePreview">移到預覽分頁</button>
+      <button class="button button-primary" data-action="dialog-queue" data-i18n="addQueue">加入佇列</button>
+    </div>
+  </dialog>
+
+  <dialog class="settings-dialog" id="settingsDialog">
+    <div class="dialog-head">
+      <div>
+        <p class="eyebrow" data-i18n="preferences">PREFERENCES</p>
+        <h2 data-i18n="settings">介面設定</h2>
+      </div>
+      <button class="icon-button" data-action="close-settings" aria-label="關閉設定">×</button>
+    </div>
+    <div class="settings-list">
+      <label>
+        <span><strong data-i18n="defaultBlur">預設模糊縮圖</strong><small data-i18n="defaultBlurNote">離開座位時更安心</small></span>
+        <input id="blurSetting" class="switch" type="checkbox">
+      </label>
+      <label>
+        <span><strong data-i18n="rememberProgress">記住播放進度</strong><small data-i18n="rememberProgressNote">只保存在這台裝置</small></span>
+        <input id="progressSetting" class="switch" type="checkbox" checked>
+      </label>
+      <label>
+        <span><strong data-i18n="autoSubtitle">自動開啟繁中字幕</strong><small data-i18n="autoSubtitleNote">有字幕時自動顯示</small></span>
+        <input id="subtitleSetting" class="switch" type="checkbox" checked>
+      </label>
+    </div>
+    <div class="shortcut-card">
+      <strong data-i18n="shortcuts">快捷鍵</strong>
+      <span><kbd>/</kbd><span data-i18n="focusSearch">搜尋</span></span>
+      <span><kbd>P</kbd><span data-i18n="privacyMode">隱私畫面</span></span>
+      <span><kbd>Esc</kbd><span data-i18n="close">關閉</span></span>
+    </div>
+  </dialog>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

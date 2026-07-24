@@ -106,5 +106,7 @@ if not exist "%MOSS_PYTHON%" (
 if errorlevel 1 exit /b %ERRORLEVEL%
 "%MOSS_PYTHON%" -c "import mutagen, PIL, requests"
 if errorlevel 1 exit /b %ERRORLEVEL%
+"%PYTHON%" "%LIB%\web_app\server.py" --check
+if errorlevel 1 exit /b %ERRORLEVEL%
 echo [OK] Application and MOSS environments are ready.
 exit /b 0
