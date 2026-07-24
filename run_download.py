@@ -97,6 +97,62 @@ DOWNLOAD_RETRIES = 3
 FALLBACK_DOWNLOAD_TIMEOUT = 2 * 60 * 60
 
 
+def is_http_416_error(error):
+    """辨識遠端拒絕既有續傳範圍的錯誤。"""
+    message = str(error).casefold()
+    return (
+        "http error 416" in message
+        or "requested range not satisfiable" in message
+    )
+
+
+def clear_yt_dlp_resume_files(temp_dir, output_basename):
+    """只移除指定輸出檔所屬的 yt-dlp 續傳狀態。"""
+    output_stem = os.path.splitext(output_basename)[0]
+    removed = []
+    try:
+        entries = os.scandir(temp_dir)
+    except FileNotFoundError:
+        return removed
+
+    with entries:
+        for entry in entries:
+            name = entry.name
+            if not entry.is_file() or not name.startswith(f"{output_stem}."):
+                continue
+            if ".part" not in name and not name.endswith(".ytdl"):
+                continue
+            os.remove(entry.path)
+            removed.append(entry.path)
+    return removed
+
+
+def download_with_416_recovery(
+    video_url,
+    ydl_opts,
+    temp_dir,
+    output_basename,
+):
+    """遇到失效續傳範圍時，清除該影片狀態並僅從零重試一次。"""
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([video_url])
+        return
+    except Exception as error:
+        if not is_http_416_error(error):
+            raise
+
+    removed = clear_yt_dlp_resume_files(temp_dir, output_basename)
+    print(
+        "   [416 RECOVERY] 遠端影片已變更，已清除 "
+        f"{len(removed)} 個舊續傳檔並從零重試一次。"
+    )
+    retry_opts = dict(ydl_opts)
+    retry_opts["continuedl"] = False
+    with yt_dlp.YoutubeDL(retry_opts) as ydl:
+        ydl.download([video_url])
+
+
 def positive_env_seconds(name, default):
     """讀取正整數秒數；設定錯誤時安全退回預設值。"""
     try:
@@ -772,8 +828,12 @@ def process_single_directory(
 
         download_success = False
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([video_url])
+            download_with_416_recovery(
+                video_url,
+                ydl_opts,
+                temp_dir_abs,
+                video_file_basename,
+            )
             download_success = (
                 os.path.exists(staged_video_file)
                 and has_video_stream(staged_video_file) is True
