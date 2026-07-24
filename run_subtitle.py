@@ -366,9 +366,11 @@ def process_video(
     remove_burn_srt = False
     metadata_written = False
     print(f"\n處理：{video.name}", flush=True)
+    existing_status = existing_meta.get("subtitle_status") or {}
     if (
         existing_meta.get("original_srt_present")
         and existing_meta.get("translated_srt_present")
+        and existing_status.get("outcome") != "failed"
         and not force
     ):
         print("  影片內已有字幕 Meta，直接略過", flush=True)

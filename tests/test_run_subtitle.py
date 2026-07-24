@@ -126,6 +126,44 @@ def test_failed_meta_requires_retry(tmp_path, monkeypatch):
     assert not run_subtitle._subtitle_complete(video)
 
 
+def test_process_video_does_not_skip_failed_meta(tmp_path, monkeypatch):
+    video = tmp_path / "failed.mp4"
+    video.write_bytes(b"video")
+    backend = FakeBackend()
+    monkeypatch.setattr(
+        run_subtitle,
+        "_read_video_meta",
+        lambda path: {
+            "subtitle_status": {"outcome": "failed"},
+            "original_srt": "",
+            "translated_srt": "",
+            "original_srt_present": True,
+            "translated_srt_present": True,
+        },
+    )
+    monkeypatch.setattr(
+        run_subtitle,
+        "_transcribe_with_chunks",
+        lambda media, selected_backend: ([], "en"),
+    )
+    meta_calls = []
+    monkeypatch.setattr(
+        run_subtitle.video_meta,
+        "merge_write_mp4_meta",
+        lambda path, **kwargs: meta_calls.append(kwargs),
+    )
+
+    run_subtitle.process_video(
+        video,
+        backend,
+        "key",
+        "model",
+        False,
+    )
+
+    assert meta_calls[0]["subtitle_status"]["outcome"] == "empty"
+
+
 def test_chunked_asr_merges_timestamps_into_full_timeline(
     tmp_path,
     monkeypatch,
