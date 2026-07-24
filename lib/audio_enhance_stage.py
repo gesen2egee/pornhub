@@ -91,6 +91,7 @@ def decode_audio(video: Path, sample_rate: int = 16_000) -> np.ndarray:
         ],
         check=False,
         capture_output=True,
+        timeout=300,
     )
     if result.returncode != 0:
         details = result.stderr.decode("utf-8", errors="replace").strip()
@@ -99,6 +100,91 @@ def decode_audio(video: Path, sample_rate: int = 16_000) -> np.ndarray:
     if not audio.size:
         raise RuntimeError("影片沒有可分析的音訊。")
     return audio
+
+
+def probe_duration(video: Path) -> float:
+    ffprobe = os.getenv("FFPROBE_EXE", "ffprobe")
+    result = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+            str(video),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    try:
+        duration = float(result.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError("無法取得影片長度，不能快速抽樣音訊。") from exc
+    if result.returncode != 0 or duration <= 0:
+        raise RuntimeError("無法取得影片長度，不能快速抽樣音訊。")
+    return duration
+
+
+def decode_audio_range(
+    video: Path,
+    start: float,
+    duration: float = 4.0,
+    sample_rate: int = 16_000,
+) -> np.ndarray:
+    """直接 Seek 解碼短音訊，不讀取整支影片。"""
+    ffmpeg = os.getenv("FFMPEG_EXE", "ffmpeg")
+    result = subprocess.run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-ss",
+            str(max(0.0, start)),
+            "-i",
+            str(video),
+            "-t",
+            str(duration),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            str(sample_rate),
+            "-f",
+            "f32le",
+            "-",
+        ],
+        check=False,
+        capture_output=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        details = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg 音訊抽樣失敗：{details[-1000:]}")
+    audio = np.frombuffer(result.stdout, dtype="<f4").copy()
+    clip_size = round(duration * sample_rate)
+    if not audio.size:
+        raise RuntimeError("影片抽樣區間沒有音訊。")
+    return np.pad(audio[:clip_size], (0, max(0, clip_size - audio.size)))
+
+
+def sample_middle_clips(
+    video: Path,
+    clip_seconds: float = 4.0,
+) -> list[np.ndarray]:
+    """只解碼 25%、50%、75% 三段，避免為分析讀完整音軌。"""
+    duration = probe_duration(video)
+    starts = [
+        max(0.0, min(duration - clip_seconds, duration * ratio - clip_seconds / 2))
+        for ratio in (0.25, 0.50, 0.75)
+    ]
+    return [
+        decode_audio_range(video, start, clip_seconds)
+        for start in starts
+    ]
 
 
 def has_enhance_marker(video: Path) -> bool:
@@ -353,7 +439,7 @@ def _prepare_audio_media_local(videos: list[Path]) -> dict[Path, PreparedMedia]:
             prepared[video] = PreparedMedia(video, video, False, analysis)
             continue
         try:
-            clips = middle_clips(decode_audio(video))
+            clips = sample_middle_clips(video)
             raw.append((video, clips, calculate_metrics(clips)))
         except Exception as exc:
             analysis = AudioAnalysis(

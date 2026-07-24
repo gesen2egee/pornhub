@@ -85,7 +85,9 @@ output/01_preview_images/
 
 雙擊 `02_run_download.bat`。
 
-影片會先進入 `output/00_temp/pipeline/`。每支下載完成後立即交給背景字幕 worker；字幕完成才移入正式目錄。正式影片完成後，九宮格移到 `output/04_downloaded/`；預覽影片的九宮格則保留在 `output/02_preview_videos/`。
+影片下載時會先進入 `output/00_temp/pipeline/`。`output/03_videos/` 的影片通過 video stream 與 1080P 驗證後會立刻移入正式目錄，再由背景 worker 直接補上音訊增強、Meta 與外掛 SRT，不需要等待字幕完成才看到影片。`output/02_preview_videos/` 因為需要燒錄硬字幕，仍會在完整處理後才移入正式位置。
+
+正式影片字幕完成後，九宮格移到 `output/04_downloaded/`；預覽影片的九宮格則保留在 `output/02_preview_videos/`。若程式中斷，下一次執行會先把舊 `pipeline/03_videos` 影片發布到正式目錄，再接續字幕。
 
 維護模式：
 
@@ -121,7 +123,7 @@ OPENROUTER_API_KEY
 
 ## 音訊自動增強
 
-字幕前會分析影片 25%、50%、75% 三個位置。`pass` 保留原音；`enhance` 與 `uncertain` 會使用 ASMR Enhancer。分類器釋放 GPU 後才載入 MOSS，避免兩個模型同時占用 VRAM。
+字幕前會直接 Seek 並解碼影片 25%、50%、75% 三個位置，各取 4 秒，分析階段不再解碼整支音軌。`pass` 保留原音；`enhance` 與 `uncertain` 才會使用 ASMR Enhancer 處理完整影片。真正的完整增強仍可能依片長與 GPU 花費數分鐘，但不會阻止已下載的正式影片出現在 `output/03_videos/`。分類器釋放 GPU 後才載入 MOSS，避免兩個模型同時占用 VRAM。
 
 常用選項：
 

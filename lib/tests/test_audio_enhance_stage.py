@@ -13,6 +13,7 @@ from audio_enhance_stage import (
     decide_audio,
     middle_clips,
     prepare_audio_media,
+    sample_middle_clips,
 )
 
 
@@ -26,6 +27,26 @@ def test_middle_clips_uses_quarter_middle_and_three_quarters():
         np.arange(70, 90, dtype=np.float32).tolist(),
         np.arange(110, 130, dtype=np.float32).tolist(),
     ]
+
+
+def test_sample_middle_clips_seeks_only_three_short_ranges(
+    tmp_path,
+    monkeypatch,
+):
+    video = tmp_path / "sample.mp4"
+    calls = []
+    monkeypatch.setattr(audio_enhance_stage, "probe_duration", lambda path: 100)
+    monkeypatch.setattr(
+        audio_enhance_stage,
+        "decode_audio_range",
+        lambda path, start, duration: calls.append((start, duration))
+        or np.zeros(4, dtype=np.float32),
+    )
+
+    clips = sample_middle_clips(video)
+
+    assert len(clips) == 3
+    assert calls == [(23.0, 4.0), (48.0, 4.0), (73.0, 4.0)]
 
 
 def test_calculate_metrics_reports_quiet_high_crest_audio():

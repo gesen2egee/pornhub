@@ -120,6 +120,27 @@ def _pipeline_dir(target_dir):
     )
 
 
+def publish_official_video(video_path, final_video_path):
+    """正式影片下載驗證完成便發布，不等待字幕或音訊增強。"""
+    source = os.path.abspath(video_path)
+    destination = os.path.abspath(final_video_path)
+    if source == destination:
+        return destination
+    if os.path.exists(destination):
+        raise RuntimeError(f"正式影片已存在，拒絕覆寫：{destination}")
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    shutil.move(source, destination)
+    staged_srt = os.path.splitext(source)[0] + ".srt"
+    final_srt = os.path.splitext(destination)[0] + ".srt"
+    if os.path.exists(staged_srt):
+        os.replace(staged_srt, final_srt)
+    print(
+        f"   [PUBLISH] 下載完成，正式影片已立即發布："
+        f"{os.path.basename(destination)}"
+    )
+    return destination
+
+
 def is_http_416_error(error):
     """辨識遠端拒絕既有續傳範圍的錯誤。"""
     message = str(error).casefold()
@@ -413,6 +434,7 @@ class SubtitleWorker:
             env=worker_env,
         )
         self.closed = False
+        self.queued = set()
 
     def enqueue(
         self,
@@ -428,6 +450,14 @@ class SubtitleWorker:
             raise RuntimeError(
                 f"字幕工作者已提前結束，ExitCode={self.process.returncode}。"
             )
+        queue_key = os.path.normcase(os.path.abspath(final_video_path))
+        if queue_key in self.queued:
+            print(
+                f"   [QUEUE SKIP] 已在字幕佇列："
+                f"{os.path.basename(final_video_path)}",
+                flush=True,
+            )
+            return
         staged_srt = os.path.splitext(video_path)[0] + ".srt"
         final_srt = os.path.splitext(final_video_path)[0] + ".srt"
         if (
@@ -455,6 +485,7 @@ class SubtitleWorker:
         }
         self.process.stdin.write(json.dumps(job, ensure_ascii=False) + "\n")
         self.process.stdin.flush()
+        self.queued.add(queue_key)
         print(
             f"   [QUEUE] 已交給背景字幕管線：{os.path.basename(final_video_path)}",
             flush=True,
@@ -588,31 +619,32 @@ def enqueue_official_subtitle_retries(
     is_low_quality,
     subtitle_worker,
 ):
-    """把正式資料夾中的舊 SRT／failed 影片重新移回字幕暫存。"""
+    """排入舊 SRT／failed 影片；正式影片留在 03_videos。"""
     pipeline_dir = _pipeline_dir(target_dir)
     os.makedirs(pipeline_dir, exist_ok=True)
     queued = 0
     for final_video in sorted(glob.glob(os.path.join(target_dir, "*.mp4"))):
         if not needs_subtitle_retry(final_video):
             continue
-        staged_video = os.path.join(
-            pipeline_dir,
-            os.path.basename(final_video),
-        )
-        if os.path.exists(staged_video):
-            print(
-                f"   [RETRY SKIP] 暫存影片已存在："
-                f"{os.path.basename(staged_video)}"
-            )
-            continue
-        shutil.move(final_video, staged_video)
+        staged_video = os.path.join(pipeline_dir, os.path.basename(final_video))
+        if is_low_quality:
+            if os.path.exists(staged_video):
+                print(
+                    f"   [RETRY SKIP] 暫存影片已存在："
+                    f"{os.path.basename(staged_video)}"
+                )
+                continue
+            shutil.move(final_video, staged_video)
+            job_video = staged_video
+        else:
+            job_video = final_video
         grid = (
             os.path.splitext(final_video)[0] + ".jpg"
             if is_low_quality
             else _archived_grid_for_video(final_video)
         )
         subtitle_worker.enqueue(
-            staged_video,
+            job_video,
             final_video,
             grid,
             is_low_quality=is_low_quality,
@@ -627,7 +659,7 @@ def enqueue_staged_subtitle_retries(
     is_low_quality,
     subtitle_worker,
 ):
-    """只重跑模式也接手先前留在 output/00_temp/pipeline 的影片。"""
+    """接手舊 pipeline；正式影片先發布，預覽影片維持暫存。"""
     pipeline_dir = _pipeline_dir(target_dir)
     queued = 0
     for staged_video in sorted(
@@ -642,13 +674,18 @@ def enqueue_staged_subtitle_retries(
                 f"{os.path.basename(staged_video)}"
             )
             continue
+        job_video = (
+            staged_video
+            if is_low_quality
+            else publish_official_video(staged_video, final_video)
+        )
         grid = (
             os.path.splitext(final_video)[0] + ".jpg"
             if is_low_quality
             else _archived_grid_for_video(final_video)
         )
         subtitle_worker.enqueue(
-            staged_video,
+            job_video,
             final_video,
             grid,
             is_low_quality=is_low_quality,
@@ -759,8 +796,16 @@ def process_single_directory(
                 upgrade_media_web_meta(
                     jpg_path, staged_video_file, video_url
                 )
+            job_video = (
+                staged_video_file
+                if is_low_quality
+                else publish_official_video(
+                    staged_video_file,
+                    final_video_file,
+                )
+            )
             subtitle_worker.enqueue(
-                staged_video_file,
+                job_video,
                 final_video_file,
                 jpg_path,
                 is_low_quality=is_low_quality,
@@ -785,10 +830,18 @@ def process_single_directory(
                 continue
             if video_url:
                 upgrade_media_web_meta(jpg_path, final_video_file, video_url)
-            shutil.move(final_video_file, staged_video_file)
-            print("   [STAGE] 舊未完成影片已移至 output/00_temp/pipeline 繼續處理")
+            if is_low_quality:
+                shutil.move(final_video_file, staged_video_file)
+                job_video = staged_video_file
+                print(
+                    "   [STAGE] 未完成預覽影片已移至 "
+                    "output/00_temp/pipeline 繼續處理"
+                )
+            else:
+                job_video = final_video_file
+                print("   [QUEUE] 正式影片留在 03_videos，背景補齊字幕")
             subtitle_worker.enqueue(
-                staged_video_file,
+                job_video,
                 final_video_file,
                 jpg_path,
                 is_low_quality=is_low_quality,
@@ -965,8 +1018,16 @@ def process_single_directory(
         if download_success:
             print(f"  [OK] 影片下載至暫存 -> {os.path.basename(staged_video_file)}")
             upgrade_media_web_meta(jpg_path, staged_video_file, video_url)
+            job_video = (
+                staged_video_file
+                if is_low_quality
+                else publish_official_video(
+                    staged_video_file,
+                    final_video_file,
+                )
+            )
             subtitle_worker.enqueue(
-                staged_video_file,
+                job_video,
                 final_video_file,
                 jpg_path,
                 is_low_quality=is_low_quality,
@@ -1034,12 +1095,12 @@ def run_download_process(
                 (LOW_VIDEO_DIR, True),
                 (VIDEO_DIR, False),
             ):
-                queued += enqueue_staged_subtitle_retries(
+                queued += enqueue_official_subtitle_retries(
                     target_dir,
                     is_low,
                     subtitle_worker,
                 )
-                queued += enqueue_official_subtitle_retries(
+                queued += enqueue_staged_subtitle_retries(
                     target_dir,
                     is_low,
                     subtitle_worker,
@@ -1057,6 +1118,11 @@ def run_download_process(
 
         if not retry_subtitles and not repair_over_1080:
             enqueue_official_subtitle_retries(
+                VIDEO_DIR,
+                False,
+                subtitle_worker,
+            )
+            enqueue_staged_subtitle_retries(
                 VIDEO_DIR,
                 False,
                 subtitle_worker,

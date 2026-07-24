@@ -31,24 +31,10 @@ def test_1080p_limit_accepts_landscape_and_portrait():
     assert not run_download.is_within_1080p_dimensions(2560, 1080)
 
 
-def test_pornhub_fallback_selects_highest_not_over_1080():
-    html = (
-        '"quality_2160p":"https:\\/\\/cdn\\/4k.mp4",'
-        '"quality_720p":"https:\\/\\/cdn\\/720.mp4",'
-        '"quality_1080p":"https:\\/\\/cdn\\/1080.mp4"'
-    )
-    assert run_download.select_pornhub_mp4_url(html) == (
-        "https://cdn/1080.mp4"
-    )
-    assert run_download.select_pornhub_mp4_url(
-        html,
-        prefer_lowest=True,
-    ) == "https://cdn/720.mp4"
-
-
-def test_pornhub_fallback_rejects_only_4k_source():
-    html = '"quality_2160p":"https:\\/\\/cdn\\/4k.mp4"'
-    assert run_download.select_pornhub_mp4_url(html) is None
+def test_pornhub_html_fallback_helpers_removed():
+    assert not hasattr(run_download, "select_pornhub_mp4_url")
+    assert not hasattr(run_download, "direct_fetch_pornhub_mp4_stream")
+    assert not hasattr(run_download, "is_pornhub_url")
 
 
 def test_upgrade_writes_same_web_meta_to_video_and_grid(tmp_path, monkeypatch):
@@ -121,7 +107,7 @@ def test_existing_video_is_queued_without_moving_grid(tmp_path, monkeypatch):
     assert kwargs == {"is_low_quality": False}
 
 
-def test_incomplete_existing_video_moves_to_temp_before_queue(
+def test_incomplete_existing_official_video_stays_published_for_subtitles(
     tmp_path,
     monkeypatch,
 ):
@@ -160,12 +146,10 @@ def test_incomplete_existing_video_moves_to_temp_before_queue(
         subtitle_worker=worker,
     )
 
-    staged = tmp_path / "temp" / "pipeline" / "videos" / "sample.mp4"
-    assert not final_video.exists()
-    assert staged.read_bytes() == b"incomplete"
+    assert final_video.read_bytes() == b"incomplete"
     assert jpg.exists()
     args, _ = worker.calls[0]
-    assert Path(args[0]).resolve() == staged
+    assert Path(args[0]).resolve() == final_video
     assert Path(args[1]).resolve() == final_video
 
 
@@ -208,7 +192,7 @@ def test_failed_meta_is_not_complete(monkeypatch):
     assert not run_download.has_completed_subtitle("sample.mp4")
 
 
-def test_official_failed_video_moves_back_to_pipeline(
+def test_official_failed_video_stays_published_while_retrying_subtitles(
     tmp_path,
     monkeypatch,
 ):
@@ -236,11 +220,43 @@ def test_official_failed_video_moves_back_to_pipeline(
         worker,
     )
 
-    staged = tmp_path / "temp" / "pipeline" / "videos" / "sample.mp4"
     assert count == 1
-    assert staged.exists()
-    assert not video.exists()
+    assert video.exists()
     args, kwargs = worker.calls[0]
-    assert Path(args[0]).resolve() == staged
+    assert Path(args[0]).resolve() == video
     assert Path(args[1]).resolve() == video
     assert kwargs["archive_grid"] is False
+
+
+def test_staged_official_video_is_published_before_subtitle_queue(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "videos"
+    target.mkdir()
+    staged_dir = tmp_path / "temp" / "pipeline" / "videos"
+    staged_dir.mkdir(parents=True)
+    staged = staged_dir / "sample.mp4"
+    staged.write_bytes(b"downloaded")
+
+    class Worker:
+        calls = []
+
+        def enqueue(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    worker = Worker()
+    count = run_download.enqueue_staged_subtitle_retries(
+        "videos",
+        False,
+        worker,
+    )
+
+    final_video = target / "sample.mp4"
+    assert count == 1
+    assert final_video.read_bytes() == b"downloaded"
+    assert not staged.exists()
+    args, _ = worker.calls[0]
+    assert Path(args[0]).resolve() == final_video
+    assert Path(args[1]).resolve() == final_video
