@@ -24,3 +24,6 @@
 .worktrees/
 .DS_Store
 Thumbs.db
+
+# Brainstorm / 本機 UI 草稿
+.superpowers/
