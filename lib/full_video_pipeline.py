@@ -718,7 +718,7 @@ def process_full_video_from_grid(
 
     max_height：高畫質上限（預設讀 HIGH_VIDEO_HEIGHT，否則 720）
     enable_enhance：是否允許音訊增強（預設讀 AUDIO_AUTO_ENHANCE）
-    enable_dialogue_trim：對話長時是否分段下載（03 全 480P 應 False）
+    enable_dialogue_trim：是否依停頓門檻移除長停頓並分段下載
     """
     ensure_output_directories()
     jpg_path = Path(jpg_path).resolve()

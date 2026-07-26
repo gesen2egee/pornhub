@@ -90,28 +90,41 @@ def build_continuous_segments(
     max_dur: float = 99999.0
 ) -> list[tuple[float, float]]:
     """
-    根據 max_gap (例如 1.5s) 合併字幕區段，產出連貫的影片保留區段列表 [(s0, e0), (s1, e1), ...]。
-    間隔 <= max_gap 的字幕區段會連貫融合為同一個大段落。
+    依字幕之間的停頓建立影片保留區段。
+
+    規則是「停頓小於 max_gap 完整保留；停頓大於或等於 max_gap
+    整段移除」，不會再對每個字幕前後自動增加 max_gap / 2 的緩衝。
+    因此 max_gap=1.5 時，1.5 秒停頓會被移除，1.49 秒停頓會保留。
     """
     if not entries:
         return []
 
-    raw_intervals = [(e['start'], e['end']) for e in entries]
-    buffer = max_gap / 2.0
-    buffered = [(max(0.0, s - buffer), min(max_dur, e + buffer)) for s, e in raw_intervals]
-    buffered.sort(key=lambda x: x[0])
+    if max_gap < 0:
+        raise ValueError("max_gap 不得小於 0")
 
-    merged = []
-    for cur in buffered:
-        if not merged:
-            merged.append(cur)
+    intervals = []
+    for entry in entries:
+        start = max(0.0, float(entry["start"]))
+        end = min(float(max_dur), float(entry["end"]))
+        if end > start:
+            intervals.append((start, end))
+    intervals.sort(key=lambda interval: interval[0])
+    if not intervals:
+        return []
+
+    segments: list[tuple[float, float]] = []
+    current_start, current_end = intervals[0]
+    for start, end in intervals[1:]:
+        pause = start - current_end
+        if pause < max_gap:
+            # 短停頓與對白放在同一個保留區段，完整保留原始時間。
+            current_end = max(current_end, end)
         else:
-            prev_s, prev_e = merged[-1]
-            if cur[0] <= prev_e:
-                merged[-1] = (prev_s, max(prev_e, cur[1]))
-            else:
-                merged.append(cur)
-    return merged
+            # 長停頓整段不加入任何保留區段，串接時會被完全移除。
+            segments.append((current_start, current_end))
+            current_start, current_end = start, end
+    segments.append((current_start, current_end))
+    return segments
 
 
 def retime_subtitles(entries: list[dict], video_segments: list[tuple[float, float]]) -> list[dict]:
