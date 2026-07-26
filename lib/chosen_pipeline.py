@@ -32,14 +32,15 @@ def _log(msg: str) -> None:
 
 
 def _chosen_asr(
-    media: Path,
+    video_url: str,
     work: Path,
+    video_stem: str,
     *,
     enable_asr: bool,
     enable_translation: bool,
     enable_dialogue_trim: bool,
-) -> dict:
-    """明確依開關執行或重用 ASR，不偷偷改動其他功能。"""
+) -> tuple[dict, float]:
+    """明確依開關重用或串流 ASR；OpenRouter 留在共同第二階段。"""
     import full_video_pipeline
 
     cache = work / "asr_result.json"
@@ -51,12 +52,9 @@ def _chosen_asr(
         if not enable_translation:
             result["translated_srt"] = ""
             result["outcome"] = "transcribed"
-        else:
-            result = full_video_pipeline.complete_cached_translation(
-                result, cache
-            )
         _log(f"  [ASR] 重用字幕快取：{cache.name}")
-        return result
+        duration = float(result.get("source_duration") or 0.0)
+        return result, duration or (full_video_pipeline.remote_duration(video_url) or 0.0)
     if not enable_asr:
         if enable_translation or enable_dialogue_trim:
             raise RuntimeError(
@@ -67,13 +65,16 @@ def _chosen_asr(
             "translated_srt": "",
             "outcome": "disabled",
             "cues": [],
-        }
-    result = full_video_pipeline.run_asr_translate(media, work)
+        }, full_video_pipeline.remote_duration(video_url) or 0.0
+    result, duration = full_video_pipeline.run_streamed_asr(
+        video_url, work, video_stem
+    )
+    result["source_duration"] = duration
     cache.write_text(
         json.dumps(result, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    return result
+    return result, duration
 
 
 def _chosen_segment_plan(
@@ -323,54 +324,39 @@ def process_chosen_video(
         / f"_work_{stem}"
     )
     work.mkdir(parents=True, exist_ok=True)
-    proxy = work / f"{stem}.proxy.mp4"
-    high = work / f"{stem}.high.mp4"
     cache = work / "asr_result.json"
-    reuse = os.getenv("REUSE_ASR_RESULT", "1").strip().casefold() not in {
-        "0", "false", "no", "off",
-    }
-    if asr_enabled and not (reuse and cache.is_file()):
-        full_video_pipeline.download_proxy_low(url, proxy)
-    asr = _chosen_asr(
-        proxy,
+    chosen_asr = _chosen_asr(
+        url,
         work,
+        stem,
         enable_asr=asr_enabled,
         enable_translation=translation_enabled,
         enable_dialogue_trim=trim_enabled,
     )
+    # 保留舊呼叫端只回傳 dict 的相容性；正式新流程回傳 (dict, duration)。
+    if isinstance(chosen_asr, tuple):
+        asr, source_duration = chosen_asr
+    else:
+        asr = chosen_asr
+        source_duration = float(asr.get("source_duration") or 0.0)
     os.environ["HIGH_VIDEO_HEIGHT"] = str(max_height or 1080)
-    source_duration = full_video_pipeline.probe_duration(proxy) or 99999.0
     segments, original, translated = _chosen_segment_plan(
         asr,
         enabled=trim_enabled,
         threshold=dialogue_trim_threshold,
         segment_gap=segment_gap,
-        max_dur=source_duration,
+        max_dur=source_duration if source_duration > 0 else 99999.0,
     )
-    if segments is None:
-        full_video_pipeline.download_high_full(url, high)
-    else:
-        high.unlink(missing_ok=True)
-        parts: list[Path] = []
-        for index, (start, end) in enumerate(segments):
-            part = work / f"{stem}.seg{index:03d}.mp4"
-            _log(
-                f"  [chosen] 高畫質分段下載 {index + 1}/{len(segments)}："
-                f"{start:.2f}-{end:.2f}s"
-            )
-            full_video_pipeline.download_high_range(
-                url, part, start, end
-            )
-            parts.append(part)
-        full_video_pipeline.concat_videos(parts, high)
-        original, translated = _retime_chosen_subtitles(
-            original, translated, segments
-        )
-        _log("  [chosen] 字幕已依高畫質分段串接後時間軸 retime")
-    if enhance_enabled:
-        high, enhanced = full_video_pipeline.enhance_full_video(high)
-    else:
-        enhanced = False
+    high, original, translated, enhanced = full_video_pipeline.run_parallel_delivery_phase(
+        url,
+        work,
+        stem,
+        asr,
+        segments,
+        enable_translation=translation_enabled,
+        enable_enhance=enhance_enabled,
+        asr_cache=cache,
+    )
     if final_video.exists():
         final_video.unlink()
     shutil.move(str(high), str(final_video))

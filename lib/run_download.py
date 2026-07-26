@@ -161,6 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
     _boolean_switch(parser, "translation", "開啟或關閉 OpenRouter 翻譯")
     _boolean_switch(parser, "asr", "開啟或關閉語音辨識")
     _boolean_switch(parser, "demucs-asr", "開啟或關閉 ASR 前 Demucs 人聲分離")
+    _boolean_switch(parser, "asr-stream", "開啟或關閉 240P 分段下載與 ASR 串流")
     _boolean_switch(parser, "subtitles", "開啟或關閉外掛 SRT 輸出")
     _boolean_switch(parser, "dialogue-trim", "開啟或關閉依對白剪片")
     _boolean_switch(parser, "enhance", "開啟或關閉音訊增強")
@@ -209,6 +210,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="合併相鄰對白區段的間隔秒數，預設 1.5",
     )
     parser.add_argument(
+        "--asr-chunk-seconds",
+        type=int,
+        metavar="SECONDS",
+        help="240P 串流下載與 ASR 的區段秒數，預設 180",
+    )
+    parser.add_argument(
         "--retry-subtitles",
         action="store_true",
         help="只修復舊字幕，不下載新影片",
@@ -237,6 +244,7 @@ def run_maintenance(args: argparse.Namespace) -> int | None:
             FeatureSwitches(
                 asr=args.asr,
                 demucs_asr=args.demucs_asr,
+                asr_stream=args.asr_stream,
                 subtitles=args.subtitles,
                 translation=args.translation,
                 dialogue_trim=args.dialogue_trim,
@@ -252,6 +260,7 @@ def run_maintenance(args: argparse.Namespace) -> int | None:
                 reasoning_effort=args.reasoning_effort,
                 trim_threshold=args.trim_threshold,
                 segment_gap=args.segment_gap,
+                asr_chunk_seconds=args.asr_chunk_seconds,
             ),
         )
         try:
@@ -294,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
         "video_height",
         "chosen_height",
         "trim_threshold",
+        "asr_chunk_seconds",
     ):
         value = getattr(args, name)
         if value is not None and value <= 0:
@@ -313,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
         for name in (
             "asr",
             "demucs_asr",
+            "asr_stream",
             "subtitles",
             "translation",
             "dialogue_trim",
@@ -330,6 +341,7 @@ def main(argv: list[str] | None = None) -> int:
             "reasoning_effort",
             "trim_threshold",
             "segment_gap",
+            "asr_chunk_seconds",
         )
     ):
         parser.error("--list 只盤點檔案，不能混用功能開關")
@@ -343,6 +355,7 @@ def main(argv: list[str] | None = None) -> int:
             for name in (
                 "asr",
                 "demucs_asr",
+                "asr_stream",
                 "subtitles",
                 "translation",
                 "dialogue_trim",
@@ -360,6 +373,7 @@ def main(argv: list[str] | None = None) -> int:
                 "reasoning_effort",
                 "trim_threshold",
                 "segment_gap",
+                "asr_chunk_seconds",
             )
         )
     ):
@@ -382,6 +396,7 @@ def main(argv: list[str] | None = None) -> int:
     options = FeatureSwitches(
         asr=args.asr,
         demucs_asr=args.demucs_asr,
+        asr_stream=args.asr_stream,
         subtitles=args.subtitles,
         translation=args.translation,
         dialogue_trim=args.dialogue_trim,
@@ -399,6 +414,7 @@ def main(argv: list[str] | None = None) -> int:
         reasoning_effort=args.reasoning_effort,
         trim_threshold=args.trim_threshold,
         segment_gap=args.segment_gap,
+        asr_chunk_seconds=args.asr_chunk_seconds,
     )
     if args.list:
         for stage in stages:

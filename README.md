@@ -120,8 +120,12 @@ output/01_preview_images/
 不會因為只跑其中一層而先啟動其他昂貴流程。下載時只顯示本程式的階段進度，不顯示
 yt-dlp DEBUG 與下載百分比訊息。
 
-暫存位於 `output/00_temp/pipeline/`。三層皆可輸出軟字幕；標準 480P
-與精選 1080P 為循序管線（代理 ASR → 下載目標畫質 → 發布）。
+暫存位於 `output/00_temp/pipeline/`。Video 與 Chosen 預設分成兩個階段：
+
+1. 以 240P 每 180 秒下載一段；每段下載完成立刻排入 `Demucs → ASR`，下載與 ASR 可重疊。必須等全部低畫質區段與 ASR 都完成，才進下一階段。
+2. 同時執行 OpenRouter 翻譯、高畫質切塊下載，以及每個已下載切塊的自動 `enhance`；三條工作都完成後才 retime 字幕、拼接與發布。
+
+Preview 本身最多只有 180 秒，因此仍是一個低畫質片段的 `Demucs → ASR` 流程，沒有高畫質切塊與 enhance 工作。
 
 只盤點、不下載：
 
@@ -144,10 +148,12 @@ yt-dlp DEBUG 與下載百分比訊息。
 02_run_download.bat --stages chosen --subtitles --enhance --metadata --archive
 02_run_download.bat --stages preview --preview-seconds 90 --no-keep-work
 02_run_download.bat --stages video --video-height 480 --asr-backend whisper
+02_run_download.bat --stages video --asr-stream --asr-chunk-seconds 180
+02_run_download.bat --stages chosen --no-asr-stream
 02_run_download.bat --stages chosen --chosen-height 1080 --translation-model x-ai/grok-4.5 --reasoning-effort minimal
 ```
 
-可控制項目包含：`asr`、`demucs-asr`、`subtitles`、`translation`、`dialogue-trim`、`enhance`、
+可控制項目包含：`asr`、`demucs-asr`、`asr-stream`、`subtitles`、`translation`、`dialogue-trim`、`enhance`、
 `metadata`、`archive`、`keep-work`、`reuse-cache`、`force`。每個布林項目都可使用
 `--功能` 或 `--no-功能`；完整說明請執行 `02_run_download.bat --help`。
 
@@ -161,6 +167,7 @@ yt-dlp DEBUG 與下載百分比訊息。
 Chosen 有 URL 時不會拿既有高畫質成品接續，會重新下載規劃出的高畫質片段；
 若連 ASR 字幕快取也要重做，請加上 `--no-reuse-cache`。
 剪片門檻與區段合併間隔可分別用 `--trim-threshold`、`--segment-gap` 調整。
+`asr-stream` 預設開啟；`--asr-chunk-seconds` 預設為 180。關閉 `--asr-stream` 時，會退回完整 240P 代理下載完成後再 ASR，其他功能不會被連帶關閉。
 目前剪片規則是：停頓小於門檻時完整保留；停頓大於或等於門檻時整段移除，
 不會再對字幕前後自動增加 0.75 秒緩衝。
 
@@ -173,7 +180,7 @@ Chosen 有 URL 時不會拿既有高畫質成品接續，會重新下載規劃�
 
 ## MOSS 與字幕輸出
 
-長影片固定以 **3 分鐘（180 秒）**切段辨識，再把完整時間軸一次交給 LLM 校正與翻譯。若單段發生 CUDA OOM，會繼續自動二分到最低 90 秒。
+長影片預設以 **3 分鐘（180 秒）**下載 240P 片段；每片段先經 Demucs，再獨立辨識，合併成完整時間軸後才一次送到 OpenRouter。若單段發生 CUDA OOM，ASR 仍會自動二分到最低 90 秒。
 
 - `output/03_videos/`：保留原始畫面，輸出 UTF-8 BOM、CRLF、移除 `[Sxx]` 標籤的播放器相容 SRT。
 - `output/02_preview_videos/`：使用 FFmpeg 燒錄繁中硬字幕。

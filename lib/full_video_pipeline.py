@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""正式影片（03_videos）循序管線：低畫質代理 → ASR/翻譯 → 高畫質（可分段）→ 分段 enhance。
+"""正式影片（03_videos）管線：240P 分段下載與 Demucs/ASR 串流重疊，
+完成後平行執行翻譯、高畫質切塊下載與分段 enhance。
 
 預覽影片（02_preview_videos）不走此模組，維持原下載＋背景字幕流程。
 """
@@ -8,11 +9,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Iterator
@@ -49,6 +52,7 @@ DIALOGUE_TRIM_THRESHOLD = 30.0
 SEGMENT_GAP = 1.5
 DOWNLOAD_SOCKET_TIMEOUT = 30
 DOWNLOAD_RETRIES = 3
+ASR_STREAM_CHUNK_SECONDS = 180.0
 
 # 由外部 benchmark 注入 PipelineMetrics；未注入則不計時
 _ACTIVE_METRICS: Any | None = None
@@ -246,6 +250,75 @@ def download_proxy_low(video_url: str, out_path: Path) -> Path:
     dur = probe_duration(out_path)
     _log(f"  [OK] 代理完成，時長 {dur:.1f}s" if dur else "  [OK] 代理完成")
     return out_path
+
+
+def download_proxy_range(
+    video_url: str,
+    out_path: Path,
+    start: float,
+    end: float,
+) -> Path:
+    """下載單一 ≤240P 區段，完成後可立即交給 Demucs 與 ASR。"""
+    import yt_dlp
+
+    out_path.unlink(missing_ok=True)
+    start = max(0.0, float(start))
+    end = max(start + 0.05, float(end))
+
+    def _ranges(_info_dict, _ydl):
+        yield {"start_time": start, "end_time": end}
+
+    opts = _base_ydl_opts(out_path, "download_low", video_url)
+    opts["format"] = PROXY_FORMAT
+    opts["download_ranges"] = _ranges
+    opts["force_keyframes_at_cuts"] = True
+    _log(f"  [1/5] 下載 240P ASR 區段 {start:.0f}–{end:.0f}s → {out_path.name}")
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([video_url])
+    if not out_path.exists() or has_video_stream(out_path) is not True:
+        raise RuntimeError(
+            f"240P ASR 區段下載失敗：{out_path.name} ({start:.2f}-{end:.2f}s)"
+        )
+    return out_path
+
+
+def remote_duration(video_url: str) -> float | None:
+    """只取遠端 metadata 的時長，供 240P/ASR 串流分段使用。"""
+    try:
+        import sites
+
+        adapter = sites.get_adapter_for_url(video_url)
+        resolved = sites.resolve_playable(
+            adapter, video_url, purpose="download_low", prefer_lowest=True
+        )
+        value = (resolved.get("info") or {}).get("duration")
+        duration = float(value)
+        return duration if duration > 0 else None
+    except Exception:
+        return None
+
+
+def asr_stream_enabled(environment: dict[str, str] | None = None) -> bool:
+    environment = os.environ if environment is None else environment
+    value = environment.get("ENABLE_ASR_STREAM", "1").strip().casefold()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("ENABLE_ASR_STREAM 必須是 ON/OFF 布林值。")
+
+
+def asr_stream_chunk_seconds(environment: dict[str, str] | None = None) -> float:
+    environment = os.environ if environment is None else environment
+    try:
+        seconds = float(
+            environment.get("ASR_STREAM_CHUNK_SECONDS", ASR_STREAM_CHUNK_SECONDS)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ASR_STREAM_CHUNK_SECONDS 必須是正數秒數。") from exc
+    if seconds <= 0:
+        raise ValueError("ASR_STREAM_CHUNK_SECONDS 必須大於 0。")
+    return seconds
 
 
 def _high_format_opts() -> tuple[str, list[str], int]:
@@ -591,6 +664,139 @@ def run_asr_translate(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
     return json.loads(result_path.read_text(encoding="utf-8"))
 
 
+def run_asr_only_local(proxy_path: Path) -> dict[str, Any]:
+    """只做 ASR；OpenRouter 翻譯留到第二階段平行執行。"""
+    import run_subtitle
+    from asr_backends import create_backend
+    from translate_srt_openrouter import format_srt
+
+    backend = create_backend().load()
+    _log(f"  [2/5] {backend.display_name} 辨識（Demucs 人聲軌）")
+    cues, language = run_subtitle._transcribe_with_chunks(proxy_path, backend)
+    _log(f"  語言：{language}；字幕段落：{len(cues)}")
+    return {
+        "language": language,
+        "original_srt": format_srt(cues) if cues else "",
+        "translated_srt": "",
+        "outcome": "transcribed" if cues else "empty",
+        "cues": cues,
+    }
+
+
+def run_asr_only(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
+    """先 Demucs 後 ASR，不在此階段呼叫 OpenRouter。"""
+    from asr_audio import prepare_asr_audio
+    from asr_backends import selected_asr_backend_name
+
+    asr_audio = prepare_asr_audio(proxy_path, work_dir)
+    backend_name = selected_asr_backend_name()
+    current = Path(sys.executable).resolve()
+    if backend_name in {"voxtral", "grok-stt", "whisper"}:
+        return run_asr_only_local(asr_audio)
+    if "moss" in str(current).casefold() and current.exists():
+        return run_asr_only_local(asr_audio)
+
+    moss_python = Path(os.getenv("MOSS_PYTHON", str(DEFAULT_MOSS_PYTHON)))
+    if not moss_python.is_file():
+        raise RuntimeError(
+            f"找不到 MOSS 環境：{moss_python}。請先執行 00_setup_or_update.bat。"
+        )
+    result_path = work_dir / "asr_result.json"
+    result_path.unlink(missing_ok=True)
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["ENABLE_TRANSLATION"] = "0"
+    env.setdefault("ASR_BACKEND", "moss")
+    cmd = [
+        str(moss_python),
+        str(Path(__file__).resolve()),
+        "--asr-only",
+        str(asr_audio),
+        "--result",
+        str(result_path),
+    ]
+    _log("  [2/5] 啟動 MOSS 子程序做 ASR…")
+    proc = subprocess.run(cmd, cwd=str(ROOT), env=env, check=False)
+    if proc.returncode != 0 or not result_path.is_file():
+        raise RuntimeError(f"MOSS ASR 子程序失敗，ExitCode={proc.returncode}")
+    return json.loads(result_path.read_text(encoding="utf-8"))
+
+
+def _offset_asr_cues(cues: list[dict], offset: float, first_id: int) -> list[dict]:
+    """把單一 3 分鐘 ASR 結果換回原影片的絕對時間軸。"""
+    adjusted: list[dict] = []
+    for index, cue in enumerate(cues, first_id):
+        try:
+            start_text, end_text = str(cue["time"]).split("-->", 1)
+            start = segment_cutter.parse_srt_time(start_text.strip()) + offset
+            end = segment_cutter.parse_srt_time(end_text.strip()) + offset
+        except (KeyError, ValueError):
+            continue
+        item = dict(cue)
+        item["id"] = index
+        item["time"] = (
+            f"{segment_cutter.format_srt_time(start)} --> "
+            f"{segment_cutter.format_srt_time(end)}"
+        )
+        adjusted.append(item)
+    return adjusted
+
+
+def run_streamed_asr(
+    video_url: str,
+    work_dir: Path,
+    video_stem: str,
+) -> tuple[dict[str, Any], float]:
+    """下載每段 240P 後立刻排入 Demucs+ASR，下載與 ASR 可重疊。"""
+    from translate_srt_openrouter import format_srt
+
+    stream_enabled = asr_stream_enabled()
+    duration = remote_duration(video_url) if stream_enabled else None
+    if not stream_enabled or duration is None:
+        proxy_path = work_dir / f"{video_stem}.proxy.mp4"
+        _log("  [ASR 串流] 無法取得時長或已關閉，改用完整 240P 代理")
+        download_proxy_low(video_url, proxy_path)
+        result = run_asr_only(proxy_path, work_dir)
+        return result, probe_duration(proxy_path) or 0.0
+
+    chunk_seconds = asr_stream_chunk_seconds()
+    ranges = [
+        (start, min(duration, start + chunk_seconds))
+        for start in (index * chunk_seconds for index in range(math.ceil(duration / chunk_seconds)))
+    ]
+    _log(
+        f"  [ASR 串流] 240P 共 {len(ranges)} 段，每段最多 {chunk_seconds / 60:.1f} 分鐘；"
+        "下載與 Demucs+ASR 同步排隊"
+    )
+    futures: list[tuple[float, Future[dict[str, Any]]]] = []
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr") as executor:
+        for index, (start, end) in enumerate(ranges, 1):
+            proxy_part = work_dir / f"{video_stem}.proxy.asr{index:03d}.mp4"
+            download_proxy_range(video_url, proxy_part, start, end)
+            asr_work = work_dir / f"asr-{index:03d}"
+            futures.append((start, executor.submit(run_asr_only, proxy_part, asr_work)))
+
+        merged: list[dict] = []
+        languages: list[str] = []
+        for index, (start, future) in enumerate(futures, 1):
+            result = future.result()
+            cues = result.get("cues") or []
+            merged.extend(_offset_asr_cues(cues, start, len(merged) + 1))
+            language = result.get("language")
+            if language and language not in languages:
+                languages.append(str(language))
+            _log(f"  [ASR 串流] 完成 {index}/{len(futures)}：{len(cues)} 段字幕")
+
+    return {
+        "language": ",".join(languages) or "multilingual",
+        "original_srt": format_srt(merged) if merged else "",
+        "translated_srt": "",
+        "outcome": "transcribed" if merged else "empty",
+        "cues": merged,
+        "source_duration": duration,
+    }, duration
+
+
 def enhance_parts(
     parts: list[Path],
     decisions: list[dict],
@@ -682,6 +888,116 @@ def enhance_full_video(video: Path) -> tuple[Path, bool]:
         shutil.move(str(final), str(video))
         return video, True
     return video, bool(media.enhanced)
+
+
+def _translate_after_asr(asr: dict[str, Any], cache_path: Path) -> dict[str, Any]:
+    """第二階段的 OpenRouter 工作；翻譯失敗時保留原文並讓其他並行工作完成。"""
+    try:
+        return complete_cached_translation(asr, cache_path)
+    except Exception as exc:
+        _log(f"  [!] OpenRouter 翻譯失敗，保留原文：{exc}")
+        asr["translated_srt"] = ""
+        asr["outcome"] = "translation_failed"
+        cache_path.write_text(
+            json.dumps(asr, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return asr
+
+
+def run_parallel_delivery_phase(
+    video_url: str,
+    work_dir: Path,
+    video_stem: str,
+    asr: dict[str, Any],
+    segments: list[tuple[float, float]] | None,
+    *,
+    enable_translation: bool,
+    enable_enhance: bool,
+    asr_cache: Path,
+) -> tuple[Path, str, str, bool]:
+    """平行執行 OpenRouter、切塊下載與切塊後 enhance，全部完成才回傳。"""
+    high_path = work_dir / f"{video_stem}.high.mp4"
+    original_srt = asr.get("original_srt") or ""
+    translated_srt = asr.get("translated_srt") or ""
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="translate") as translator, ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="enhance"
+    ) as enhancer:
+        translation_future: Future[dict[str, Any]] | None = None
+        if enable_translation:
+            _log("  [第二階段] OpenRouter 翻譯、高畫質下載、Enhance 可同時進行")
+            translation_future = translator.submit(
+                _translate_after_asr, asr, asr_cache
+            )
+        else:
+            _log("  [第二階段] 翻譯已關閉；開始高畫質下載與 Enhance")
+
+        enhanced = False
+        if segments is None:
+            _log("  [第二階段] 下載完整高畫質影片")
+            download_high_full(video_url, high_path)
+            enhance_future = (
+                enhancer.submit(enhance_full_video, high_path)
+                if enable_enhance
+                else None
+            )
+            if enhance_future is not None:
+                high_path, enhanced = enhance_future.result()
+        else:
+            _log(f"  [第二階段] 下載 {len(segments)} 個高畫質切塊")
+            part_futures: list[tuple[Path, Future[tuple[Path, bool]] | None]] = []
+            for index, (start, end) in enumerate(segments):
+                part = work_dir / f"{video_stem}.seg{index:03d}.mp4"
+                _log(f"    下載段 {index + 1}/{len(segments)}：{start:.2f}-{end:.2f}s")
+                download_high_range(video_url, part, start, end)
+                part_futures.append(
+                    (
+                        part,
+                        enhancer.submit(enhance_full_video, part)
+                        if enable_enhance
+                        else None,
+                    )
+                )
+
+            parts: list[Path] = []
+            for index, (part, future) in enumerate(part_futures, 1):
+                if future is None:
+                    parts.append(part)
+                    continue
+                enhanced_part, part_enhanced = future.result()
+                parts.append(enhanced_part)
+                enhanced = enhanced or part_enhanced
+                _log(f"    Enhance 段 {index}/{len(part_futures)} 完成")
+            concat_videos(parts, high_path)
+
+        if translation_future is not None:
+            translated_asr = translation_future.result()
+            translated_srt = translated_asr.get("translated_srt") or ""
+            asr.update(translated_asr)
+        else:
+            asr["translated_srt"] = ""
+            asr["outcome"] = "transcribed" if original_srt else "empty"
+            asr_cache.write_text(
+                json.dumps(asr, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+
+    if segments is not None:
+        if original_srt.strip():
+            original_srt = _entries_to_srt(
+                segment_cutter.retime_subtitles(
+                    srt_text_to_entries(original_srt), segments
+                )
+            )
+        if translated_srt.strip():
+            translated_srt = _entries_to_srt(
+                segment_cutter.retime_subtitles(
+                    srt_text_to_entries(translated_srt), segments
+                )
+            )
+        _log("  [第二階段] 翻譯、切塊下載與 Enhance 已全部完成；字幕已 retime")
+    else:
+        _log("  [第二階段] 翻譯、完整下載與 Enhance 已全部完成")
+    return high_path, original_srt, translated_srt, enhanced
 
 
 def write_compatible_srt(path: Path, content: str) -> None:
@@ -867,56 +1183,30 @@ def process_full_video_from_grid(
     _log(f"URL：{video_url}")
     _log("=" * 60)
 
-    # 1) 只有真的需要重新 ASR 或做增強分析時才準備代理。
-    needs_proxy = (
-        (enable_asr and not (reuse_asr and asr_cache.is_file()))
-        or enable_enhance
-    )
-    with _stage("01_proxy_download"):
-        if not needs_proxy:
-            _log("  [1/5] 代理下載已略過（ASR 快取可用或相關功能已關閉）")
-            duration = 0.0
-        elif proxy_path.exists() and has_video_stream(proxy_path) is True:
-            _log(f"  [1/5] 重用既有代理：{proxy_path.name}")
-            duration = probe_duration(proxy_path) or 0.0
-        else:
-            download_proxy_low(video_url, proxy_path)
-            duration = probe_duration(proxy_path) or 0.0
-
-    # 2–3) ASR + 翻譯（可重用 work_dir/asr_result.json 續跑）
-    with _stage("02_asr_and_translate"):
+    # 第一階段：每下載完 3 分鐘 240P 區段，就立即排入 Demucs + ASR。
+    # OpenRouter 會留到所有 ASR 就緒後的第二階段，避免阻塞下載佇列。
+    with _stage("01_stream_proxy_and_asr"):
         if reuse_asr and asr_cache.is_file():
             try:
                 asr = json.loads(asr_cache.read_text(encoding="utf-8"))
                 if not enable_translation:
                     asr["translated_srt"] = ""
                     asr["outcome"] = "transcribed"
+                duration = float(asr.get("source_duration") or 0.0)
+                if duration <= 0:
+                    duration = remote_duration(video_url) or 0.0
                 _log(
-                    f"  [2/5] 重用既有字幕快取：{asr_cache.name}"
+                    f"  [ASR] 重用既有字幕快取：{asr_cache.name}"
                     f"（cues={len(asr.get('cues') or [])}，"
                     f"outcome={asr.get('outcome')}）"
                 )
-                # 先前翻譯失敗時，有 API key 則只重跑翻譯
-                if (
-                    enable_translation
-                    and
-                    not (asr.get("translated_srt") or "").strip()
-                    and (asr.get("original_srt") or asr.get("cues"))
-                ):
-                    _log("  [3/5] 補跑 OpenRouter 翻譯（沿用既有 ASR）")
-                    with _stage("02b_translate_only"):
-                        asr = complete_cached_translation(asr, asr_cache)
             except Exception as exc:
-                if "翻譯已開啟" in str(exc):
-                    raise
                 if not enable_asr:
                     raise RuntimeError(
                         f"ASR 已關閉，但字幕快取無法讀取：{exc}"
                     ) from exc
                 _log(f"  [!] 讀取字幕快取失敗，改重新 ASR：{exc}")
-                if not proxy_path.exists() or has_video_stream(proxy_path) is not True:
-                    download_proxy_low(video_url, proxy_path)
-                asr = run_asr_translate(proxy_path, work_dir)
+                asr, duration = run_streamed_asr(video_url, work_dir, video_stem)
         elif not enable_asr:
             if enable_translation or enable_dialogue_trim:
                 raise RuntimeError(
@@ -931,8 +1221,10 @@ def process_full_video_from_grid(
                 "outcome": "disabled",
                 "cues": [],
             }
+            duration = remote_duration(video_url) or 0.0
         else:
-            asr = run_asr_translate(proxy_path, work_dir)
+            asr, duration = run_streamed_asr(video_url, work_dir, video_stem)
+            asr["source_duration"] = duration
             try:
                 asr_cache.write_text(
                     json.dumps(
@@ -942,6 +1234,7 @@ def process_full_video_from_grid(
                             "translated_srt": asr.get("translated_srt"),
                             "outcome": asr.get("outcome"),
                             "cues": asr.get("cues") or [],
+                            "source_duration": duration,
                         },
                         ensure_ascii=False,
                         indent=2,
@@ -972,8 +1265,6 @@ def process_full_video_from_grid(
 
         any_enhanced = False
         segments: list[tuple[float, float]] | None = None
-        segment_decisions: list[dict] = []
-
         if (
             enable_dialogue_trim
             and net_dur > dialogue_trim_threshold
@@ -992,93 +1283,25 @@ def process_full_video_from_grid(
             for i, (s, e) in enumerate(segments, 1):
                 _log(f"    段 {i:02d}: {s:.2f} → {e:.2f} ({e - s:.2f}s)")
 
-            if enable_enhance:
-                from audio_enhance_stage import analyze_and_enhance_segments
-
-                with _stage("03b_enhance_detect", segments=len(segments)):
-                    segment_decisions = analyze_and_enhance_segments(
-                        proxy_path, segments
-                    )
-                for d in segment_decisions:
-                    tag = "ENHANCE" if d.get("should_enhance") else "PASS"
-                    _log(
-                        f"    偵測 段{d['segment_index'] + 1:02d}: "
-                        f"[{tag}] {d.get('reason')}"
-                    )
-            else:
-                segment_decisions = [
-                    {
-                        "segment_index": i,
-                        "should_enhance": False,
-                        "reason": "此模式關閉 enhance",
-                    }
-                    for i in range(len(segments))
-                ]
         else:
             segments = None
-            segment_decisions = []
             trimmed = duration
 
-    if segments is not None:
-        _log(f"  [4/5] 下載高畫質分段（共 {len(segments)}，≤{max_height}P）…")
-        parts: list[Path] = []
-        with _stage(
-            "04_high_segment_download",
-            segments=len(segments),
-            planned_sec=round(trimmed, 2),
-        ):
-            for i, (s, e) in enumerate(segments):
-                part = work_dir / f"{video_stem}.seg{i:03d}.mp4"
-                _log(f"    下載段 {i + 1}/{len(segments)}: {s:.2f}-{e:.2f}s")
-                download_high_range(video_url, part, s, e)
-                parts.append(part)
-
-        with _stage("05_segment_enhance", segments=len(parts)):
-            if enable_enhance:
-                parts, any_enhanced = enhance_parts(parts, segment_decisions)
-            else:
-                any_enhanced = False
-        with _stage("06_concat"):
-            concat_videos(parts, high_path)
-
-        # 字幕重對位
-        with _stage("07_retime_subtitles"):
-            orig_entries = (
-                srt_text_to_entries(original_srt)
-                if original_srt.strip()
-                else []
-            )
-            trans_entries = (
-                srt_text_to_entries(translated_srt)
-                if translated_srt.strip()
-                else []
-            )
-            if orig_entries:
-                original_srt = _entries_to_srt(
-                    segment_cutter.retime_subtitles(orig_entries, segments)
-                )
-            if trans_entries:
-                translated_srt = _entries_to_srt(
-                    segment_cutter.retime_subtitles(trans_entries, segments)
-                )
-            _log("  [OK] 字幕已依切除後時間軸 retime")
-    else:
-        _log(
-            f"  [全片] 下載完整 ≤{max_height}P"
-            + (
-                f"（對話 ≤ {dialogue_trim_threshold}s 或 trim 關閉）"
-                if enable_dialogue_trim
-                else "（全片模式，不裁切）"
+    # 第二階段三條工作並行：翻譯、高畫質切塊下載、完成切塊後的 Enhance。
+    with _stage("02_parallel_translate_download_enhance"):
+        high_path, original_srt, translated_srt, any_enhanced = (
+            run_parallel_delivery_phase(
+                video_url,
+                work_dir,
+                video_stem,
+                asr,
+                segments,
+                enable_translation=enable_translation,
+                enable_enhance=enable_enhance,
+                asr_cache=asr_cache,
             )
         )
-        with _stage("04_high_full_download"):
-            download_high_full(video_url, high_path)
-        with _stage("05_full_enhance"):
-            if enable_enhance:
-                high_path, any_enhanced = enhance_full_video(high_path)
-            else:
-                any_enhanced = False
-        trimmed = duration
+    outcome = asr.get("outcome") or outcome
 
     # 5) 發布 + Meta + SRT
     with _stage("08_publish_meta"):

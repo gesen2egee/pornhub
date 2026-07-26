@@ -38,6 +38,7 @@ class FeatureSwitches:
 
     asr: bool | None = None
     demucs_asr: bool | None = None
+    asr_stream: bool | None = None
     subtitles: bool | None = None
     translation: bool | None = None
     dialogue_trim: bool | None = None
@@ -55,6 +56,7 @@ class FeatureSwitches:
     reasoning_effort: str | None = None
     trim_threshold: float | None = None
     segment_gap: float | None = None
+    asr_chunk_seconds: int | None = None
 
 
 STAGES = {
@@ -161,6 +163,7 @@ def _set_bool_env(name: str, value: bool | None) -> None:
 def apply_feature_switches(options: FeatureSwitches) -> None:
     _set_bool_env("ENABLE_ASR", options.asr)
     _set_bool_env("ENABLE_DEMUCS_ASR", options.demucs_asr)
+    _set_bool_env("ENABLE_ASR_STREAM", options.asr_stream)
     _set_bool_env("EXPORT_SUBTITLES", options.subtitles)
     _set_bool_env("ENABLE_TRANSLATION", options.translation)
     _set_bool_env("ENABLE_DIALOGUE_TRIM", options.dialogue_trim)
@@ -169,6 +172,8 @@ def apply_feature_switches(options: FeatureSwitches) -> None:
     _set_bool_env("REUSE_ASR_RESULT", options.reuse_cache)
     if options.preview_seconds is not None:
         os.environ["PREVIEW_SECONDS"] = str(options.preview_seconds)
+    if options.asr_chunk_seconds is not None:
+        os.environ["ASR_STREAM_CHUNK_SECONDS"] = str(options.asr_chunk_seconds)
     if options.asr_backend:
         os.environ["ASR_BACKEND"] = options.asr_backend
         os.environ["CHOSEN_ASR_BACKEND"] = options.asr_backend
@@ -188,6 +193,7 @@ def resolve_stage_options(
     defaults = {
         "asr": True,
         "demucs_asr": True,
+        "asr_stream": True,
         "subtitles": True,
         "translation": True,
         "dialogue_trim": True,
@@ -207,6 +213,7 @@ def resolve_stage_options(
         "reasoning_effort": "minimal" if stage_name == "chosen" else "none",
         "trim_threshold": 30.0,
         "segment_gap": 1.5,
+        "asr_chunk_seconds": 180,
     }
     values = {
         name: getattr(options, name)
@@ -234,6 +241,7 @@ def print_effective_options(stage_name: str, options: FeatureSwitches) -> None:
     print(
         "實際設定："
         f"ASR={state(options.asr)}｜Demucs={state(options.demucs_asr)}｜"
+        f"ASR串流={state(options.asr_stream)}｜"
         f"SRT={state(options.subtitles)}｜"
         f"翻譯={state(options.translation)}｜剪片={state(options.dialogue_trim)}｜"
         f"增強={state(options.enhance)}｜Meta={state(options.metadata)}｜"
@@ -244,6 +252,7 @@ def print_effective_options(stage_name: str, options: FeatureSwitches) -> None:
         f"Backend={options.asr_backend}｜Model={options.translation_model}｜"
         f"Reasoning={options.reasoning_effort}｜"
         f"剪片門檻={options.trim_threshold}s｜段落間隔={options.segment_gap}s"
+        f"｜ASR區段={options.asr_chunk_seconds}s"
     )
 
 
@@ -253,6 +262,7 @@ def feature_environment(options: FeatureSwitches):
     names = (
         "ENABLE_ASR",
         "ENABLE_DEMUCS_ASR",
+        "ENABLE_ASR_STREAM",
         "EXPORT_SUBTITLES",
         "ENABLE_TRANSLATION",
         "ENABLE_DIALOGUE_TRIM",
@@ -260,6 +270,7 @@ def feature_environment(options: FeatureSwitches):
         "ENABLE_METADATA",
         "REUSE_ASR_RESULT",
         "PREVIEW_SECONDS",
+        "ASR_STREAM_CHUNK_SECONDS",
         "ASR_BACKEND",
         "CHOSEN_ASR_BACKEND",
         "OPENROUTER_MODEL",
