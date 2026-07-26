@@ -108,8 +108,8 @@ output/01_preview_images/
 
 將素材放入對應目錄：
 
-- `output/02_preview_videos/`：九宮格 → **前 3 分鐘低畫質**，**MOSS** 語音辨識後剪片（淨語音 ≤30s 則保留整段），自動判斷並 **enhance**，輸出軟 SRT。
-- `output/03_videos/`：九宮格 → **480P**，**MOSS** 字幕並據此剪片（對白淨長 >30s），高畫質切塊下載完成就排入自動 **enhance**，輸出同名軟 SRT。
+- `output/02_preview_videos/`：九宮格**或含 URL 的影片** → **前 3 分鐘低畫質**，**MOSS** 語音辨識後剪片（淨語音 ≤30s 則保留整段），自動判斷並 **enhance**，輸出軟 SRT。
+- `output/03_videos/`：九宮格**或含 URL 的影片** → **480P**，**MOSS** 字幕並據此剪片（對白淨長 >30s），高畫質切塊下載完成就排入自動 **enhance**，輸出同名軟 SRT。
 - `output/05_chosen/`：九宮格**或含 URL 的影片**（影片只作 URL 載體）→ **1080P + MOSS + Grok 4.5（minimal）**，**判斷 enhance**；先用低畫質分析，再只下載需要的高畫質區段，完成進 `06_good`；九宮格歸檔 `04_downloaded`，來源影片刪除。
 
 ### 3. 下載與字幕
@@ -166,6 +166,7 @@ Preview 本身最多只有 180 秒，因此是單一低畫質片段的 `Demucs �
 若要讓新設定重新套用到既有成品，請明確加上 `--force`；預設會保護既有成品。
 Chosen 有 URL 時不會拿既有高畫質成品接續，會重新下載規劃出的高畫質片段；
 若連 ASR 字幕快取也要重做，請加上 `--no-reuse-cache`。
+每支發布完成的影片 Metadata 都會寫入 `published_stage`（`preview`、`video` 或 `chosen`）。下次掃描同一層資料夾時，標示同層已發布的影片會列為既有成品、不再處理；需要明確重跑時使用 `--force`。
 剪片門檻與區段合併間隔可分別用 `--trim-threshold`、`--segment-gap` 調整。
 `asr-stream` 預設開啟；`--asr-chunk-seconds` 預設為 180。下載速度領先 ASR 時，已就緒片段會進入佇列，並在 `--asr-batch-size`（預設 3）上限內自動提高 MOSS 的實際 batch。關閉 `--asr-stream` 時，會退回完整 240P 代理下載完成後再 ASR，其他功能不會被連帶關閉。
 目前剪片規則是：停頓小於門檻時完整保留；停頓大於或等於門檻時整段移除，

@@ -1485,6 +1485,7 @@ def process_full_video_from_grid(
                 web_meta = video_meta.build_web_meta(info)
                 web_meta = dict(web_meta)
                 web_meta["pipeline_stage"] = pipeline_stage
+                web_meta["published_stage"] = pipeline_stage
                 if segments is not None:
                     web_meta["trimmed_segments"] = [
                         [round(s, 3), round(e, 3)] for s, e in segments

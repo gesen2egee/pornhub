@@ -395,6 +395,7 @@ def process_preview_from_grid(
             web_meta = video_meta.build_web_meta(info)
             web_meta = dict(web_meta)
             web_meta["pipeline_stage"] = "preview"
+            web_meta["published_stage"] = "preview"
             if segments is not None:
                 web_meta["preview_trimmed_segments"] = [
                     [round(s, 3), round(e, 3)] for s, e in segments

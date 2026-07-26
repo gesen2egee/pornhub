@@ -372,6 +372,7 @@ def process_chosen_video(
         if metadata_enabled:
             chosen_web = dict(web) if isinstance(web, dict) else {}
             chosen_web["pipeline_stage"] = "chosen"
+            chosen_web["published_stage"] = "chosen"
             video_meta.merge_write_mp4_meta(
                 final_video,
                 web_meta=chosen_web,

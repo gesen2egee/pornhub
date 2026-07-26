@@ -66,7 +66,7 @@ STAGES = {
         "第一層：Preview Video",
         PREVIEW_VIDEOS_DIR,
         "$ 低預算",
-        "前 3 分鐘低畫質、Whisper、軟字幕",
+        "前 3 分鐘低畫質、MOSS、自動 enhance、軟字幕",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
     "video": StageDefinition(
@@ -74,7 +74,7 @@ STAGES = {
         "第二層：Video",
         VIDEOS_DIR,
         "$$ 中預算",
-        "480P 全片、Whisper、Grok 4.3",
+        "480P 全片、MOSS、Grok 4.3、自動 enhance",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
     "chosen": StageDefinition(
@@ -104,14 +104,39 @@ def parse_stage_names(values: Iterable[str] | None) -> list[str]:
     return result
 
 
-def list_stage_sources(stage_name: str) -> list[Path]:
+def _published_in_same_stage(path: Path, stage_name: str) -> bool:
+    """只排除已在目前層級發布的影片；移到另一層仍可當作 URL 輸入。"""
+    if path.suffix.casefold() not in VIDEO_EXTENSIONS:
+        return False
+    try:
+        import video_meta
+
+        web_meta = video_meta.read_mp4_meta(path).get("web_meta") or {}
+        published_stage = web_meta.get("published_stage") or web_meta.get(
+            "pipeline_stage"
+        )
+        return published_stage == stage_name
+    except Exception:
+        return False
+
+
+def list_stage_sources(
+    stage_name: str,
+    *,
+    include_published: bool = False,
+) -> list[Path]:
     stage = STAGES[stage_name]
     if not stage.directory.is_dir():
         return []
     return [
         path
         for path in sorted(stage.directory.iterdir(), key=lambda item: item.name.casefold())
-        if path.is_file() and path.suffix.casefold() in stage.accepted_extensions
+        if path.is_file()
+        and path.suffix.casefold() in stage.accepted_extensions
+        and (
+            include_published
+            or not _published_in_same_stage(path, stage_name)
+        )
     ]
 
 
@@ -305,7 +330,9 @@ def run_stage(stage_name: str, options: FeatureSwitches) -> int:
 
 
 def _execute_stage(stage_name: str, options: FeatureSwitches) -> int:
-    sources = list_stage_sources(stage_name)
+    sources = list_stage_sources(
+        stage_name, include_published=bool(options.force)
+    )
     if not sources:
         print(f"[SKIP] {STAGES[stage_name].title} 沒有待處理來源。")
         return 0
