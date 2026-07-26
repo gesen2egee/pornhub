@@ -120,6 +120,22 @@ def _published_in_same_stage(path: Path, stage_name: str) -> bool:
         return False
 
 
+def _grid_has_published_output(path: Path, stage_name: str) -> bool:
+    """九宮格已有同名、同層成品時，掃描階段直接略過。"""
+    if path.suffix.casefold() not in GRID_EXTENSIONS:
+        return False
+    stage = STAGES[stage_name]
+    output_dir = GOOD_DIR if stage_name == "chosen" else stage.directory
+    candidates = [output_dir / f"{path.stem}.mp4"]
+    # Chosen 的影片 URL 載體會移除四位數前綴；兼容同名舊成品。
+    if stage_name == "chosen" and len(path.stem) > 5 and path.stem[:4].isdigit():
+        candidates.append(output_dir / f"{path.stem[5:]}.mp4")
+    return any(
+        candidate.is_file() and _published_in_same_stage(candidate, stage_name)
+        for candidate in candidates
+    )
+
+
 def list_stage_sources(
     stage_name: str,
     *,
@@ -135,7 +151,10 @@ def list_stage_sources(
         and path.suffix.casefold() in stage.accepted_extensions
         and (
             include_published
-            or not _published_in_same_stage(path, stage_name)
+            or (
+                not _published_in_same_stage(path, stage_name)
+                and not _grid_has_published_output(path, stage_name)
+            )
         )
     ]
 
