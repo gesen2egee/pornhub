@@ -25,10 +25,15 @@ if /i "%~1"=="--check" (
     exit /b 0
 )
 
-echo [INFO] Downloads and subtitles run in parallel.
-echo [INFO] 03_videos uses sidecar SRT; 02_preview_videos uses hard subtitles.
+echo [INFO] Three budget layers: Preview ^($^) -^> Video ^($$^) -^> Chosen ^($$$^)
+echo [INFO] Each layer lists its files before you choose Run, Skip, or Quit.
+echo [INFO] Use --help for all feature switches and arguments.
 
-"%PYTHON%" "%SCRIPT%" %*
+if "%~1"=="" (
+    "%PYTHON%" "%SCRIPT%" --interactive
+) else (
+    "%PYTHON%" "%SCRIPT%" %*
+)
 if errorlevel 1 (
     set "DOWNLOAD_EXIT=!ERRORLEVEL!"
     echo [ERROR] Pipeline failed with exit code !DOWNLOAD_EXIT!.

@@ -1,55 +1,33 @@
-import os
-import sys
-import re
+"""下載入口：只負責 CLI、三層預算控制與維護模式分流。"""
+
+from __future__ import annotations
+
 import argparse
-import json
 import glob
-import shutil
-import subprocess
-import urllib.request
-import urllib.parse
-from datetime import datetime
-import yt_dlp
-import video_meta
-import sites
-from project_paths import (
-    DOWNLOADED_DIR,
-    LIB_DIR,
-    MOSS_VENV_DIR,
-    OUTPUT_ROOT,
-    PREVIEW_VIDEOS_DIR,
-    TEMP_DIR,
-    VIDEOS_DIR,
-    ensure_output_directories,
+import os
+import re
+import sys
+from pathlib import Path
+
+import download_maintenance as maintenance
+from download_maintenance import *  # noqa: F401,F403 - 保留舊工具的相容入口
+from pipeline_control import (
+    FeatureSwitches,
+    feature_environment,
+    parse_stage_names,
+    print_stage_inventory,
+    resolve_stage_options,
+    run_interactive,
+    run_stages,
+    validate_stage_options,
 )
+from project_paths import DOWNLOADED_DIR, VIDEOS_DIR, ensure_output_directories
 
-MAX_VIDEO_WIDTH = 1920
-MAX_VIDEO_HEIGHT = 1080
-HIGH_VIDEO_FORMAT = "bestvideo*+bestaudio/best"
-HIGH_VIDEO_FORMAT_SORT = ["res:1080"]
-
-if sys.platform == 'win32':
-    try:
-        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-    except Exception:
-        pass
-
-from PIL import Image
-
-
-ROOT = str(LIB_DIR)
-DEFAULT_MOSS_PYTHON = str(MOSS_VENV_DIR / "Scripts" / "python.exe")
-LOW_VIDEO_DIR = str(PREVIEW_VIDEOS_DIR)
-VIDEO_DIR = str(VIDEOS_DIR)
-ARCHIVE_DIR = str(DOWNLOADED_DIR)
-WORK_TEMP_DIR = str(TEMP_DIR)
-DOWNLOAD_SOCKET_TIMEOUT = 30
-DOWNLOAD_RETRIES = 3
+WORK_TEMP_DIR = maintenance.WORK_TEMP_DIR
 
 
 def _pipeline_dir(target_dir):
-    """依正式目錄名稱建立固定的下載／字幕暫存路徑。"""
+    """相容舊呼叫，但使用入口模組可覆寫的暫存根目錄。"""
     return os.path.join(
         WORK_TEMP_DIR,
         "pipeline",
@@ -57,165 +35,8 @@ def _pipeline_dir(target_dir):
     )
 
 
-def publish_official_video(video_path, final_video_path):
-    """正式影片下載驗證完成便發布，不等待字幕或音訊增強。"""
-    source = os.path.abspath(video_path)
-    destination = os.path.abspath(final_video_path)
-    if source == destination:
-        return destination
-    if os.path.exists(destination):
-        raise RuntimeError(f"正式影片已存在，拒絕覆寫：{destination}")
-    os.makedirs(os.path.dirname(destination), exist_ok=True)
-    shutil.move(source, destination)
-    staged_srt = os.path.splitext(source)[0] + ".srt"
-    final_srt = os.path.splitext(destination)[0] + ".srt"
-    if os.path.exists(staged_srt):
-        os.replace(staged_srt, final_srt)
-    print(
-        f"   [PUBLISH] 下載完成，正式影片已立即發布："
-        f"{os.path.basename(destination)}"
-    )
-    return destination
-
-
-def is_http_416_error(error):
-    """辨識遠端拒絕既有續傳範圍的錯誤。"""
-    message = str(error).casefold()
-    return (
-        "http error 416" in message
-        or "requested range not satisfiable" in message
-    )
-
-
-def clear_yt_dlp_resume_files(temp_dir, output_basename):
-    """只移除指定輸出檔所屬的 yt-dlp 續傳狀態。"""
-    output_stem = os.path.splitext(output_basename)[0]
-    removed = []
-    try:
-        entries = os.scandir(temp_dir)
-    except FileNotFoundError:
-        return removed
-
-    with entries:
-        for entry in entries:
-            name = entry.name
-            if not entry.is_file() or not name.startswith(f"{output_stem}."):
-                continue
-            if ".part" not in name and not name.endswith(".ytdl"):
-                continue
-            os.remove(entry.path)
-            removed.append(entry.path)
-    return removed
-
-
-def download_with_416_recovery(
-    video_url,
-    ydl_opts,
-    temp_dir,
-    output_basename,
-):
-    """遇到失效續傳範圍時，清除該影片狀態並僅從零重試一次。"""
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([video_url])
-        return
-    except Exception as error:
-        if not is_http_416_error(error):
-            raise
-
-    removed = clear_yt_dlp_resume_files(temp_dir, output_basename)
-    print(
-        "   [416 RECOVERY] 遠端影片已變更，已清除 "
-        f"{len(removed)} 個舊續傳檔並從零重試一次。"
-    )
-    retry_opts = dict(ydl_opts)
-    retry_opts["continuedl"] = False
-    with yt_dlp.YoutubeDL(retry_opts) as ydl:
-        ydl.download([video_url])
-
-
-def positive_env_seconds(name, default):
-    """讀取正整數秒數；設定錯誤時安全退回預設值。"""
-    try:
-        value = int(os.getenv(name, str(default)))
-    except ValueError:
-        value = default
-    return max(1, value)
-
-
-def has_video_stream(path):
-    """只有 ffprobe 確認含可播放 video stream 才算下載成功。"""
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe",
-                "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=codec_type",
-                "-of", "default=nw=1:nk=1",
-                os.path.abspath(path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return None
-    return result.returncode == 0 and "video" in result.stdout.split()
-
-
-def probe_video_dimensions(path):
-    """回傳第一條 video stream 的 (width, height)，無法確認時回傳 None。"""
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe",
-                "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height",
-                "-of", "json",
-                os.path.abspath(path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        payload = json.loads(result.stdout or "{}")
-        stream = (payload.get("streams") or [])[0]
-        width = int(stream["width"])
-        height = int(stream["height"])
-        return width, height
-    except (
-        FileNotFoundError,
-        subprocess.SubprocessError,
-        ValueError,
-        KeyError,
-        IndexError,
-        json.JSONDecodeError,
-    ):
-        return None
-
-
-def is_within_1080p_dimensions(width, height):
-    """接受橫式 1920×1080 與直式 1080×1920 的等效 1080P 範圍。"""
-    return (
-        width <= MAX_VIDEO_WIDTH
-        and height <= MAX_VIDEO_HEIGHT
-    ) or (
-        width <= MAX_VIDEO_HEIGHT
-        and height <= MAX_VIDEO_WIDTH
-    )
-
-
-def is_video_within_1080p(path):
-    dimensions = probe_video_dimensions(path)
-    if dimensions is None:
-        return None
-    return is_within_1080p_dimensions(*dimensions)
-
-
 def remove_invalid_video(path, label):
-    """移除沒有 video stream 的空殼，讓該九宮格重新下載。"""
+    """只在 ffprobe 明確判定無 video stream 時移除檔案。"""
     stream_state = has_video_stream(path) if os.path.exists(path) else None
     if stream_state is not False:
         return False
@@ -227,875 +48,368 @@ def remove_invalid_video(path, label):
     return True
 
 
-def _backup_over_1080_video(video_path):
-    """把超標原檔移到 output/00_temp 備份，避免重下載前遺失。"""
-    relative_parent = os.path.relpath(
-        os.path.dirname(os.path.abspath(video_path)),
-        str(OUTPUT_ROOT),
-    )
-    backup_dir = os.path.join(
-        WORK_TEMP_DIR,
-        "over-1080-backup",
-        relative_parent,
-    )
-    os.makedirs(backup_dir, exist_ok=True)
-    destination = os.path.join(backup_dir, os.path.basename(video_path))
-    if os.path.exists(destination):
-        stem, ext = os.path.splitext(destination)
-        destination = (
-            f"{stem}.{datetime.now():%Y%m%d-%H%M%S}{ext}"
-        )
-    shutil.move(video_path, destination)
-    return destination
-
-
-def _grid_for_video_in_directory(video_path, directory):
-    """依去編號後檔名尋找同名九宮格。"""
-    video_stem = os.path.splitext(os.path.basename(video_path))[0].casefold()
-    for grid_path in glob.glob(os.path.join(directory, "*.jpg")):
-        grid_stem = os.path.splitext(os.path.basename(grid_path))[0]
-        normalized = re.sub(r"^\d{4}-", "", grid_stem).casefold()
-        if normalized == video_stem:
-            return grid_path
-    return None
-
-
-def prepare_over_1080_redownloads():
-    """備份現有超標影片、還原九宮格，回傳只需重下載的九宮格。"""
-    selected_grids = []
-    search_dirs = [
-        VIDEO_DIR,
-        _pipeline_dir(VIDEO_DIR),
-    ]
-    for directory in search_dirs:
-        for video_path in sorted(glob.glob(os.path.join(directory, "*.mp4"))):
-            if os.path.basename(video_path).startswith("."):
-                continue
-            dimensions = probe_video_dimensions(video_path)
-            if (
-                dimensions is None
-                or is_within_1080p_dimensions(*dimensions)
-            ):
-                continue
-
-            archived_grid = _archived_grid_for_video(video_path)
-            local_grid = _grid_for_video_in_directory(
-                video_path,
-                VIDEO_DIR,
-            ) or os.path.join(
-                VIDEO_DIR, os.path.basename(archived_grid)
-            )
-            source_grid = (
-                archived_grid
-                if os.path.exists(archived_grid)
-                else local_grid
-            )
-            if (
-                not os.path.exists(source_grid)
-                or not get_video_url_from_image(source_grid)
-            ):
-                print(
-                    f"[!] 發現 {dimensions[0]}×{dimensions[1]} 超標影片，"
-                    f"但找不到含 URL 的九宮格，為安全起見先保留："
-                    f"{os.path.basename(video_path)}"
-                )
-                continue
-
-            backup_path = _backup_over_1080_video(video_path)
-            if os.path.abspath(source_grid) != os.path.abspath(local_grid):
-                os.makedirs(os.path.dirname(local_grid), exist_ok=True)
-                shutil.move(source_grid, local_grid)
-            if local_grid not in selected_grids:
-                selected_grids.append(local_grid)
-
-            partial_hardsub = os.path.join(
-                os.path.dirname(video_path),
-                f".{os.path.splitext(os.path.basename(video_path))[0]}"
-                ".hardsub.tmp.mp4",
-            )
-            if os.path.exists(partial_hardsub):
-                os.remove(partial_hardsub)
-                print(
-                    "   [CLEAN] 已移除停止工作留下的未完成硬字幕暫存檔"
-                )
-            print(
-                f"[REQUEUE] {dimensions[0]}×{dimensions[1]} 已備份至 "
-                f"{backup_path}，九宮格已排入 1080P 重下載"
-            )
-
-    backup_root = os.path.join(WORK_TEMP_DIR, "over-1080-backup")
-    for backup_video in glob.glob(
-        os.path.join(backup_root, "**", "*.mp4"),
-        recursive=True,
-    ):
-        basename = os.path.basename(backup_video)
-        if os.path.exists(os.path.join(VIDEO_DIR, basename)):
-            continue
-        if os.path.exists(
-            os.path.join(_pipeline_dir(VIDEO_DIR), basename)
-        ):
-            continue
-        local_grid = _grid_for_video_in_directory(
-            backup_video,
-            VIDEO_DIR,
-        )
-        if (
-            local_grid
-            and get_video_url_from_image(local_grid)
-            and local_grid not in selected_grids
-        ):
-            selected_grids.append(local_grid)
-            print(
-                f"[RESUME] 接續先前未成功的 1080P 重下載：{basename}"
-            )
-    return selected_grids
-
-
-class SubtitleWorker:
-    """以獨立 MOSS 程序處理字幕，下載主流程可持續抓下一支。"""
-
-    def __init__(self):
-        python = os.getenv("MOSS_PYTHON", DEFAULT_MOSS_PYTHON)
-        if not os.path.exists(python):
-            raise RuntimeError(
-                f"找不到 MOSS 字幕環境：{python}。請先執行 00_setup_or_update.bat。"
-            )
-        worker_env = os.environ.copy()
-        worker_env["PYTHONUTF8"] = "1"
-        self.process = subprocess.Popen(
-            [python, os.path.join(ROOT, "subtitle_worker.py")],
-            cwd=ROOT,
-            stdin=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            env=worker_env,
-        )
-        self.closed = False
-        self.queued = set()
-
-    def enqueue(
-        self,
-        video_path,
-        final_video_path,
-        grid_path,
-        is_low_quality=False,
-        archive_grid=None,
-    ):
-        if self.closed or self.process.stdin is None:
-            raise RuntimeError("字幕工作者已關閉。")
-        if self.process.poll() is not None:
-            raise RuntimeError(
-                f"字幕工作者已提前結束，ExitCode={self.process.returncode}。"
-            )
-        queue_key = os.path.normcase(os.path.abspath(final_video_path))
-        if queue_key in self.queued:
-            print(
-                f"   [QUEUE SKIP] 已在字幕佇列："
-                f"{os.path.basename(final_video_path)}",
-                flush=True,
-            )
-            return
-        staged_srt = os.path.splitext(video_path)[0] + ".srt"
-        final_srt = os.path.splitext(final_video_path)[0] + ".srt"
-        if (
-            os.path.abspath(staged_srt) != os.path.abspath(final_srt)
-            and os.path.exists(final_srt)
-            and not os.path.exists(staged_srt)
-        ):
-            shutil.move(final_srt, staged_srt)
-            print(
-                f"   [MIGRATE] 舊 SRT 已移至字幕暫存："
-                f"{os.path.basename(staged_srt)}",
-                flush=True,
-            )
-        job = {
-            "video": os.path.abspath(video_path),
-            "final_video": os.path.abspath(final_video_path),
-            "grid": os.path.abspath(grid_path),
-            "archive_dir": ARCHIVE_DIR,
-            "archive_grid": (
-                not bool(is_low_quality)
-                if archive_grid is None
-                else bool(archive_grid)
-            ),
-            "is_low_quality": bool(is_low_quality),
-        }
-        self.process.stdin.write(json.dumps(job, ensure_ascii=False) + "\n")
-        self.process.stdin.flush()
-        self.queued.add(queue_key)
-        print(
-            f"   [QUEUE] 已交給背景字幕管線：{os.path.basename(final_video_path)}",
-            flush=True,
-        )
-
-    def close(self):
-        if self.closed:
-            return self.process.returncode or 0
-        self.closed = True
-        if self.process.stdin is not None:
-            try:
-                self.process.stdin.close()
-            except BrokenPipeError:
-                pass
-        return self.process.wait()
-
-
-def get_low_video_sample_range(duration):
-    """超過一分鐘取 30–60 秒，否則維持取影片開頭 30 秒。"""
-    try:
-        duration = float(duration)
-    except (TypeError, ValueError):
-        duration = 0
-    return (30, 60) if duration > 60 else (0, 30)
-
-
-def low_video_download_ranges(info_dict, ydl):
-    """依 yt-dlp 取得的影片總長度動態選擇 LOW VIDEO 下載區間。"""
-    start, end = get_low_video_sample_range(info_dict.get("duration"))
-    ydl.to_screen(f"[info] LOW VIDEO 取樣區間：{start}–{end} 秒")
-    yield {"start_time": start, "end_time": end}
-
-
-def probe_stream_duration(stream_url, headers):
-    """供 FFmpeg 備援路徑查詢直連影片長度；失敗時回傳 None。"""
-    command = [
-        "ffprobe",
-        "-v", "error",
-        "-headers", headers,
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        stream_url,
-    ]
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode == 0:
-            return float(result.stdout.strip())
-    except (FileNotFoundError, subprocess.SubprocessError, ValueError):
-        pass
-    return None
-
-
-def is_http_video_url(url):
-    """接受可交由 yt-dlp 處理的完整 HTTP/HTTPS 網址。"""
-    if not isinstance(url, str):
-        return False
-    parsed = urllib.parse.urlparse(url.strip())
-    return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
-
-
-def get_video_url_from_image(jpg_path):
-    """直接從九宮格 JPG 圖片檔案的 EXIF Metadata (ImageDescription 0x010e) 中讀取影片 URL"""
-    try:
-        with Image.open(jpg_path) as img:
-            exif = img.getexif()
-            url = exif.get(0x010e)
-            if is_http_video_url(url):
-                return url.strip()
-    except Exception:
-        pass
-    return None
-
-
-def has_completed_subtitle(video_path, require_srt=False):
-    """只有非 failed 的雙字幕 Meta，及必要外掛 SRT，才是完整成品。"""
-    try:
-        meta = video_meta.read_mp4_meta(video_path)
-        status = meta.get("subtitle_status") or {}
-        if status.get("outcome") == "failed":
-            return False
-        meta_complete = bool(
-            meta.get("original_srt_present")
-            and meta.get("translated_srt_present")
-        )
-        translated = meta.get("translated_srt") or ""
-        srt_complete = (
-            not require_srt
-            or not translated.strip()
-            or os.path.exists(os.path.splitext(video_path)[0] + ".srt")
-        )
-        return meta_complete and srt_complete
-    except Exception:
-        return False
-
-
-def needs_subtitle_retry(video_path, require_srt=None):
-    """舊 SRT、failed Meta 或缺少雙字幕 Meta 都需要重新處理。"""
-    if require_srt is None:
-        parent_name = os.path.basename(
-            os.path.dirname(os.path.abspath(video_path))
-        ).casefold()
-        require_srt = parent_name != PREVIEW_VIDEOS_DIR.name.casefold()
-    return not has_completed_subtitle(video_path, require_srt=require_srt)
-
-
-def _archived_grid_for_video(video_path):
-    stem = os.path.splitext(os.path.basename(video_path))[0].casefold()
-    for grid in glob.glob(os.path.join(ARCHIVE_DIR, "*.jpg")):
-        grid_stem = os.path.splitext(os.path.basename(grid))[0]
-        normalized = re.sub(r"^\d{4}-", "", grid_stem).casefold()
-        if normalized == stem:
-            return grid
-    return os.path.join(ARCHIVE_DIR, f"{stem}.jpg")
-
-
-def enqueue_official_subtitle_retries(
-    target_dir,
-    is_low_quality,
-    subtitle_worker,
-):
-    """排入舊 SRT／failed 影片；正式影片留在 03_videos。"""
-    pipeline_dir = _pipeline_dir(target_dir)
-    os.makedirs(pipeline_dir, exist_ok=True)
-    queued = 0
-    for final_video in sorted(glob.glob(os.path.join(target_dir, "*.mp4"))):
-        if not needs_subtitle_retry(final_video):
-            continue
-        staged_video = os.path.join(pipeline_dir, os.path.basename(final_video))
-        if is_low_quality:
-            if os.path.exists(staged_video):
-                print(
-                    f"   [RETRY SKIP] 暫存影片已存在："
-                    f"{os.path.basename(staged_video)}"
-                )
-                continue
-            shutil.move(final_video, staged_video)
-            job_video = staged_video
-        else:
-            job_video = final_video
-        grid = (
-            os.path.splitext(final_video)[0] + ".jpg"
-            if is_low_quality
-            else _archived_grid_for_video(final_video)
-        )
-        subtitle_worker.enqueue(
-            job_video,
-            final_video,
-            grid,
-            is_low_quality=is_low_quality,
-            archive_grid=False,
-        )
-        queued += 1
-    return queued
-
-
-def enqueue_staged_subtitle_retries(
-    target_dir,
-    is_low_quality,
-    subtitle_worker,
-):
-    """接手舊 pipeline；正式影片先發布，預覽影片維持暫存。"""
-    pipeline_dir = _pipeline_dir(target_dir)
-    queued = 0
-    for staged_video in sorted(
-        glob.glob(os.path.join(pipeline_dir, "*.mp4"))
-    ):
-        final_video = os.path.abspath(
-            os.path.join(target_dir, os.path.basename(staged_video))
-        )
-        if os.path.exists(final_video):
-            print(
-                f"   [RETRY CONFLICT] 正式與暫存影片同時存在，跳過："
-                f"{os.path.basename(staged_video)}"
-            )
-            continue
-        job_video = (
-            staged_video
-            if is_low_quality
-            else publish_official_video(staged_video, final_video)
-        )
-        grid = (
-            os.path.splitext(final_video)[0] + ".jpg"
-            if is_low_quality
-            else _archived_grid_for_video(final_video)
-        )
-        subtitle_worker.enqueue(
-            job_video,
-            final_video,
-            grid,
-            is_low_quality=is_low_quality,
-            archive_grid=False,
-        )
-        queued += 1
-    return queued
-
-
-def upgrade_media_web_meta(jpg_path, mp4_path, video_url, info=None):
-    """補齊影片與九宮格 WEB_META；失敗不影響下載結果。"""
-    try:
-        if info is None:
-            adapter = sites.get_adapter_for_url(video_url)
-            resolved = sites.resolve_playable(
-                adapter,
-                video_url,
-                purpose="info",
-                prefer_lowest=False,
-            )
-            info = resolved.get("info")
-        info = dict(info or {})
-        info.setdefault("webpage_url", video_url)
-        web_meta = video_meta.build_web_meta(info)
-        if os.path.exists(mp4_path):
-            video_meta.merge_write_mp4_meta(mp4_path, web_meta=web_meta)
-        was_legacy = video_meta.is_legacy_grid_jpg(jpg_path)
-        video_meta.write_grid_jpg_web_meta(jpg_path, web_meta, url=video_url)
-        label = "舊格式→已升級" if was_legacy else "已同步"
-        print(f"   [META] 九宮格 {label} WEB_META，影片 metadata 已補齊")
-    except Exception as exc:
-        print(f"   [!] 補齊 WEB_META 失敗（不影響影片）：{exc}")
-
 def process_single_directory(
     target_dir,
     is_low_quality,
     subtitle_worker,
     selected_jpgs=None,
 ):
-    """處理預覽或正式影片目錄中 JPG 內嵌 EXIF 網址的下載邏輯。"""
-    # 從名字為順序開始下載 (字母/數字自然排序)
-    jpg_files = (
+    """舊 API 相容層；既有正式片只補排字幕，新來源交給新 pipeline。"""
+    if is_low_quality:
+        return maintenance.process_single_directory(
+            target_dir,
+            is_low_quality,
+            subtitle_worker,
+            selected_jpgs=selected_jpgs,
+        )
+    jpgs = (
         sorted(selected_jpgs)
         if selected_jpgs is not None
         else sorted(glob.glob(os.path.join(target_dir, "*.jpg")))
     )
-    if not jpg_files:
-        return
-
-    mode_label = (
-        "最低解析度/動態30秒取樣"
-        if is_low_quality
-        else "最高 1080P"
-    )
-    print(f"[+] 開始為 [{target_dir}/] 依檔名順序讀取圖片內嵌 EXIF 網址並進行 {mode_label} 下載 (共 {len(jpg_files)} 張預覽圖)...\n")
-
-    success_count = 0
-    skipped_count = 0
-    failed_count = 0
-    prompted_upgrade = False
-
-    for idx, jpg_path in enumerate(jpg_files, 1):
-        image_name = os.path.basename(jpg_path)
-        
-        raw_name_no_ext = os.path.splitext(image_name)[0]
-        base_name_without_num = re.sub(r'^\d{4}-', '', raw_name_no_ext)
-        
-        # 預覽影片與九宮格同名；正式影片則移除前綴編號。
-        if is_low_quality:
-            video_file_basename = raw_name_no_ext + ".mp4"
-        else:
-            video_file_basename = base_name_without_num + ".mp4"
-            
-        final_video_file = os.path.join(target_dir, video_file_basename)
-        pipeline_dir_abs = _pipeline_dir(target_dir)
-        os.makedirs(pipeline_dir_abs, exist_ok=True)
-        staged_video_file = os.path.join(
-            pipeline_dir_abs, video_file_basename
-        )
-        os.makedirs(ARCHIVE_DIR, exist_ok=True)
-        video_url = get_video_url_from_image(jpg_path)
-        remove_invalid_video(staged_video_file, "暫存影片")
-        remove_invalid_video(final_video_file, "正式影片")
-
-        if os.path.exists(staged_video_file):
-            if os.path.exists(final_video_file):
-                if has_completed_subtitle(final_video_file):
-                    print(
-                        f"[{idx}/{len(jpg_files)}] [EXISTS] 正式成品已存在，"
-                        "暫存檔保留不覆寫"
-                    )
-                    subtitle_worker.enqueue(
-                        final_video_file,
-                        final_video_file,
-                        jpg_path,
-                        is_low_quality=is_low_quality,
-                    )
-                else:
-                    print(
-                        f"[{idx}/{len(jpg_files)}] [CONFLICT] 暫存與正式位置"
-                        "同時存在未完成影片，為避免覆寫已跳過"
-                    )
-                skipped_count += 1
-                continue
-            print(
-                f"[{idx}/{len(jpg_files)}] [RESUME] 找到未完成暫存影片："
-                f"{os.path.basename(staged_video_file)}"
-            )
-            if video_url:
-                upgrade_media_web_meta(
-                    jpg_path, staged_video_file, video_url
-                )
-            job_video = (
-                staged_video_file
-                if is_low_quality
-                else publish_official_video(
-                    staged_video_file,
-                    final_video_file,
-                )
-            )
-            subtitle_worker.enqueue(
-                job_video,
-                final_video_file,
-                jpg_path,
-                is_low_quality=is_low_quality,
-            )
-            skipped_count += 1
+    pending = []
+    for jpg in jpgs:
+        stem = re.sub(r"^\d{4}-", "", Path(jpg).stem)
+        video = os.path.join(target_dir, f"{stem}.mp4")
+        if not os.path.exists(video) or has_video_stream(video) is not True:
+            pending.append(jpg)
             continue
-
-        if os.path.exists(final_video_file):
-            print(f"[{idx}/{len(jpg_files)}] [EXISTS] 影片已存在: {os.path.basename(final_video_file)}")
-            if has_completed_subtitle(final_video_file):
-                if is_low_quality:
-                    print("   [DONE] low video 已完整完成，九宮格保留原位")
-                    skipped_count += 1
-                    continue
-                subtitle_worker.enqueue(
-                    final_video_file,
-                    final_video_file,
-                    jpg_path,
-                    is_low_quality=False,
-                )
-                skipped_count += 1
-                continue
-            if video_url:
-                upgrade_media_web_meta(jpg_path, final_video_file, video_url)
-            if is_low_quality:
-                shutil.move(final_video_file, staged_video_file)
-                job_video = staged_video_file
-                print(
-                    "   [STAGE] 未完成預覽影片已移至 "
-                    "output/00_temp/pipeline 繼續處理"
-                )
-            else:
-                job_video = final_video_file
-                print("   [QUEUE] 正式影片留在 03_videos，背景補齊字幕")
-            subtitle_worker.enqueue(
-                job_video,
-                final_video_file,
-                jpg_path,
-                is_low_quality=is_low_quality,
-            )
-            skipped_count += 1
-            continue
-
-        video_title = base_name_without_num
-
-        if not video_url:
-            print(f"[{idx}/{len(jpg_files)}] [SKIP] 九宮格圖片未內嵌影片 URL Metadata，跳過該圖片: {image_name}\n")
-            skipped_count += 1
-            continue
-
-        print(f"[{idx}/{len(jpg_files)}] 正在啟動下載 ({mode_label}): {video_title}")
-        print(f"   - 圖片 Metadata 讀取網址: {video_url}")
-        print(f"   - 暫存路徑: {staged_video_file}")
-        print(f"   - 完成路徑: {final_video_file}")
-
-        fmt_spec = (
-            "worstvideo+worstaudio/worst"
-            if is_low_quality
-            else HIGH_VIDEO_FORMAT
+        url = get_video_url_from_image(jpg)
+        if url:
+            upgrade_media_web_meta(jpg, video, url)
+        subtitle_worker.enqueue(
+            video,
+            video,
+            jpg,
+            is_low_quality=False,
         )
-        temp_dir_abs = WORK_TEMP_DIR
-        os.makedirs(temp_dir_abs, exist_ok=True)
-        temp_thumb_template = os.path.join(temp_dir_abs, f"thumb_{idx}_%(id)s.%(ext)s")
-
-        purpose = "download_low" if is_low_quality else "download_full"
-        adapter = sites.get_adapter_for_url(video_url)
-        ydl_opts = {
-            'format': fmt_spec,
-            'paths': {
-                'home': pipeline_dir_abs,
-                'temp': temp_dir_abs,
-            },
-            'outtmpl': {
-                'default': video_file_basename,
-                'thumbnail': temp_thumb_template
-            },
-            'quiet': False,
-            'no_warnings': True,
-            'socket_timeout': DOWNLOAD_SOCKET_TIMEOUT,
-            'retries': DOWNLOAD_RETRIES,
-            'fragment_retries': DOWNLOAD_RETRIES,
-            'extractor_retries': DOWNLOAD_RETRIES,
-            'file_access_retries': DOWNLOAD_RETRIES,
-        }
-        ydl_opts.update(adapter.ydl_opts(purpose))
-        if not is_low_quality:
-            ydl_opts["format_sort"] = HIGH_VIDEO_FORMAT_SORT
-
-        # 正式影片模式（最高畫質）內嵌縮圖封面。
-        if not is_low_quality:
-            ydl_opts['writethumbnail'] = True
-            ydl_opts['postprocessors'] = [{
-                'key': 'EmbedThumbnail',
-                'already_have_thumbnail': False,
-            }]
-        else:
-            ydl_opts['writethumbnail'] = False
-
-        # 預覽影片模式：超過 60 秒下載 30–60 秒，否則下載 0–30 秒。
-        if is_low_quality:
-            ydl_opts['download_ranges'] = low_video_download_ranges
-
-        download_success = False
-        try:
-            # Optional adapter stream (Tier 3): direct ffmpeg path when yt-dlp alone is insufficient.
-            stream = adapter.resolve_stream(video_url, prefer_lowest=is_low_quality)
-            if stream and stream.get("url"):
-                print(f"   [i] 使用 {adapter.name} resolve_stream 下載")
-                temp_ffmpeg_file = os.path.join(
-                    temp_dir_abs, f"stream_{idx}_{video_file_basename}"
-                )
-                headers = stream.get("http_headers") or {}
-                ua = headers.get("User-Agent", "Mozilla/5.0")
-                header_lines = "".join(
-                    f"{k}: {v}\r\n"
-                    for k, v in headers.items()
-                    if k.lower() != "user-agent"
-                )
-                ff_cmd = [
-                    "ffmpeg",
-                    "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
-                    "-allowed_segment_extensions", "ALL",
-                    "-rw_timeout", str(DOWNLOAD_SOCKET_TIMEOUT * 1_000_000),
-                    "-user_agent", ua,
-                    "-y",
-                ]
-                if header_lines:
-                    ff_cmd.extend(["-headers", header_lines])
-                if is_low_quality:
-                    hdr_str = header_lines
-                    duration = probe_stream_duration(stream["url"], hdr_str)
-                    start, end = get_low_video_sample_range(duration)
-                    ff_cmd.extend([
-                        "-ss", str(start),
-                        "-i", stream["url"],
-                        "-t", str(end - start),
-                        "-c", "copy",
-                        temp_ffmpeg_file,
-                    ])
-                else:
-                    ff_cmd.extend(["-i", stream["url"], "-c", "copy", temp_ffmpeg_file])
-                res_ff = subprocess.run(ff_cmd, timeout=2 * 60 * 60)
-                if (
-                    res_ff.returncode == 0
-                    and os.path.exists(temp_ffmpeg_file)
-                    and has_video_stream(temp_ffmpeg_file) is True
-                    and (
-                        is_low_quality
-                        or is_video_within_1080p(temp_ffmpeg_file) is True
-                    )
-                ):
-                    shutil.move(temp_ffmpeg_file, staged_video_file)
-                    download_success = True
-                elif os.path.exists(temp_ffmpeg_file):
-                    remove_invalid_video(temp_ffmpeg_file, "adapter stream 暫存")
-
-            if not download_success:
-                download_with_416_recovery(
-                    video_url,
-                    ydl_opts,
-                    temp_dir_abs,
-                    video_file_basename,
-                )
-                download_success = (
-                    os.path.exists(staged_video_file)
-                    and has_video_stream(staged_video_file) is True
-                    and (
-                        is_low_quality
-                        or is_video_within_1080p(staged_video_file) is True
-                    )
-                )
-            if not download_success:
-                print(
-                    "   [!] yt-dlp 結束但影片無效，或解析度超過 1080P。"
-                )
-                remove_invalid_video(staged_video_file, "yt-dlp 暫存影片")
-                if (
-                    os.path.exists(staged_video_file)
-                    and not is_low_quality
-                    and is_video_within_1080p(staged_video_file) is False
-                ):
-                    os.remove(staged_video_file)
-                    print("   [LIMIT] 已移除超過 1080P 的下載暫存檔")
-                raise RuntimeError("yt-dlp 未產生有效 video stream")
-        except Exception as e:
-            err_str = str(e)
-            print(f"   [!] yt-dlp 下載過程觸發異常: {e}")
-            if "410" in err_str or "Gone" in err_str:
-                if not prompted_upgrade:
-                    print("=" * 65)
-                    print("[!] 警告: 本機的 yt-dlp 套件版本過舊，觸發了 HTTP Error 410 錯誤！")
-                    print("[!] 請在控制台 (CMD/PowerShell) 執行以下指令進行升級：")
-                    print("    pip install --upgrade yt-dlp")
-                    print("=" * 65)
-                    prompted_upgrade = True
-
-        if download_success:
-            print(f"  [OK] 影片下載至暫存 -> {os.path.basename(staged_video_file)}")
-            upgrade_media_web_meta(jpg_path, staged_video_file, video_url)
-            job_video = (
-                staged_video_file
-                if is_low_quality
-                else publish_official_video(
-                    staged_video_file,
-                    final_video_file,
-                )
-            )
-            subtitle_worker.enqueue(
-                job_video,
-                final_video_file,
-                jpg_path,
-                is_low_quality=is_low_quality,
-            )
-            success_count += 1
-        else:
-            print(f"  [FAIL] 影片下載失敗: {video_url}\n")
-            failed_count += 1
-
-    print(
-        f"[*] [{target_dir}/] 處理完成: 成功下載 {success_count} 部 | "
-        f"已存在/跳過 {skipped_count} 部 | 失敗 {failed_count} 部"
-    )
-    return failed_count
-
-def run_download_process(
-    retry_subtitles=False,
-    repair_over_1080=False,
-):
-    """主下載流程控制"""
-    print(f"==================================================")
-    print(f"   多站雙畫質原影片下載器 (EXIF URL + site registry)")
-    print(f"==================================================")
-
-    ensure_output_directories()
-
-    over_1080_jpgs = (
-        []
-        if retry_subtitles
-        else prepare_over_1080_redownloads()
-    )
-    low_jpgs = glob.glob(os.path.join(LOW_VIDEO_DIR, "*.jpg"))
-    high_jpgs = glob.glob(os.path.join(VIDEO_DIR, "*.jpg"))
-
-    if repair_over_1080 and not over_1080_jpgs:
-        print("[OK] 沒有發現需要重下載的超過 1080P 影片。")
-        return 0
-
-    if (
-        not retry_subtitles
-        and not repair_over_1080
-        and not low_jpgs
-        and not high_jpgs
-    ):
-        print("[!] output/02_preview_videos 與 output/03_videos 都找不到九宮格 JPG！")
-        print("[i] 請將九宮格移入對應目錄後再次執行。")
-        return 0
-
-    print(
-        f"[+] 檢測到 02_preview_videos ({len(low_jpgs)} 張) | "
-        f"03_videos ({len(high_jpgs)} 張)\n"
-    )
-
-    download_failures = 0
-    try:
-        subtitle_worker = SubtitleWorker()
-    except Exception as exc:
-        print(f"[錯誤] 無法啟動字幕管線：{exc}", file=sys.stderr)
-        return 2
-
-    try:
-        if retry_subtitles:
-            queued = 0
-            for target_dir, is_low in (
-                (LOW_VIDEO_DIR, True),
-                (VIDEO_DIR, False),
-            ):
-                queued += enqueue_official_subtitle_retries(
-                    target_dir,
-                    is_low,
-                    subtitle_worker,
-                )
-                queued += enqueue_staged_subtitle_retries(
-                    target_dir,
-                    is_low,
-                    subtitle_worker,
-                )
-            print(f"[*] 字幕修復模式共排入 {queued} 支影片")
-        # 【階段一】優先處理預覽影片目錄（最低畫質）
-        if not retry_subtitles and not repair_over_1080 and low_jpgs:
-            print("==================================================")
-            print(" [階段 1/2] 開始處理 02_preview_videos（最低解析度／動態30秒取樣）")
-            print("==================================================")
-            download_failures += process_single_directory(
-                LOW_VIDEO_DIR, is_low_quality=True,
-                subtitle_worker=subtitle_worker,
-            ) or 0
-
-        if not retry_subtitles and not repair_over_1080:
-            enqueue_official_subtitle_retries(
-                VIDEO_DIR,
-                False,
-                subtitle_worker,
-            )
-            enqueue_staged_subtitle_retries(
-                VIDEO_DIR,
-                False,
-                subtitle_worker,
-            )
-
-        # 【階段二】處理正式影片目錄（最高畫質）
-        selected_high_jpgs = (
-            over_1080_jpgs if repair_over_1080 else high_jpgs
-        )
-        if not retry_subtitles and selected_high_jpgs:
-            print("\n==================================================")
-            print(" [階段 2/2] 開始處理 03_videos（最高畫質下載）")
-            print("==================================================")
-            download_failures += process_single_directory(
-                VIDEO_DIR, is_low_quality=False,
-                subtitle_worker=subtitle_worker,
-                selected_jpgs=(
-                    selected_high_jpgs
-                    if repair_over_1080
-                    else None
-                ),
-            ) or 0
-    finally:
-        print("\n[*] 下載佇列完成，等待背景字幕管線處理剩餘影片...")
-        subtitle_exit = subtitle_worker.close()
-
-    print("\n==================================================")
-    if subtitle_exit:
-        print("[未完成] 部分字幕流程失敗，相關九宮格保留在原資料夾。")
-        return subtitle_exit
-    if download_failures:
-        print(
-            f"[未完成] 有 {download_failures} 支影片下載失敗，"
-            "九宮格已保留供下次重試。"
-        )
-        return 3
-    print("[ALL DONE] 下載、完整字幕與九宮格歸檔全數完成！")
+    if pending:
+        return maintenance.process_official_directory(selected_jpgs=pending)
     return 0
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+
+def enqueue_staged_subtitle_retries(target_dir, is_low_quality, subtitle_worker):
+    """相容舊暫存目錄；正式片先發布，再補排字幕。"""
+    pipeline_dir = _pipeline_dir(target_dir)
+    queued = 0
+    for staged in sorted(glob.glob(os.path.join(pipeline_dir, "*.mp4"))):
+        final_video = os.path.join(target_dir, os.path.basename(staged))
+        if os.path.exists(final_video):
+            continue
+        final_video = publish_official_video(staged, final_video)
+        grid = maintenance._archived_grid_for_video(final_video)
+        subtitle_worker.enqueue(
+            final_video,
+            final_video,
+            grid,
+            is_low_quality=is_low_quality,
+            archive_grid=False,
+        )
+        queued += 1
+    return queued
+
+
+def run_download_process(
+    retry_subtitles: bool = False,
+    repair_over_1080: bool = False,
+    *,
+    stage_names: list[str] | None = None,
+    options: FeatureSwitches | None = None,
+) -> int:
+    """程式化入口；維護模式與三層流程明確分流。"""
+    if retry_subtitles or repair_over_1080:
+        return maintenance.run_download_process(
+            retry_subtitles=retry_subtitles,
+            repair_over_1080=repair_over_1080,
+        )
+    failures = run_stages(
+        stage_names or ["preview", "video", "chosen"],
+        options or FeatureSwitches(),
+    )
+    return 3 if failures else 0
+
+
+def _boolean_switch(parser: argparse.ArgumentParser, name: str, help_text: str) -> None:
+    parser.add_argument(
+        f"--{name}",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=help_text,
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Preview → Video → Chosen 三層預算下載控制器"
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="逐層顯示檔案並詢問是否執行",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="只列出各層檔案與待處理數量，不下載",
+    )
+    parser.add_argument(
+        "--stages",
+        nargs="+",
+        metavar="STAGE",
+        help="指定 preview、video、chosen；可用空白或逗號分隔",
+    )
+    _boolean_switch(parser, "translation", "開啟或關閉 OpenRouter 翻譯")
+    _boolean_switch(parser, "asr", "開啟或關閉語音辨識")
+    _boolean_switch(parser, "subtitles", "開啟或關閉外掛 SRT 輸出")
+    _boolean_switch(parser, "dialogue-trim", "開啟或關閉依對白剪片")
+    _boolean_switch(parser, "enhance", "開啟或關閉音訊增強")
+    _boolean_switch(parser, "metadata", "開啟或關閉 MP4/JPG Metadata 寫入")
+    _boolean_switch(parser, "archive", "開啟或關閉完成後九宮格歸檔")
+    _boolean_switch(parser, "keep-work", "開啟或關閉保留 pipeline 工作檔")
+    _boolean_switch(parser, "reuse-cache", "開啟或關閉重用 ASR 字幕快取")
+    _boolean_switch(parser, "force", "開啟或關閉強制重跑既有成品")
+    parser.add_argument(
+        "--preview-seconds",
+        type=int,
+        metavar="SECONDS",
+        help="Preview 下載秒數，預設 180",
+    )
+    parser.add_argument(
+        "--video-height", type=int, metavar="P", help="Video 解析度高度，預設 480"
+    )
+    parser.add_argument(
+        "--chosen-height", type=int, metavar="P", help="Chosen 解析度高度，預設 1080"
+    )
+    parser.add_argument(
+        "--asr-backend",
+        choices=("whisper", "moss", "voxtral", "grok-stt"),
+        help="覆寫所選層級的 ASR backend",
+    )
+    parser.add_argument(
+        "--translation-model",
+        metavar="MODEL",
+        help="覆寫 OpenRouter 翻譯 model",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("none", "minimal", "low", "medium", "high"),
+        help="覆寫翻譯 reasoning effort",
+    )
+    parser.add_argument(
+        "--trim-threshold",
+        type=float,
+        metavar="SECONDS",
+        help="啟動對白剪片所需的淨對白秒數，預設 30",
+    )
+    parser.add_argument(
+        "--segment-gap",
+        type=float,
+        metavar="SECONDS",
+        help="合併相鄰對白區段的間隔秒數，預設 1.5",
+    )
     parser.add_argument(
         "--retry-subtitles",
         action="store_true",
-        help="只重跑舊 SRT、failed Meta 與未完成字幕，不下載新影片",
+        help="只修復舊字幕，不下載新影片",
     )
     parser.add_argument(
         "--repair-over-1080",
         action="store_true",
-        help="只備份並重下載現有超過等效 1080P 的影片",
+        help="只備份並重下載超過等效 1080P 的影片",
     )
-    args = parser.parse_args()
-    raise SystemExit(
-        run_download_process(
+    parser.add_argument("--grid", type=Path, help="只處理指定九宮格")
+    parser.add_argument(
+        "--keep-proxy",
+        action="store_true",
+        help="搭配 --grid 保留代理工作檔",
+    )
+    return parser
+
+
+def run_maintenance(args: argparse.Namespace) -> int | None:
+    if args.grid:
+        import full_video_pipeline
+
+        ensure_output_directories()
+        options = resolve_stage_options(
+            "video",
+            FeatureSwitches(
+                asr=args.asr,
+                subtitles=args.subtitles,
+                translation=args.translation,
+                dialogue_trim=args.dialogue_trim,
+                enhance=args.enhance,
+                metadata=args.metadata,
+                archive_grid=args.archive,
+                keep_work=args.keep_work,
+                reuse_cache=args.reuse_cache,
+                force=args.force,
+                video_height=args.video_height,
+                asr_backend=args.asr_backend,
+                translation_model=args.translation_model,
+                reasoning_effort=args.reasoning_effort,
+                trim_threshold=args.trim_threshold,
+                segment_gap=args.segment_gap,
+            ),
+        )
+        try:
+            validate_stage_options("video", options)
+            with feature_environment(options):
+                full_video_pipeline.process_full_video_from_grid(
+                    args.grid.resolve(),
+                    final_dir=VIDEOS_DIR,
+                    archive_dir=DOWNLOADED_DIR,
+                    keep_proxy=args.keep_proxy or options.keep_work,
+                    max_height=options.video_height,
+                    enable_enhance=options.enhance,
+                    enable_asr=options.asr,
+                    export_subtitles=options.subtitles,
+                    enable_dialogue_trim=options.dialogue_trim,
+                    enable_translation=options.translation,
+                    enable_metadata=options.metadata,
+                    archive_grid_on_done=options.archive_grid,
+                    dialogue_trim_threshold=options.trim_threshold,
+                    segment_gap=options.segment_gap,
+                    force=options.force,
+                )
+            return 0
+        except Exception as exc:
+            print(f"[FAIL] {exc}", file=sys.stderr)
+            return 1
+    if args.retry_subtitles or args.repair_over_1080:
+        return maintenance.run_download_process(
             retry_subtitles=args.retry_subtitles,
             repair_over_1080=args.repair_over_1080,
         )
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    for name in (
+        "preview_seconds",
+        "video_height",
+        "chosen_height",
+        "trim_threshold",
+    ):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            parser.error(f"--{name.replace('_', '-')} 必須大於 0")
+    if args.segment_gap is not None and args.segment_gap < 0:
+        parser.error("--segment-gap 不得小於 0")
+    if args.interactive and args.list:
+        parser.error("--interactive 不能與 --list 同時使用")
+    if args.retry_subtitles and args.repair_over_1080:
+        parser.error("--retry-subtitles 不能與 --repair-over-1080 同時使用")
+    if args.keep_proxy and not args.grid:
+        parser.error("--keep-proxy 只能搭配 --grid")
+    if args.grid and (args.stages or args.interactive or args.list):
+        parser.error("--grid 不能混用 --stages、--interactive 或 --list")
+    if args.list and any(
+        getattr(args, name) is not None
+        for name in (
+            "asr",
+            "subtitles",
+            "translation",
+            "dialogue_trim",
+            "enhance",
+            "metadata",
+            "archive",
+            "keep_work",
+            "reuse_cache",
+            "force",
+            "preview_seconds",
+            "video_height",
+            "chosen_height",
+            "asr_backend",
+            "translation_model",
+            "reasoning_effort",
+            "trim_threshold",
+            "segment_gap",
+        )
+    ):
+        parser.error("--list 只盤點檔案，不能混用功能開關")
+    if (args.retry_subtitles or args.repair_over_1080) and (
+        args.grid
+        or args.stages
+        or args.interactive
+        or args.list
+        or any(
+            getattr(args, name) is not None
+            for name in (
+                "asr",
+                "subtitles",
+                "translation",
+                "dialogue_trim",
+                "enhance",
+                "metadata",
+                "archive",
+                "keep_work",
+                "reuse_cache",
+                "force",
+                "preview_seconds",
+                "video_height",
+                "chosen_height",
+                "asr_backend",
+                "translation_model",
+                "reasoning_effort",
+                "trim_threshold",
+                "segment_gap",
+            )
+        )
+    ):
+        parser.error("維護模式不能混用三層流程或功能開關")
+    maintenance_exit = run_maintenance(args)
+    if maintenance_exit is not None:
+        return maintenance_exit
+
+    try:
+        stages = parse_stage_names(args.stages)
+    except ValueError as exc:
+        print(f"錯誤：{exc}", file=sys.stderr)
+        return 2
+    if args.preview_seconds is not None and "preview" not in stages:
+        parser.error("--preview-seconds 只能用於 preview 層")
+    if args.video_height is not None and "video" not in stages:
+        parser.error("--video-height 只能用於 video 層")
+    if args.chosen_height is not None and "chosen" not in stages:
+        parser.error("--chosen-height 只能用於 chosen 層")
+    options = FeatureSwitches(
+        asr=args.asr,
+        subtitles=args.subtitles,
+        translation=args.translation,
+        dialogue_trim=args.dialogue_trim,
+        enhance=args.enhance,
+        metadata=args.metadata,
+        archive_grid=args.archive,
+        keep_work=args.keep_work,
+        reuse_cache=args.reuse_cache,
+        force=args.force,
+        preview_seconds=args.preview_seconds,
+        video_height=args.video_height,
+        chosen_height=args.chosen_height,
+        asr_backend=args.asr_backend,
+        translation_model=args.translation_model,
+        reasoning_effort=args.reasoning_effort,
+        trim_threshold=args.trim_threshold,
+        segment_gap=args.segment_gap,
     )
+    if args.list:
+        for stage in stages:
+            print_stage_inventory(stage)
+        return 0
+    try:
+        failures = (
+            run_interactive(options, stages)
+            if args.interactive
+            else run_stages(stages, options)
+        )
+    except ValueError as exc:
+        print(f"設定錯誤：{exc}", file=sys.stderr)
+        return 2
+    return 3 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

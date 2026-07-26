@@ -20,6 +20,8 @@ PREVIEW_IMAGES_DIR = OUTPUT_ROOT / "01_preview_images"
 PREVIEW_VIDEOS_DIR = OUTPUT_ROOT / "02_preview_videos"
 VIDEOS_DIR = OUTPUT_ROOT / "03_videos"
 DOWNLOADED_DIR = OUTPUT_ROOT / "04_downloaded"
+CHOSEN_DIR = OUTPUT_ROOT / "05_chosen"
+GOOD_DIR = OUTPUT_ROOT / "06_good"
 
 TASKS_DIR = PROJECT_ROOT / "tasks"
 APP_VENV_DIR = PROJECT_ROOT / ".venv"
@@ -38,5 +40,7 @@ def ensure_output_directories() -> None:
         PREVIEW_VIDEOS_DIR,
         VIDEOS_DIR,
         DOWNLOADED_DIR,
+        CHOSEN_DIR,
+        GOOD_DIR,
     ):
         directory.mkdir(parents=True, exist_ok=True)

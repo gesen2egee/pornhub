@@ -32,7 +32,8 @@ except Exception:
 RESULT_MARKER = "__SUBTITLE_JOB_RESULT__"
 DEFAULT_LOW_JOB_TIMEOUT = 15 * 60
 DEFAULT_JOB_TIMEOUT = 2 * 60 * 60
-DEFAULT_HIGH_MAX_TOKENS = 8192
+# 搭配 3 分鐘 ASR 切段；官方 CLI 預設 2048，密講話留到 4096。
+DEFAULT_HIGH_MAX_TOKENS = 4096
 
 
 def _positive_timeout(name: str, default: int) -> int:
@@ -183,7 +184,7 @@ class SubtitleRuntime:
 
         if run_subtitle._subtitle_complete(video):
             print("[字幕管線] 已有舊 SRT 或影片字幕 Meta，直接略過字幕", flush=True)
-            if not is_low_quality and not video.with_suffix(".srt").exists():
+            if not video.with_suffix(".srt").exists():
                 translated = run_subtitle._read_video_meta(video).get(
                     "translated_srt"
                 )
@@ -192,7 +193,7 @@ class SubtitleRuntime:
                         video.with_suffix(".srt"),
                         translated,
                     )
-            finalize_video(video, final_video, move_srt=not is_low_quality)
+            finalize_video(video, final_video, move_srt=True)
             finish_grid(grid, archive_dir, should_archive_grid)
             return
         legacy_srt = run_subtitle._subtitle_path(video)
@@ -208,6 +209,7 @@ class SubtitleRuntime:
                 prepared = prepare_audio_media([video])
                 media = prepared.get(video)
             backend = None if legacy_srt.exists() else self._load_backend()
+            # 預覽與正式片皆軟 SRT、不硬字幕
             run_subtitle.process_video(
                 video,
                 backend,
@@ -216,8 +218,8 @@ class SubtitleRuntime:
                 False,
                 media_input=media.media_input if media else video,
                 audio_enhanced=media.enhanced if media else False,
-                hard_subtitle=is_low_quality,
-                export_srt=not is_low_quality,
+                hard_subtitle=False,
+                export_srt=True,
             )
             subtitle_meta = run_subtitle._read_video_meta(video)
             if not (
@@ -240,7 +242,7 @@ class SubtitleRuntime:
             for item in prepared.values():
                 item.cleanup()
 
-        finalize_video(video, final_video, move_srt=not is_low_quality)
+        finalize_video(video, final_video, move_srt=True)
         finish_grid(grid, archive_dir, should_archive_grid)
 
 

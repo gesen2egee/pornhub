@@ -614,6 +614,48 @@ def _run_manifest(manifest: Path, result_path: Path) -> int:
     return 0
 
 
+def analyze_and_enhance_segments(
+    video: Path,
+    segments: list[tuple[float, float]],
+    sample_rate: int = 16_000,
+) -> list[dict]:
+    """
+    分段獨立偵測音訊是否符合增強條件。
+    傳回每個 segment 的獨立增強決策與檢測數據。
+    """
+    results = []
+    for idx, (start, end) in enumerate(segments):
+        dur = end - start
+        if dur <= 0:
+            continue
+        try:
+            sample_start = start + max(0.0, (dur - 4.0) / 2.0)
+            sample_dur = min(dur, 4.0)
+            audio = decode_audio_range(video, sample_start, sample_dur, sample_rate)
+            metrics = calculate_metrics([audio], sample_rate)
+
+            should_enhance = (metrics.rms_dbfs < -20.0 or metrics.stability_db < 8.0)
+            results.append({
+                "segment_index": idx,
+                "start": start,
+                "end": end,
+                "duration": round(dur, 2),
+                "should_enhance": should_enhance,
+                "rms_dbfs": round(metrics.rms_dbfs, 2),
+                "reason": "音量低或細節需修飾，建議 Enhance" if should_enhance else "音量穩定充沛，Pass 免 Enhance"
+            })
+        except Exception as e:
+            results.append({
+                "segment_index": idx,
+                "start": start,
+                "end": end,
+                "duration": round(dur, 2),
+                "should_enhance": False,
+                "reason": f"分段分析跳過: {str(e)}"
+            })
+    return results
+
+
 def main() -> int:
     import argparse
 

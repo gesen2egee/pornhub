@@ -1,4 +1,4 @@
-"""使用 OpenRouter Grok 4.5 將字幕翻譯為台灣繁體中文。"""
+"""使用 OpenRouter Grok 將字幕翻譯為繁體中文。"""
 
 from __future__ import annotations
 
@@ -14,9 +14,25 @@ import requests
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "x-ai/grok-4.5"
+# 預設給 03 標準片：4.3 + none（便宜）。精選 05 會覆寫成 4.5 + minimal。
+DEFAULT_MODEL = "x-ai/grok-4.3"
+# 預設每 60 條一批；設 0 或 TRANSLATE_BATCH_SIZE=0 則整份一次。
 DEFAULT_BATCH_SIZE = 60
 SPEAKER_LABEL_PATTERN = re.compile(r"^\s*\[S\d+\]\s*", re.IGNORECASE)
+# 扁平格式：每行「id|正文」（無 JSON 殼、無前後文）
+LINE_PATTERN = re.compile(r"^\s*(\d+)\s*[|｜]\s*(.*?)\s*$")
+
+# 最近一次 translate_cues 的用量統計（時間 / tokens / cost），供測試腳本讀取。
+LAST_TRANSLATE_STATS: dict[str, Any] = {}
+
+SYSTEM_PROMPT = (
+    "你是字幕校正與翻譯專家。每行格式為 id|原文（ASR 聽寫）。"
+    "先校正錯字/漏字/誤聽，再翻成自然口語的繁體中文。"
+    "輸出的 text 只能是繁體中文：禁止英文、日文、韓文、簡體或其他外語殘留。"
+    "只輸出譯文；保留原意、語氣與成人內容，不要摘要或加說明。"
+    "輸出格式必須與輸入相同：每行一條 id|譯文，id 不可改、不可漏、不可合併。"
+    "不要 Markdown、不要 JSON、不要前後文說明。"
+)
 
 
 def strip_speaker_labels(
@@ -55,9 +71,26 @@ def parse_srt(content: str) -> list[dict[str, Any]]:
 
 
 def format_srt(cues: list[dict[str, Any]]) -> str:
-    return "\n\n".join(
-        f"{cue['id']}\n{cue['time']}\n{cue['text']}" for cue in cues
-    ) + ("\n" if cues else "")
+    """組成標準 SRT（\\n 換行、cue 之間一個空行）。跳過空白正文。"""
+    blocks: list[str] = []
+    for cue in cues:
+        text = str(cue.get("text") or "").replace("\r\n", "\n").replace("\r", "\n")
+        text = "\n".join(
+            part.strip() for part in text.split("\n") if part.strip()
+        ).strip()
+        if not text:
+            continue
+        cue_id = cue.get("id", len(blocks) + 1)
+        time = str(cue.get("time") or "").strip()
+        blocks.append(f"{cue_id}\n{time}\n{text}")
+    # 重新編號，避免跳過空白後 id 不連續
+    renumbered: list[str] = []
+    for index, block in enumerate(blocks, 1):
+        _id, time, *text_parts = block.split("\n")
+        renumbered.append(
+            f"{index}\n{time}\n" + "\n".join(text_parts)
+        )
+    return "\n\n".join(renumbered) + ("\n" if renumbered else "")
 
 
 def _content_to_text(content: Any) -> str:
@@ -70,24 +103,96 @@ def _content_to_text(content: Any) -> str:
     return str(content)
 
 
-def _parse_json_array(content: str) -> list[dict[str, Any]]:
+def _format_flat_lines(items: list[dict[str, Any]]) -> str:
+    """id|text 每行一條；正文內換行壓成空白。"""
+    lines: list[str] = []
+    for item in items:
+        cue_id = int(item["id"])
+        text = str(item.get("text") or "").replace("\r\n", "\n")
+        text = " ".join(part.strip() for part in text.split("\n") if part.strip())
+        lines.append(f"{cue_id}|{text}")
+    return "\n".join(lines)
+
+
+def _parse_flat_lines(content: str) -> dict[int, str]:
+    """解析 id|譯文；相容舊 JSON array 回傳。"""
     content = content.strip()
     if content.startswith("```"):
         content = content.replace("```json", "", 1).replace("```", "").strip()
+
+    result: dict[int, str] = {}
+    # 優先扁平行
+    for raw in content.replace("\r\n", "\n").split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        match = LINE_PATTERN.match(line)
+        if not match:
+            continue
+        cue_id = int(match.group(1))
+        text = match.group(2).strip()
+        if text:
+            result[cue_id] = text
+    if result:
+        return result
+
+    # 後備：舊 JSON [{"id":1,"text":"..."}]
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:
         start = content.find("[")
         end = content.rfind("]")
         if start < 0 or end <= start:
-            raise ValueError("API 沒有回傳可解析的 JSON array")
-        parsed = json.loads(content[start : end + 1])
-
+            return {}
+        try:
+            parsed = json.loads(content[start : end + 1])
+        except json.JSONDecodeError:
+            return {}
     if isinstance(parsed, dict) and isinstance(parsed.get("translations"), list):
         parsed = parsed["translations"]
-    if not isinstance(parsed, list) or not all(isinstance(item, dict) for item in parsed):
-        raise ValueError("API 回傳格式不是 JSON array")
-    return parsed
+    if not isinstance(parsed, list):
+        return {}
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        if "id" not in item or "text" not in item:
+            continue
+        try:
+            cue_id = int(item["id"])
+        except (TypeError, ValueError):
+            continue
+        text = str(item["text"]).strip()
+        if text:
+            result[cue_id] = text
+    return result
+
+
+def _usage_from_response(data: dict[str, Any]) -> dict[str, Any]:
+    """從 OpenRouter chat.completions 回傳抽出 tokens / cost。"""
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    prompt = int(usage.get("prompt_tokens") or 0)
+    completion = int(usage.get("completion_tokens") or 0)
+    total = int(usage.get("total_tokens") or (prompt + completion))
+    cost = usage.get("cost")
+    if cost is None:
+        cost = data.get("cost")
+    try:
+        cost_f = float(cost) if cost is not None else None
+    except (TypeError, ValueError):
+        cost_f = None
+    details = usage.get("completion_tokens_details") or {}
+    reasoning_tokens = details.get("reasoning_tokens")
+    if reasoning_tokens is None:
+        reasoning_tokens = usage.get("native_tokens_reasoning")
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+        "reasoning_tokens": int(reasoning_tokens or 0),
+        "cost_usd": cost_f,
+        "model": data.get("model"),
+        "id": data.get("id"),
+    }
 
 
 def _translate_batch(
@@ -95,55 +200,29 @@ def _translate_batch(
     api_key: str,
     model: str,
     session: requests.Session,
-    context_before: list[dict[str, Any]] | None = None,
-    context_after: list[dict[str, Any]] | None = None,
+    stats_sink: list[dict[str, Any]] | None = None,
 ) -> dict[int, str]:
-    minimal_input = [{"id": cue["id"], "text": cue["text"]} for cue in cues]
-    user_payload = json.dumps(
-        {
-            "context_before": [
-                {"id": cue["id"], "text": cue["text"]}
-                for cue in (context_before or [])
-            ],
-            "items": minimal_input,
-            "context_after": [
-                {"id": cue["id"], "text": cue["text"]}
-                for cue in (context_after or [])
-            ],
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    body = {
+    items = [{"id": cue["id"], "text": cue["text"]} for cue in cues]
+    max_tokens = int(os.getenv("TRANSLATE_MAX_TOKENS", "32000"))
+    effort = os.getenv("TRANSLATE_REASONING_EFFORT", "none").strip() or "none"
+    # grok-4.5 等模型強制 reasoning，none 會 400；自動升到 minimal
+    model_l = model.casefold()
+    if effort == "none" and ("grok-4.5" in model_l or "grok-4-5" in model_l):
+        effort = "minimal"
+        print(
+            f"  [translate] {model} 不支援 reasoning=none，改用 minimal",
+            flush=True,
+        )
+    body_template = {
         "model": model,
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "你是字幕校正與翻譯專家。每個 text 可能是 Whisper 聽寫結果，"
-                    "請先依上下文校正錯字、漏字、同音誤聽、專有名詞與標點，"
-                    "再翻譯成自然、準確、口語流暢的台灣繁體中文。"
-                    "人名、角色名、暱稱與稱呼盡量翻成自然合適的繁體中文；"
-                    "有公認中文譯名時優先使用，沒有公認譯名時採自然音譯，"
-                    "只有品牌、帳號或無法合理翻譯的專有名稱才保留原文。"
-                    "翻譯結果只保留繁體中文，不要輸出校正原文。"
-                    "保留原意、語氣、成人內容與說話者情緒，不要摘要、解釋或審查；"
-                    "原文不確定時不要自行捏造內容。"
-                    "user 會提供 context_before、items、context_after；"
-                    "前後文只用於統一人名、語氣、指涉與用詞，"
-                    "只翻譯 items，禁止輸出前後文項目。"
-                    "只能回傳 JSON array，每個元素只能有 id 與 text，id 必須完全保留。"
-                    "不要使用 Markdown、不要加前後說明。"
-                ),
-            },
-            {
-                "role": "user",
-                "content": user_payload,
-            },
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": ""},
         ],
-        "reasoning": {"effort": "minimal", "exclude": True},
-        "max_tokens": 8000,
+        "reasoning": {"effort": effort, "exclude": True},
+        "max_tokens": max_tokens,
         "stream": False,
+        "usage": {"include": True},
     }
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -152,44 +231,124 @@ def _translate_batch(
         "X-Title": "pornhub subtitle translator",
     }
 
+    expected_ids = {int(cue["id"]) for cue in cues}
+    cue_by_id = {int(cue["id"]): cue for cue in cues}
+    result: dict[int, str] = {}
     last_error: Exception | None = None
-    for attempt in range(3):
-        try:
-            response = session.post(
-                OPENROUTER_URL,
-                headers=headers,
-                json=body,
-                timeout=(20, 300),
+    read_timeout = int(os.getenv("TRANSLATE_TIMEOUT_SECONDS", "600"))
+
+    def _post(batch_items: list[dict[str, Any]], *, note: str = "") -> dict[int, str]:
+        nonlocal last_error
+        user_content = _format_flat_lines(batch_items)
+        if note:
+            user_content = f"{note}\n{user_content}"
+        req_body = dict(body_template)
+        req_body["messages"] = [
+            body_template["messages"][0],
+            {"role": "user", "content": user_content},
+        ]
+        parsed_batch: dict[int, str] = {}
+        for attempt in range(3):
+            try:
+                t0 = time.perf_counter()
+                response = session.post(
+                    OPENROUTER_URL,
+                    headers=headers,
+                    json=req_body,
+                    timeout=(20, read_timeout),
+                )
+                wall = time.perf_counter() - t0
+                if response.status_code == 429 or response.status_code >= 500:
+                    raise RuntimeError(
+                        f"OpenRouter 暫時錯誤 HTTP {response.status_code}"
+                    )
+                if response.status_code == 400:
+                    err_text = (response.text or "")[:400]
+                    if (
+                        "reasoning" in err_text.casefold()
+                        and "mandatory" in err_text.casefold()
+                        and req_body.get("reasoning", {}).get("effort") == "none"
+                    ):
+                        req_body = dict(req_body)
+                        req_body["reasoning"] = {
+                            "effort": "minimal",
+                            "exclude": True,
+                        }
+                        print(
+                            "  [translate] reasoning=none 被拒，改 minimal 重試",
+                            flush=True,
+                        )
+                        response = session.post(
+                            OPENROUTER_URL,
+                            headers=headers,
+                            json=req_body,
+                            timeout=(20, read_timeout),
+                        )
+                        wall = time.perf_counter() - t0
+                    else:
+                        response.raise_for_status()
+                response.raise_for_status()
+                data = response.json()
+                usage_row = _usage_from_response(data)
+                usage_row["wall_sec"] = round(wall, 3)
+                usage_row["items"] = len(batch_items)
+                usage_row["attempt"] = attempt + 1
+                usage_row["note"] = note or "main"
+                usage_row["user_chars"] = len(user_content)
+                if stats_sink is not None:
+                    stats_sink.append(usage_row)
+                content = _content_to_text(data["choices"][0]["message"]["content"])
+                raw = _parse_flat_lines(content)
+                want = {int(item["id"]) for item in batch_items}
+                for cue_id, text in raw.items():
+                    if cue_id in want and text:
+                        parsed_batch[cue_id] = text
+                if parsed_batch:
+                    return parsed_batch
+                raise ValueError("API 回傳沒有可用的翻譯項目")
+            except (
+                requests.RequestException,
+                KeyError,
+                TypeError,
+                ValueError,
+                RuntimeError,
+            ) as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(2**attempt)
+                else:
+                    break
+        return parsed_batch
+
+    result.update(_post(items))
+
+    for refill in range(2):
+        missing = sorted(expected_ids - set(result))
+        if not missing:
+            break
+        print(
+            f"OpenRouter 翻譯補漏 round {refill + 1}：缺 {len(missing)} 條 "
+            f"（例：{missing[:8]}{'…' if len(missing) > 8 else ''}）",
+            flush=True,
+        )
+        refill_items = [
+            {"id": cue_by_id[i]["id"], "text": cue_by_id[i]["text"]}
+            for i in missing
+        ]
+        result.update(
+            _post(
+                refill_items,
+                note=f"# 補翻以下 {len(refill_items)} 條，每行 id|譯文全部回傳",
             )
-            if response.status_code == 429 or response.status_code >= 500:
-                raise RuntimeError(f"OpenRouter 暫時錯誤 HTTP {response.status_code}")
-            response.raise_for_status()
-            data = response.json()
-            content = data["choices"][0]["message"]["content"]
-            translated = _parse_json_array(_content_to_text(content))
-            expected_ids = {int(cue["id"]) for cue in cues}
-            result: dict[int, str] = {}
-            for item in translated:
-                if "id" not in item or "text" not in item:
-                    raise ValueError("API 回傳項目缺少 id 或 text")
-                cue_id = int(item["id"])
-                text = str(item["text"]).strip()
-                if cue_id not in expected_ids or not text:
-                    raise ValueError("API 回傳了無效字幕編號或空白翻譯")
-                if cue_id in result:
-                    raise ValueError("API 重複回傳字幕編號")
-                result[cue_id] = text
-            if set(result) != expected_ids:
-                missing = sorted(expected_ids - set(result))
-                raise ValueError(f"API 遺漏字幕編號：{missing}")
-            return result
-        except (requests.RequestException, KeyError, TypeError, ValueError, RuntimeError) as exc:
-            last_error = exc
-            if attempt < 2:
-                time.sleep(2**attempt)
-            else:
-                break
-    raise RuntimeError(f"OpenRouter 翻譯失敗：{last_error}") from last_error
+        )
+
+    missing = sorted(expected_ids - set(result))
+    if missing:
+        raise RuntimeError(
+            f"OpenRouter 翻譯失敗：API 遺漏字幕編號：{missing}；"
+            f"last_error={last_error}"
+        )
+    return result
 
 
 def translate_cues(
@@ -198,6 +357,12 @@ def translate_cues(
     model: str = DEFAULT_MODEL,
     batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> list[dict[str, Any]]:
+    """翻譯字幕。預設每 batch_size 條一批；batch_size<=0 則整份一次。
+
+    輸入輸出皆為扁平 id|text，無 JSON 殼、無前後文。
+    用量寫入全域 LAST_TRANSLATE_STATS。
+    """
+    global LAST_TRANSLATE_STATS
     translated_cues: list[dict[str, Any]] = []
     speaker_prefixes: dict[int, str] = {}
     for source in cues:
@@ -207,32 +372,77 @@ def translate_cues(
         speaker_prefixes[int(cue["id"])] = match.group(0).strip() if match else ""
         cue["text"] = SPEAKER_LABEL_PATTERN.sub("", text).strip()
         translated_cues.append(cue)
+
+    if not translated_cues:
+        LAST_TRANSLATE_STATS = {
+            "model": model,
+            "cues": 0,
+            "batches": [],
+            "totals": {},
+        }
+        return translated_cues
+
+    env_bs = os.getenv("TRANSLATE_BATCH_SIZE", "").strip()
+    if env_bs:
+        try:
+            batch_size = int(env_bs)
+        except ValueError:
+            pass
+    step = len(translated_cues) if batch_size <= 0 else max(1, batch_size)
+    single_shot = step >= len(translated_cues)
+    stats_sink: list[dict[str, Any]] = []
+    t_all = time.perf_counter()
+
     with requests.Session() as session:
-        for start in range(0, len(translated_cues), batch_size):
-            batch = translated_cues[start : start + batch_size]
-            context_before = translated_cues[max(0, start - 8):start]
-            context_after = translated_cues[
-                start + len(batch):start + len(batch) + 8
-            ]
+        for start in range(0, len(translated_cues), step):
+            batch = translated_cues[start : start + step]
             translations = _translate_batch(
                 batch,
                 api_key,
                 model,
                 session,
-                context_before,
-                context_after,
+                stats_sink=stats_sink,
             )
-            for cue in translated_cues[start : start + len(batch)]:
+            for cue in batch:
                 body = SPEAKER_LABEL_PATTERN.sub(
                     "",
                     translations[int(cue["id"])],
                 ).strip()
                 prefix = speaker_prefixes[int(cue["id"])]
                 cue["text"] = f"{prefix} {body}".strip()
-            print(
-                f"OpenRouter 翻譯字幕 {start + 1}-{start + len(batch)}/{len(cues)}",
-                flush=True,
-            )
+            if single_shot:
+                print(
+                    f"OpenRouter 翻譯字幕 一次完成 {len(cues)} 條（model={model}）",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"OpenRouter 翻譯字幕 {start + 1}-{start + len(batch)}/{len(cues)}",
+                    flush=True,
+                )
+
+    wall = time.perf_counter() - t_all
+    prompt = sum(int(r.get("prompt_tokens") or 0) for r in stats_sink)
+    completion = sum(int(r.get("completion_tokens") or 0) for r in stats_sink)
+    total_tok = sum(int(r.get("total_tokens") or 0) for r in stats_sink)
+    reasoning = sum(int(r.get("reasoning_tokens") or 0) for r in stats_sink)
+    costs = [r.get("cost_usd") for r in stats_sink if r.get("cost_usd") is not None]
+    cost_sum = sum(float(c) for c in costs) if costs else None
+    LAST_TRANSLATE_STATS = {
+        "model": model,
+        "reasoning_effort": os.getenv("TRANSLATE_REASONING_EFFORT", "none"),
+        "format": "flat_id_pipe",
+        "batch_size": 0 if single_shot else step,
+        "cues": len(cues),
+        "api_calls": len(stats_sink),
+        "wall_sec": round(wall, 3),
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "reasoning_tokens": reasoning,
+        "total_tokens": total_tok or (prompt + completion),
+        "cost_usd": round(cost_sum, 6) if cost_sum is not None else None,
+        "batches": stats_sink,
+    }
     return translated_cues
 
 

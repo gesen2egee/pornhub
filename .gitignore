@@ -1,6 +1,7 @@
 # 產出與工作資料
 /output/
 /tasks/
+/.temp/
 *.log
 *.zip
 
@@ -9,9 +10,12 @@
 /.venv-confucius4/
 # 舊版 Muse 執行中時可能暫時無法刪除
 /lib/.venv/
+/lib/docs/
+/lib/tests/
 /lib/moss/asmr-enhancer/
 /lib/moss/audio-model-cache/
 /lib/moss/model-cache/
+/lib/whisper/
 /lib/confucius4_tts/
 
 # 暫存檔與快取

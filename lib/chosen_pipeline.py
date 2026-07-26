@@ -1,0 +1,528 @@
+# -*- coding: utf-8 -*-
+"""05_chosen 精選管線：九宮格或本機影片 → 1080P + MOSS + Grok 4.5 + enhance → 06_good。
+
+來源清理：
+  - 九宮格 JPG → 移到 04_downloaded
+  - 本機低解析度影片 → 處理完成後刪除
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+from project_paths import (
+    CHOSEN_DIR,
+    DOWNLOADED_DIR,
+    GOOD_DIR,
+    ensure_output_directories,
+)
+
+VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".m4v"}
+GRID_EXTS = {".jpg", ".jpeg", ".png"}
+
+
+def _log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def _chosen_asr(
+    media: Path,
+    work: Path,
+    *,
+    enable_asr: bool,
+    enable_translation: bool,
+    enable_dialogue_trim: bool,
+) -> dict:
+    """明確依開關執行或重用 ASR，不偷偷改動其他功能。"""
+    import full_video_pipeline
+
+    cache = work / "asr_result.json"
+    reuse = os.getenv("REUSE_ASR_RESULT", "1").strip().casefold() not in {
+        "0", "false", "no", "off",
+    }
+    if reuse and cache.is_file():
+        result = json.loads(cache.read_text(encoding="utf-8"))
+        if not enable_translation:
+            result["translated_srt"] = ""
+            result["outcome"] = "transcribed"
+        else:
+            result = full_video_pipeline.complete_cached_translation(
+                result, cache
+            )
+        _log(f"  [ASR] 重用字幕快取：{cache.name}")
+        return result
+    if not enable_asr:
+        if enable_translation or enable_dialogue_trim:
+            raise RuntimeError(
+                "ASR 已關閉且沒有 Chosen 字幕快取；翻譯與剪片無資料來源。"
+            )
+        return {
+            "original_srt": "",
+            "translated_srt": "",
+            "outcome": "disabled",
+            "cues": [],
+        }
+    result = full_video_pipeline.run_asr_translate(media, work)
+    cache.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return result
+
+
+def _trim_chosen_media(
+    media: Path,
+    work: Path,
+    asr: dict,
+    enabled: bool,
+    threshold: float,
+    segment_gap: float,
+) -> tuple[Path, str, str]:
+    """Chosen 本機媒體的獨立對白剪片開關。"""
+    import full_video_pipeline as fvp
+    import preview_pipeline
+    import segment_cutter
+
+    original = asr.get("original_srt") or ""
+    translated = asr.get("translated_srt") or ""
+    if not enabled:
+        return media, original, translated
+    source_srt = translated.strip() or original
+    entries = fvp.srt_text_to_entries(source_srt) if source_srt else []
+    if not entries and asr.get("cues"):
+        entries = fvp.cues_to_entries(asr["cues"])
+    net_duration = segment_cutter.calculate_net_dialogue_duration(entries)
+    if net_duration <= threshold or not entries:
+        _log("  [剪片] 對白未達門檻，保留全片")
+        return media, original, translated
+    duration = fvp.probe_duration(media) or 99999.0
+    segments = segment_cutter.build_continuous_segments(
+        entries,
+        max_gap=segment_gap,
+        max_dur=duration,
+    )
+    trimmed = work / f"{media.stem}.trimmed.mp4"
+    preview_pipeline.cut_local_segments(media, segments, trimmed)
+    if original.strip():
+        original = fvp._entries_to_srt(
+            segment_cutter.retime_subtitles(
+                fvp.srt_text_to_entries(original), segments
+            )
+        )
+    if translated.strip():
+        translated = fvp._entries_to_srt(
+            segment_cutter.retime_subtitles(
+                fvp.srt_text_to_entries(translated), segments
+            )
+        )
+    _log(f"  [剪片] 已保留 {len(segments)} 個對白區段")
+    return trimmed, original, translated
+
+
+def _apply_chosen_env(
+    *,
+    enable_translation: bool | None = None,
+    enable_dialogue_trim: bool | None = None,
+    enable_enhance: bool | None = None,
+    max_height: int | None = None,
+) -> None:
+    """精選：MOSS + Grok 4.5 minimal 翻譯 + 1080P enhance（較貴、品質優先）。"""
+    os.environ["ASR_BACKEND"] = os.getenv("CHOSEN_ASR_BACKEND", "moss")
+    # 4.5 不支援 none，預設 minimal；勿設 none（會被自動升並多印警告）
+    os.environ["OPENROUTER_MODEL"] = os.getenv(
+        "CHOSEN_OPENROUTER_MODEL", "x-ai/grok-4.5"
+    )
+    os.environ["TRANSLATE_REASONING_EFFORT"] = os.getenv(
+        "CHOSEN_TRANSLATE_REASONING", "minimal"
+    )
+    os.environ["HIGH_VIDEO_HEIGHT"] = os.getenv("CHOSEN_VIDEO_HEIGHT", "1080")
+    if enable_translation is not None:
+        os.environ["ENABLE_TRANSLATION"] = "1" if enable_translation else "0"
+    os.environ["AUDIO_AUTO_ENHANCE"] = (
+        "1" if enable_enhance is not False else "0"
+    )
+    os.environ["ENABLE_DIALOGUE_TRIM"] = (
+        "1" if enable_dialogue_trim is not False else "0"
+    )
+    if max_height is not None:
+        os.environ["HIGH_VIDEO_HEIGHT"] = str(max_height)
+
+
+def list_chosen_items(chosen_dir: Path | None = None) -> list[Path]:
+    root = Path(chosen_dir or CHOSEN_DIR)
+    if not root.is_dir():
+        return []
+    items: list[Path] = []
+    for path in sorted(root.iterdir()):
+        if not path.is_file():
+            continue
+        ext = path.suffix.lower()
+        if ext in GRID_EXTS or ext in VIDEO_EXTS:
+            items.append(path)
+    return items
+
+
+def process_chosen_grid(
+    jpg_path: Path,
+    *,
+    final_dir: Path = GOOD_DIR,
+    archive_grid: bool = True,
+    keep_work: bool = False,
+    enable_asr: bool | None = None,
+    export_subtitles: bool | None = None,
+    enable_translation: bool | None = None,
+    enable_dialogue_trim: bool | None = None,
+    enable_enhance: bool | None = None,
+    enable_metadata: bool | None = None,
+    max_height: int | None = None,
+    dialogue_trim_threshold: float = 30.0,
+    segment_gap: float = 1.5,
+    force: bool = False,
+) -> Path:
+    """九宮格：代理 → MOSS → 1080P（可分段）→ 判斷 enhance → 06_good，JPG→04。"""
+    import full_video_pipeline
+
+    _apply_chosen_env(
+        enable_translation=enable_translation,
+        enable_dialogue_trim=enable_dialogue_trim,
+        enable_enhance=enable_enhance,
+        max_height=max_height,
+    )
+    return full_video_pipeline.process_full_video_from_grid(
+        jpg_path,
+        final_dir=final_dir,
+        archive_dir=DOWNLOADED_DIR,
+        keep_proxy=keep_work,
+        max_height=max_height or int(os.environ.get("HIGH_VIDEO_HEIGHT", "1080")),
+        enable_enhance=True if enable_enhance is None else enable_enhance,
+        enable_asr=enable_asr,
+        export_subtitles=export_subtitles,
+        enable_dialogue_trim=enable_dialogue_trim,
+        enable_translation=enable_translation,
+        enable_metadata=enable_metadata,
+        dialogue_trim_threshold=dialogue_trim_threshold,
+        segment_gap=segment_gap,
+        force=force,
+        work_bucket="05_chosen",
+        archive_grid_on_done=archive_grid,
+    )
+
+
+def process_chosen_video(
+    video_path: Path,
+    *,
+    final_dir: Path = GOOD_DIR,
+    keep_work: bool = False,
+    enable_asr: bool | None = None,
+    export_subtitles: bool | None = None,
+    enable_translation: bool | None = None,
+    enable_dialogue_trim: bool | None = None,
+    enable_enhance: bool | None = None,
+    enable_metadata: bool | None = None,
+    max_height: int | None = None,
+    dialogue_trim_threshold: float = 30.0,
+    segment_gap: float = 1.5,
+    force: bool = False,
+) -> Path:
+    """本機影片：用檔案做 ASR/翻譯，1080 若可從 meta 取 URL 則重下；否則直接處理。
+
+    規格：精選最高品質——若有 URL 走 1080P 管線；純本機檔則 ASR+翻譯+可 enhance 後搬到 06_good。
+    完成後刪除 05_chosen 來源影片。
+    """
+    import full_video_pipeline
+    import video_meta
+
+    _apply_chosen_env(
+        enable_translation=enable_translation,
+        enable_dialogue_trim=enable_dialogue_trim,
+        enable_enhance=enable_enhance,
+        max_height=max_height,
+    )
+    asr_enabled = (
+        os.getenv("ENABLE_ASR", "1").strip().casefold()
+        not in {"0", "false", "no", "off"}
+        if enable_asr is None
+        else enable_asr
+    )
+    srt_enabled = (
+        os.getenv("EXPORT_SUBTITLES", "1").strip().casefold()
+        not in {"0", "false", "no", "off"}
+        if export_subtitles is None
+        else export_subtitles
+    )
+    metadata_enabled = (
+        os.getenv("ENABLE_METADATA", "1").strip().casefold()
+        not in {"0", "false", "no", "off"}
+        if enable_metadata is None
+        else enable_metadata
+    )
+    enhance_enabled = True if enable_enhance is None else enable_enhance
+    translation_enabled = os.getenv(
+        "ENABLE_TRANSLATION", "1"
+    ).strip().casefold() not in {"0", "false", "no", "off"}
+    trim_enabled = (
+        os.getenv("ENABLE_DIALOGUE_TRIM", "1").strip().casefold()
+        not in {"0", "false", "no", "off"}
+        if enable_dialogue_trim is None
+        else enable_dialogue_trim
+    )
+    video_path = Path(video_path).resolve()
+    ensure_output_directories()
+    final_dir = Path(final_dir)
+    final_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = re.sub(r"^\d{4}-", "", video_path.stem)
+    final_video = final_dir / f"{stem}.mp4"
+    final_srt = final_dir / f"{stem}.srt"
+
+    # 若 metadata 有網址，改走九宮格式完整下載管線（需先寫成臨時流程用 proxy 來源）
+    try:
+        meta = video_meta.read_mp4_meta(video_path)
+        web = meta.get("web_meta") or {}
+        url = (
+            web.get("webpage_url")
+            or web.get("url")
+            or meta.get("webpage_url")
+        )
+    except Exception:
+        url = None
+        meta = {}
+
+    if isinstance(url, str) and url.startswith("http"):
+        # 用暫存九宮格流程：直接 full pipeline 需要 jpg；改手動 1080 下載+字幕
+        _log(f"  [chosen-video] 偵測到 URL，走 1080P 完整下載：{stem}")
+        work = (
+            Path(full_video_pipeline.TEMP_DIR)
+            / "pipeline"
+            / "05_chosen"
+            / f"_work_{stem}"
+        )
+        work.mkdir(parents=True, exist_ok=True)
+        proxy = work / f"{stem}.proxy.mp4"
+        high = work / f"{stem}.high.mp4"
+        cache = work / "asr_result.json"
+        reuse = os.getenv("REUSE_ASR_RESULT", "1").strip().casefold() not in {
+            "0", "false", "no", "off",
+        }
+        if asr_enabled and not (reuse and cache.is_file()):
+            full_video_pipeline.download_proxy_low(url, proxy)
+        asr = _chosen_asr(
+            proxy if proxy.exists() else video_path,
+            work,
+            enable_asr=asr_enabled,
+            enable_translation=translation_enabled,
+            enable_dialogue_trim=trim_enabled,
+        )
+        os.environ["HIGH_VIDEO_HEIGHT"] = str(max_height or 1080)
+        full_video_pipeline.download_high_full(url, high)
+        high, original, translated = _trim_chosen_media(
+            high,
+            work,
+            asr,
+            trim_enabled,
+            dialogue_trim_threshold,
+            segment_gap,
+        )
+        if enhance_enabled:
+            high, enhanced = full_video_pipeline.enhance_full_video(high)
+        else:
+            enhanced = False
+        if final_video.exists():
+            final_video.unlink()
+        shutil.move(str(high), str(final_video))
+        translated = translated.strip()
+        original = original.strip()
+        if srt_enabled and translated:
+            full_video_pipeline.write_compatible_srt(final_srt, translated)
+        elif srt_enabled and original:
+            full_video_pipeline.write_compatible_srt(final_srt, original)
+        elif not srt_enabled:
+            final_srt.unlink(missing_ok=True)
+        try:
+            if metadata_enabled:
+                video_meta.merge_write_mp4_meta(
+                    final_video,
+                    web_meta=web if isinstance(web, dict) else None,
+                    original_srt=original or None,
+                    translated_srt=translated or None,
+                    subtitle_status=video_meta.build_subtitle_status(
+                        asr.get("outcome") or "empty",
+                        audio_enhanced=enhanced,
+                    ),
+                )
+            else:
+                _log("  [META] 已由開關停用")
+        except Exception as exc:
+            _log(f"  [!] meta 失敗：{exc}")
+        if not keep_work:
+            shutil.rmtree(work, ignore_errors=True)
+    else:
+        _log(f"  [chosen-video] 本機檔 ASR+翻譯+enhance：{video_path.name}")
+        # 直接用本機影片當媒體
+        work = (
+            Path(full_video_pipeline.TEMP_DIR)
+            / "pipeline"
+            / "05_chosen"
+            / f"_work_{stem}"
+        )
+        work.mkdir(parents=True, exist_ok=True)
+        asr = _chosen_asr(
+            video_path,
+            work,
+            enable_asr=asr_enabled,
+            enable_translation=translation_enabled,
+            enable_dialogue_trim=trim_enabled,
+        )
+        work_media = work / f"{stem}.source{video_path.suffix}"
+        if not work_media.exists() or work_media.stat().st_size != video_path.stat().st_size:
+            shutil.copy2(video_path, work_media)
+        media, original, translated = _trim_chosen_media(
+            work_media,
+            work,
+            asr,
+            trim_enabled,
+            dialogue_trim_threshold,
+            segment_gap,
+        )
+        if enhance_enabled:
+            media, enhanced = full_video_pipeline.enhance_full_video(media)
+        else:
+            enhanced = False
+        # enhance 可能改路徑；發布到 06_good
+        if final_video.exists():
+            final_video.unlink()
+        shutil.move(str(media), str(final_video))
+        translated = translated.strip()
+        original = original.strip()
+        if srt_enabled and translated:
+            full_video_pipeline.write_compatible_srt(final_srt, translated)
+        elif srt_enabled and original:
+            full_video_pipeline.write_compatible_srt(final_srt, original)
+        elif not srt_enabled:
+            final_srt.unlink(missing_ok=True)
+        try:
+            if metadata_enabled:
+                video_meta.merge_write_mp4_meta(
+                    final_video,
+                    original_srt=original or None,
+                    translated_srt=translated or None,
+                    subtitle_status=video_meta.build_subtitle_status(
+                        asr.get("outcome") or "empty",
+                        audio_enhanced=enhanced,
+                    ),
+                )
+            else:
+                _log("  [META] 已由開關停用")
+        except Exception as exc:
+            _log(f"  [!] meta 失敗：{exc}")
+        if not keep_work:
+            shutil.rmtree(work, ignore_errors=True)
+
+    # 刪除 05_chosen 來源影片
+    try:
+        if video_path.exists() and video_path.resolve() != final_video.resolve():
+            video_path.unlink()
+            _log(f"  [清理] 已刪除 chosen 來源影片：{video_path.name}")
+    except OSError as exc:
+        _log(f"  [!] 無法刪除來源影片：{exc}")
+
+    # 同名 srt 在 chosen 也清掉
+    for side in video_path.parent.glob(video_path.stem + ".*"):
+        if side.suffix.lower() in {".srt", ".ass"} and side.exists():
+            side.unlink(missing_ok=True)
+
+    _log(f"[DONE] chosen → {final_video}")
+    return final_video
+
+
+def process_chosen_item(path: Path, **options) -> Path:
+    path = Path(path)
+    ext = path.suffix.lower()
+    if ext in GRID_EXTS:
+        return process_chosen_grid(path, **options)
+    if ext in VIDEO_EXTS:
+        options.pop("archive_grid", None)
+        return process_chosen_video(path, **options)
+    raise ValueError(f"不支援的 chosen 項目：{path.name}")
+
+
+def process_chosen_directory(
+    chosen_dir: Path | None = None,
+) -> tuple[int, int]:
+    """處理 05_chosen 全部項目。回傳 (成功數, 失敗數)。"""
+    ensure_output_directories()
+    items = list_chosen_items(chosen_dir)
+    if not items:
+        _log("[chosen] 05_chosen 沒有九宮格或影片")
+        return 0, 0
+    _log(
+        f"[chosen] 精選管線 1080P + MOSS + Grok 4.5 minimal + enhance → 06_good，"
+        f"共 {len(items)} 項"
+    )
+    ok = 0
+    fail = 0
+    for idx, item in enumerate(items, 1):
+        _log(f"\n[chosen {idx}/{len(items)}] {item.name}")
+        try:
+            process_chosen_item(item)
+            ok += 1
+        except Exception as exc:
+            _log(f"  [FAIL] {exc}")
+            fail += 1
+    _log(f"[chosen] 完成：成功 {ok} | 失敗 {fail}")
+    return ok, fail
+
+
+def process_chosen_items(
+    items: list[Path],
+    **options,
+) -> tuple[int, int]:
+    """處理控制器已盤點的 Chosen 項目，避免執行途中重新掃描。"""
+    ok = 0
+    fail = 0
+    for index, item in enumerate(items, 1):
+        _log(f"\n[chosen {index}/{len(items)}] {item.name}")
+        try:
+            process_chosen_item(item, **options)
+            ok += 1
+        except Exception as exc:
+            _log(f"  [FAIL] {exc}")
+            fail += 1
+    return ok, fail
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="05_chosen → 06_good 精選管線")
+    parser.add_argument(
+        "--dir",
+        type=Path,
+        default=None,
+        help="chosen 目錄（預設 output/05_chosen）",
+    )
+    parser.add_argument(
+        "--item",
+        type=Path,
+        default=None,
+        help="只處理單一檔案（九宮格或影片）",
+    )
+    args = parser.parse_args(argv)
+    if args.item:
+        ensure_output_directories()
+        try:
+            process_chosen_item(args.item.resolve())
+            return 0
+        except Exception as exc:
+            print(f"[FAIL] {exc}", file=sys.stderr)
+            return 1
+    ok, fail = process_chosen_directory(args.dir)
+    return 1 if fail else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -21,7 +21,7 @@ VIDEOS = VIDEOS_DIR
 SUBTITLE_TEMP = TASKS_DIR / "subtitle-temp"
 
 sys.path.insert(0, str(ROOT))
-from asr_backends import create_backend, srt_time  # noqa: E402
+from asr_backends import asr_batch_size, create_backend, srt_time  # noqa: E402
 from audio_enhance_stage import (  # noqa: E402
     ENHANCE_MARKER,
     auto_enhance_enabled,
@@ -37,8 +37,10 @@ import video_meta  # noqa: E402
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm"}
-ASR_CHUNK_SECONDS = 7.5 * 60
-MIN_ASR_CHUNK_SECONDS = 3 * 60
+# 3 分鐘切段：縮短單次 context（約 6×30s 窗），比 7.5 分明顯較快。
+ASR_CHUNK_SECONDS = 3 * 60
+# OOM 時可再二分，最低 90 秒。
+MIN_ASR_CHUNK_SECONDS = 90
 
 
 def _low_video_directories() -> list[Path]:
@@ -216,134 +218,147 @@ def _extract_audio_chunk(
     except FileNotFoundError as exc:
         raise RuntimeError("找不到 ffmpeg，無法建立 ASR 分段。") from exc
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("FFmpeg 建立 7.5 分鐘 ASR 分段超時。") from exc
+        raise RuntimeError("FFmpeg 建立 ASR 分段超時。") from exc
     if result.returncode != 0 or not output.exists():
         details = (result.stderr or result.stdout).strip()
         raise RuntimeError(f"FFmpeg 建立 ASR 分段失敗：{details[-1000:]}")
 
 
+def _is_cuda_oom(exc: Exception) -> bool:
+    message = str(exc).casefold()
+    return "cuda out of memory" in message or (
+        "cuda" in message and "allocate" in message
+    )
+
+
+def _backend_transcribe_many(
+    backend,
+    paths: list[Path],
+) -> list[tuple[list[dict], str]]:
+    """優先走 transcribe_batch（真正 BS>1）；否則逐段 transcribe。"""
+    batch_fn = getattr(backend, "transcribe_batch", None)
+    if callable(batch_fn):
+        return list(batch_fn(paths))
+    return [backend.transcribe(path) for path in paths]
+
+
+def _release_backend(backend) -> None:
+    release = getattr(backend, "release_transient_memory", None)
+    if callable(release):
+        release()
+
+
 def _transcribe_with_chunks(media: Path, backend) -> tuple[list[dict], str]:
-    """每 7.5 分鐘執行 MOSS；CUDA OOM 時自動二分後合併時間軸。"""
+    """每 3 分鐘切段；預設一次 batch 3 段一起 generate；OOM 降 BS 或再切。"""
     duration = _probe_media_duration(media)
+    batch_size = asr_batch_size()
     if duration is None:
         try:
             return backend.transcribe(media)
         finally:
-            release = getattr(backend, "release_transient_memory", None)
-            if callable(release):
-                release()
+            _release_backend(backend)
 
-    def is_cuda_oom(exc: Exception) -> bool:
-        message = str(exc).casefold()
-        return "cuda out of memory" in message or (
-            "cuda" in message and "allocate" in message
-        )
-
+    # 先依固定窗長列 ranges；OOM 時再把過長段二分。
+    ranges: list[tuple[float, float]] = []
     if duration <= ASR_CHUNK_SECONDS:
-        try:
-            try:
-                return backend.transcribe(media)
-            finally:
-                release = getattr(
-                    backend,
-                    "release_transient_memory",
-                    None,
-                )
-                if callable(release):
-                    release()
-        except Exception as exc:
-            if (
-                not is_cuda_oom(exc)
-                or duration <= MIN_ASR_CHUNK_SECONDS
-            ):
-                raise
-            print(
-                f"  整段 ASR 發生 CUDA OOM，改用 "
-                f"{duration / 120:.1f} 分鐘子段重試",
-                flush=True,
-            )
-            safe_chunk_seconds = duration / 2
+        ranges = [(0.0, float(duration))]
     else:
-        safe_chunk_seconds = ASR_CHUNK_SECONDS
+        part_count = math.ceil(duration / ASR_CHUNK_SECONDS)
+        for index in range(part_count):
+            start = index * ASR_CHUNK_SECONDS
+            part_duration = min(ASR_CHUNK_SECONDS, duration - start)
+            ranges.append((float(start), float(part_duration)))
 
-    part_count = math.ceil(duration / ASR_CHUNK_SECONDS)
     print(
         f"  MOSS 分段 ASR：片長 {duration / 60:.1f} 分鐘，"
-        f"共 {part_count} 段，每段最多 7.5 分鐘",
+        f"共 {len(ranges)} 段，每段最多 {ASR_CHUNK_SECONDS / 60:.1f} 分鐘，"
+        f"batch={batch_size}",
         flush=True,
     )
-    merged: list[dict] = []
-    languages: list[str] = []
-    chunk_sequence = 0
 
-    def transcribe_range(start: float, part_duration: float) -> None:
-        nonlocal chunk_sequence, safe_chunk_seconds
-        if part_duration > safe_chunk_seconds + 0.001:
-            first_duration = min(safe_chunk_seconds, part_duration)
-            transcribe_range(start, first_duration)
-            transcribe_range(
-                start + first_duration,
-                part_duration - first_duration,
-            )
-            return
-
-        chunk_sequence += 1
-        chunk = _chunk_audio_path(media, chunk_sequence)
-        try:
-            print(
-                f"  ASR 子段：{srt_time(start)}–"
-                f"{srt_time(start + part_duration)}",
-                flush=True,
-            )
-            _extract_audio_chunk(
-                media,
-                chunk,
-                start,
-                part_duration,
-            )
-            try:
-                cues, language = backend.transcribe(chunk)
-            finally:
-                release = getattr(
-                    backend,
-                    "release_transient_memory",
-                    None,
-                )
-                if callable(release):
-                    release()
-        except Exception as exc:
-            if (
-                not is_cuda_oom(exc)
-                or part_duration <= MIN_ASR_CHUNK_SECONDS
-            ):
-                raise
-            safe_chunk_seconds = min(
-                safe_chunk_seconds,
-                part_duration / 2,
-            )
-            print(
-                f"  [OOM 自適應] {part_duration / 60:.1f} 分鐘仍過大，"
-                f"改用 {safe_chunk_seconds / 60:.1f} 分鐘子段",
-                flush=True,
-            )
-            transcribe_range(start, part_duration)
-            return
-        finally:
-            chunk.unlink(missing_ok=True)
-
-        merged.extend(_offset_cues(cues, start, len(merged) + 1))
-        if language and language not in languages:
-            languages.append(language)
-
-    for index in range(part_count):
-        start = index * ASR_CHUNK_SECONDS
-        part_duration = min(ASR_CHUNK_SECONDS, duration - start)
+    # 抽齊所有 wav（磁碟 I/O，很快）
+    jobs: list[tuple[float, float, Path]] = []
+    for index, (start, part_duration) in enumerate(ranges, start=1):
+        chunk = _chunk_audio_path(media, index)
         print(
-            f"  ASR 分段 {index + 1}/{part_count}："
+            f"  準備分段 {index}/{len(ranges)}："
             f"{srt_time(start)}–{srt_time(start + part_duration)}",
             flush=True,
         )
-        transcribe_range(start, part_duration)
+        _extract_audio_chunk(media, chunk, start, part_duration)
+        jobs.append((start, part_duration, chunk))
+
+    merged: list[dict] = []
+    languages: list[str] = []
+    pending = list(jobs)
+    wave = 0
+    try:
+        while pending:
+            wave += 1
+            bs = min(batch_size, len(pending))
+            group = pending[:bs]
+            paths = [item[2] for item in group]
+            labels = ", ".join(
+                f"{srt_time(s)}–{srt_time(s + d)}" for s, d, _ in group
+            )
+            print(
+                f"  ASR batch {wave}（BS={len(group)}）：{labels}",
+                flush=True,
+            )
+            try:
+                results = _backend_transcribe_many(backend, paths)
+                _release_backend(backend)
+            except Exception as exc:
+                if not _is_cuda_oom(exc):
+                    raise
+                if len(group) > 1:
+                    batch_size = max(1, len(group) // 2)
+                    print(
+                        f"  [OOM] batch 太大，降為 BS={batch_size} 重試",
+                        flush=True,
+                    )
+                    _release_backend(backend)
+                    continue
+                # BS=1 仍 OOM：把該段時間二分（若仍長於下限）
+                start, part_duration, chunk = group[0]
+                if part_duration <= MIN_ASR_CHUNK_SECONDS + 0.001:
+                    raise
+                half = part_duration / 2
+                print(
+                    f"  [OOM] 單段 {part_duration / 60:.1f} 分仍過大，"
+                    f"二分為 {half / 60:.1f} 分",
+                    flush=True,
+                )
+                chunk.unlink(missing_ok=True)
+                rest = pending[1:]
+                split_jobs: list[tuple[float, float, Path]] = []
+                for offset, dur in ((0.0, half), (half, part_duration - half)):
+                    chunk_sequence = len(jobs) + 1
+                    new_path = _chunk_audio_path(media, chunk_sequence)
+                    new_start = start + offset
+                    _extract_audio_chunk(media, new_path, new_start, dur)
+                    item = (new_start, dur, new_path)
+                    jobs.append(item)
+                    split_jobs.append(item)
+                # 二分後仍排在後續分段之前，避免時間軸錯位
+                pending = split_jobs + rest
+                _release_backend(backend)
+                continue
+
+            if len(results) != len(group):
+                raise RuntimeError(
+                    f"ASR batch 回傳 {len(results)} 筆，預期 {len(group)}。"
+                )
+            for (start, _dur, chunk), (cues, language) in zip(group, results):
+                merged.extend(_offset_cues(cues, start, len(merged) + 1))
+                if language and language not in languages:
+                    languages.append(language)
+                chunk.unlink(missing_ok=True)
+            pending = pending[len(group):]
+    finally:
+        for _start, _dur, chunk in jobs:
+            chunk.unlink(missing_ok=True)
+
     print(
         f"  ASR 分段合併完成：{len(merged)} 段字幕，"
         "接著統一交給 LLM 校正與翻譯",
@@ -673,8 +688,8 @@ def main() -> int:
     failures = 0
     try:
         backend = create_backend().load() if needs_asr else None
-        if needs_asr:
-            print("使用 ASR：MOSS-Transcribe-Diarize", flush=True)
+        if needs_asr and backend is not None:
+            print(f"使用 ASR：{backend.display_name}", flush=True)
         model_name = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
         for video in pending:
             media = prepared_media.get(video)

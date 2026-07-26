@@ -24,10 +24,21 @@ requirements.txt
 output/
 ├── 00_temp/             下載、字幕與 FFmpeg 暫存
 ├── 01_preview_images/   01_run_capture.bat 產生的九宮格
-├── 02_preview_videos/   最低畫質 30 秒預覽影片與硬字幕
-├── 03_videos/           正式影片與同名相容 SRT
-└── 04_downloaded/       已完成正式影片的九宮格歸檔
+├── 02_preview_videos/   前 3 分鐘低畫質 → Whisper 語音剪片 + 軟 SRT，不硬字幕/不 enhance
+├── 03_videos/           480P（對白>30s 剪片）+ 軟字幕，不 enhance
+├── 04_downloaded/       已完成九宮格歸檔
+├── 05_chosen/           精選輸入（可丟九宮格或本機影片）
+└── 06_good/             精選成品：1080P + MOSS + Grok 4.5 minimal + 判斷 enhance
 ```
+
+### 四條流程
+
+| 流程 | 放入 | 畫質 | 字幕 | enhance | 輸出 |
+|------|------|------|------|---------|------|
+| 預覽 | `02_preview_videos` 九宮格 | 前 3 分鐘低畫質；語音>30s 剪片否則全留 | Whisper + Grok 4.3 none 軟 SRT | 否 | 同目錄 |
+| 標準全片 | `03_videos` 九宮格 | 480P（Whisper 剪片） | Whisper + **Grok 4.3 none**（便宜） | 否 | `03_videos` |
+| 精選 | `05_chosen` 九宮格或影片 | 1080P | MOSS + **Grok 4.5 minimal** | 判斷 | `06_good` |
+| 歸檔 | （自動） | — | — | — | 九宮格→`04_downloaded`；chosen 來源影片刪除 |
 
 可用 `PORN_OUTPUT_DIR` 環境變數整體改寫 `output/` 位置，程式內的子目錄名稱由 `lib/project_paths.py` 統一管理。
 
@@ -95,18 +106,55 @@ output/01_preview_images/
 
 ### 2. 選擇下載方式
 
-將九宮格 JPG 移到：
+將素材放入對應目錄：
 
-- `output/02_preview_videos/`：下載最低畫質的動態 30 秒取樣，輸出繁中硬字幕。
-- `output/03_videos/`：下載最高等效 1080P 正式影片，不燒錄畫面字幕，輸出同名外掛 SRT。
+- `output/02_preview_videos/`：九宮格 → **前 3 分鐘低畫質**，**Whisper** 估語音後剪片（淨語音 ≤30s 則保留整段），**軟 SRT**（不硬字幕），**不 enhance**。
+- `output/03_videos/`：九宮格 → **480P**，**Whisper** 字幕並據此剪片（對白淨長 >30s），同名**軟 SRT**，**不 enhance**。
+- `output/05_chosen/`：九宮格**或本機影片** → **1080P + MOSS + Grok 4.5（minimal）**，**判斷 enhance**，完成進 `06_good`；九宮格歸檔 `04_downloaded`，來源影片刪除。
 
 ### 3. 下載與字幕
 
-雙擊 `02_run_download.bat`。
+雙擊 `02_run_download.bat`。程式會依序列出 `02_preview_videos`、
+`03_videos`、`05_chosen` 的所有檔案與大小，再讓你逐層選擇執行、跳過或結束。
+三層分別對應低、中、高預算，不會因為只跑其中一層而先啟動其他昂貴流程。
 
-影片下載時會先進入 `output/00_temp/pipeline/`。`output/03_videos/` 的影片通過 video stream 與 1080P 驗證後會立刻移入正式目錄，再由背景 worker 直接補上音訊增強、Meta 與外掛 SRT，不需要等待字幕完成才看到影片。`output/02_preview_videos/` 因為需要燒錄硬字幕，仍會在完整處理後才移入正式位置。
+暫存位於 `output/00_temp/pipeline/`。三層皆可輸出軟字幕；標準 480P
+與精選 1080P 為循序管線（代理 ASR → 下載目標畫質 → 發布）。
 
-正式影片字幕完成後，九宮格移到 `output/04_downloaded/`；預覽影片的九宮格則保留在 `output/02_preview_videos/`。若程式中斷，下一次執行會先把舊 `pipeline/03_videos` 影片發布到正式目錄，再接續字幕。
+只盤點、不下載：
+
+```bat
+02_run_download.bat --list
+```
+
+直接指定預算層級：
+
+```bat
+02_run_download.bat --stages preview
+02_run_download.bat --stages preview video
+02_run_download.bat --stages chosen
+```
+
+所有主要功能都有正反開關與 args：
+
+```bat
+02_run_download.bat --stages video --no-translation --no-dialogue-trim
+02_run_download.bat --stages chosen --subtitles --enhance --metadata --archive
+02_run_download.bat --stages preview --preview-seconds 90 --no-keep-work
+02_run_download.bat --stages video --video-height 480 --asr-backend whisper
+02_run_download.bat --stages chosen --chosen-height 1080 --translation-model x-ai/grok-4.5 --reasoning-effort minimal
+```
+
+可控制項目包含：`asr`、`subtitles`、`translation`、`dialogue-trim`、`enhance`、
+`metadata`、`archive`、`keep-work`、`reuse-cache`、`force`。每個布林項目都可使用
+`--功能` 或 `--no-功能`；完整說明請執行 `02_run_download.bat --help`。
+
+這些開關彼此獨立：`--no-subtitles` 只停止輸出外掛 SRT，不會關閉 ASR、
+翻譯或剪片；`--no-translation` 也不會關閉 ASR。若關閉 ASR 但仍開啟翻譯
+或剪片，程式只會使用既有 ASR 快取；沒有快取時會明確報錯，不會偷偷替你
+開啟 ASR 或順帶關閉其他功能。每層開始前都會印出實際 ON/OFF 設定。
+若要讓新設定重新套用到既有成品，請明確加上 `--force`；預設會保護既有成品。
+剪片門檻與區段合併間隔可分別用 `--trim-threshold`、`--segment-gap` 調整。
 
 維護模式：
 
@@ -117,7 +165,7 @@ output/01_preview_images/
 
 ## MOSS 與字幕輸出
 
-長影片固定以 **7.5 分鐘（450 秒）**切段辨識，再把完整時間軸一次交給 LLM 校正與翻譯。若單段發生 CUDA OOM，會繼續自動二分到最低 3 分鐘。
+長影片固定以 **3 分鐘（180 秒）**切段辨識，再把完整時間軸一次交給 LLM 校正與翻譯。若單段發生 CUDA OOM，會繼續自動二分到最低 90 秒。
 
 - `output/03_videos/`：保留原始畫面，輸出 UTF-8 BOM、CRLF、移除 `[Sxx]` 標籤的播放器相容 SRT。
 - `output/02_preview_videos/`：使用 FFmpeg 燒錄繁中硬字幕。
@@ -135,7 +183,11 @@ OPENROUTER_API_KEY
 - `MOSS_MODEL`：預設 `openmoss/MOSS-Transcribe-Diarize`
 - `MOSS_DEVICE`：預設 `cuda:0`
 - `MOSS_DTYPE`：預設 `bfloat16`
-- `MOSS_MAX_NEW_TOKENS`：正式影片預設 `8192`，預覽影片預設 `1024`
+- `ASR_BACKEND`：`moss`（預設，本機 GPU）或 `voxtral`（OpenRouter 雲端 STT）
+- `REUSE_ASR_RESULT`：預設 `1`，有 `work_dir/asr_result.json` 則跳過 ASR 續跑
+- `VOXTRAL_MODEL`：預設 `mistralai/voxtral-mini-transcribe`
+- `MOSS_MAX_NEW_TOKENS`：僅 moss；正式片預設 `4096`，預覽預設 `1024`
+- `MOSS_ASR_BATCH_SIZE`：一次並行幾段 3 分鐘音訊（預設 `3`；voxtral 為 HTTP 並行，moss 為 GPU batch）
 - `MOSS_HOTWORDS`：逗號分隔的專有名詞
 - `SUBTITLE_LOW_JOB_TIMEOUT_SECONDS`：預覽影片字幕 timeout，預設 900 秒
 - `SUBTITLE_JOB_TIMEOUT_SECONDS`：正式影片字幕 timeout，預設 7200 秒
