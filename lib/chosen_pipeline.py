@@ -39,6 +39,7 @@ def _chosen_asr(
     enable_asr: bool,
     enable_translation: bool,
     enable_dialogue_trim: bool,
+    moss_worker=None,
 ) -> tuple[dict, float]:
     """明確依開關重用或串流 ASR；OpenRouter 留在共同第二階段。"""
     import full_video_pipeline
@@ -67,7 +68,7 @@ def _chosen_asr(
             "cues": [],
         }, full_video_pipeline.remote_duration(video_url) or 0.0
     result, duration = full_video_pipeline.run_streamed_asr(
-        video_url, work, video_stem
+        video_url, work, video_stem, moss_worker=moss_worker
     )
     result["source_duration"] = duration
     cache.write_text(
@@ -198,6 +199,7 @@ def process_chosen_grid(
     dialogue_trim_threshold: float = 30.0,
     segment_gap: float = 1.5,
     force: bool = False,
+    moss_worker=None,
 ) -> Path:
     """九宮格：代理 → MOSS → 1080P（可分段）→ 判斷 enhance → 06_good，JPG→04。"""
     import full_video_pipeline
@@ -225,6 +227,7 @@ def process_chosen_grid(
         force=force,
         work_bucket="05_chosen",
         archive_grid_on_done=archive_grid,
+        moss_worker=moss_worker,
     )
 
 
@@ -243,6 +246,7 @@ def process_chosen_video(
     dialogue_trim_threshold: float = 30.0,
     segment_gap: float = 1.5,
     force: bool = False,
+    moss_worker=None,
 ) -> Path:
     """影片只作為 URL 載體；所有處理都重新走 Chosen 的高畫質管線。
 
@@ -332,6 +336,7 @@ def process_chosen_video(
         enable_asr=asr_enabled,
         enable_translation=translation_enabled,
         enable_dialogue_trim=trim_enabled,
+        moss_worker=moss_worker,
     )
     # 保留舊呼叫端只回傳 dict 的相容性；正式新流程回傳 (dict, duration)。
     if isinstance(chosen_asr, tuple):

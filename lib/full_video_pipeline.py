@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import sys
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, redirect_stdout
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
@@ -727,11 +727,19 @@ def run_asr_only(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
 def run_asr_batch_local(proxy_paths: list[Path]) -> list[dict[str, Any]]:
     """同一個 backend 載入一次，對多個已就緒 ASR 片段做真正的 batch。"""
     from asr_backends import create_backend
-    from translate_srt_openrouter import format_srt
 
     if not proxy_paths:
         return []
     backend = create_backend().load()
+    return _run_asr_batch_with_backend(proxy_paths, backend)
+
+
+def _run_asr_batch_with_backend(
+    proxy_paths: list[Path], backend: Any,
+) -> list[dict[str, Any]]:
+    """以已載入的 backend 執行 ASR；供常駐 MOSS worker 重複使用。"""
+    from translate_srt_openrouter import format_srt
+
     _log(f"  [2/5] {backend.display_name} 批次辨識：BS={len(proxy_paths)}")
     release = getattr(backend, "release_transient_memory", None)
     try:
@@ -761,6 +769,97 @@ def run_asr_batch_local(proxy_paths: list[Path]) -> list[dict[str, Any]]:
     return results
 
 
+def _uses_external_moss() -> bool:
+    """目前程序不是 MOSS venv，且 ASR 指定為 MOSS 時才需要常駐子程序。"""
+    from asr_backends import selected_asr_backend_name
+
+    current = Path(sys.executable).resolve()
+    return (
+        selected_asr_backend_name() == "moss"
+        and not ("moss" in str(current).casefold() and current.exists())
+    )
+
+
+class MossAsrWorker:
+    """一次管線執行常駐的 MOSS 子程序，避免每個片段或影片重載權重。"""
+
+    def __init__(self) -> None:
+        moss_python = Path(os.getenv("MOSS_PYTHON", str(DEFAULT_MOSS_PYTHON)))
+        if not moss_python.is_file():
+            raise RuntimeError(
+                f"找不到 MOSS 環境：{moss_python}。請先執行 00_setup_or_update.bat。"
+            )
+        env = os.environ.copy()
+        env["PYTHONUTF8"] = "1"
+        env["ENABLE_TRANSLATION"] = "0"
+        env.setdefault("ASR_BACKEND", "moss")
+        self._process = subprocess.Popen(
+            [str(moss_python), str(Path(__file__).resolve()), "--asr-worker"],
+            cwd=str(ROOT),
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+        )
+        self._closed = False
+        _log("  [MOSS 常駐] 已啟動；後續 ASR 片段不會重載權重")
+
+    def transcribe(self, audio_paths: list[Path]) -> list[dict[str, Any]]:
+        if self._closed or self._process.stdin is None or self._process.stdout is None:
+            raise RuntimeError("MOSS 常駐程序已關閉")
+        request = {"audio": [str(Path(path).resolve()) for path in audio_paths]}
+        try:
+            self._process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+            self._process.stdin.flush()
+            line = self._process.stdout.readline()
+        except OSError as exc:
+            raise RuntimeError("MOSS 常駐程序通訊失敗") from exc
+        if not line:
+            raise RuntimeError(
+                f"MOSS 常駐程序提早結束，ExitCode={self._process.poll()}"
+            )
+        try:
+            reply = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"MOSS 常駐程序回傳無效 JSON：{line[:160]}") from exc
+        if reply.get("error"):
+            raise RuntimeError(f"MOSS 常駐程序失敗：{reply['error']}")
+        payload = reply.get("results")
+        if not isinstance(payload, list) or len(payload) != len(audio_paths):
+            raise RuntimeError("MOSS 常駐程序回傳格式或數量不符。")
+        return payload
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self._process.stdin is not None and self._process.poll() is None:
+                self._process.stdin.write('{"command":"shutdown"}\n')
+                self._process.stdin.flush()
+                self._process.stdin.close()
+            self._process.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            self._process.kill()
+            self._process.wait(timeout=10)
+
+
+@contextmanager
+def moss_asr_session() -> Iterator[MossAsrWorker | None]:
+    """MOSS 才建立常駐程序；其他 ASR backend 完全維持原有獨立流程。"""
+    if not _uses_external_moss():
+        yield None
+        return
+    worker = MossAsrWorker()
+    try:
+        yield worker
+    finally:
+        worker.close()
+
+
 def _safe_asr_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """讓 MOSS 子程序輸出的 cues 一定可 JSON 序列化。"""
     safe_cues = []
@@ -777,7 +876,41 @@ def _safe_asr_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def run_asr_batch(proxy_paths: list[Path], work_dir: Path) -> list[dict[str, Any]]:
+def run_moss_asr_worker() -> int:
+    """MOSS 常駐程序入口：stdin/stdout 僅走一行一筆 JSON 協定。"""
+    from asr_backends import create_backend
+
+    protocol_stdout = sys.stdout
+    # transformers／ModelScope 的進度輸出不可混入協定 stdout，全部改送終端 stderr。
+    with redirect_stdout(sys.stderr):
+        backend = create_backend().load()
+        _log("[MOSS 常駐] 權重已載入，等待 ASR 工作")
+    for raw in sys.stdin:
+        try:
+            request = json.loads(raw)
+            if request.get("command") == "shutdown":
+                return 0
+            audio = request.get("audio")
+            if not isinstance(audio, list) or not audio:
+                raise ValueError("audio 必須是非空陣列")
+            paths = [Path(item).resolve() for item in audio]
+            with redirect_stdout(sys.stderr):
+                results = _run_asr_batch_with_backend(paths, backend)
+            reply: dict[str, Any] = {
+                "results": [_safe_asr_payload(item) for item in results]
+            }
+        except Exception as exc:
+            reply = {"error": str(exc)}
+        protocol_stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
+        protocol_stdout.flush()
+    return 0
+
+
+def run_asr_batch(
+    proxy_paths: list[Path],
+    work_dir: Path,
+    moss_worker: MossAsrWorker | None = None,
+) -> list[dict[str, Any]]:
     """每段先 Demucs，再以目前可用的動態 BS 做 ASR。"""
     from asr_audio import prepare_asr_audio
     from asr_backends import selected_asr_backend_name
@@ -788,6 +921,12 @@ def run_asr_batch(proxy_paths: list[Path], work_dir: Path) -> list[dict[str, Any
         prepare_asr_audio(path, work_dir / f"demucs-{index:03d}")
         for index, path in enumerate(proxy_paths, 1)
     ]
+    if moss_worker is not None:
+        try:
+            return moss_worker.transcribe(asr_audio)
+        except RuntimeError as exc:
+            _log(f"  [MOSS 常駐] 失敗，回退單次程序：{exc}")
+            moss_worker.close()
     backend_name = selected_asr_backend_name()
     current = Path(sys.executable).resolve()
     if backend_name in {"voxtral", "grok-stt", "whisper"} or (
@@ -848,6 +987,8 @@ def run_streamed_asr(
     video_url: str,
     work_dir: Path,
     video_stem: str,
+    *,
+    moss_worker: MossAsrWorker | None = None,
 ) -> tuple[dict[str, Any], float]:
     """下載每段 240P 後立刻排入 Demucs+ASR，下載與 ASR 可重疊。"""
     from translate_srt_openrouter import format_srt
@@ -877,7 +1018,7 @@ def run_streamed_asr(
     worker_errors: list[BaseException] = []
     batch_limit = asr_batch_size()
 
-    def consume_asr_queue() -> None:
+    def consume_asr_queue(moss_worker: MossAsrWorker | None) -> None:
         while True:
             first = job_queue.get()
             if first is None:
@@ -902,7 +1043,14 @@ def run_streamed_asr(
                     f"本批 BS={len(jobs)}/{batch_limit}"
                 )
                 batch_work = work_dir / f"asr-batch-{jobs[0][0]:03d}"
-                results = run_asr_batch([job[2] for job in jobs], batch_work)
+                paths = [job[2] for job in jobs]
+                results = (
+                    run_asr_batch(paths, batch_work)
+                    if moss_worker is None
+                    else run_asr_batch(
+                        paths, batch_work, moss_worker=moss_worker
+                    )
+                )
                 for job, result in zip(jobs, results):
                     completed[job[0]] = (job[1], result)
             except BaseException as exc:
@@ -912,17 +1060,27 @@ def run_streamed_asr(
                 for _job in jobs:
                     job_queue.task_done()
 
-    worker = Thread(target=consume_asr_queue, name="asr-queue", daemon=True)
+    worker = Thread(
+        target=consume_asr_queue,
+        args=(moss_worker,),
+        name="asr-queue",
+        daemon=True,
+    )
     worker.start()
-    for index, (start, end) in enumerate(ranges, 1):
-        if worker_errors:
-            break
-        proxy_part = work_dir / f"{video_stem}.proxy.asr{index:03d}.mp4"
-        download_proxy_range(video_url, proxy_part, start, end)
-        job_queue.put((index, start, proxy_part))
-        _log(f"  [ASR 佇列] 已排入第 {index}/{len(ranges)} 段；等待中 {job_queue.qsize()} 段")
-    job_queue.put(None)
-    worker.join()
+    try:
+        for index, (start, end) in enumerate(ranges, 1):
+            if worker_errors:
+                break
+            proxy_part = work_dir / f"{video_stem}.proxy.asr{index:03d}.mp4"
+            download_proxy_range(video_url, proxy_part, start, end)
+            job_queue.put((index, start, proxy_part))
+            _log(
+                f"  [ASR 佇列] 已排入第 {index}/{len(ranges)} 段；"
+                f"等待中 {job_queue.qsize()} 段"
+            )
+    finally:
+        job_queue.put(None)
+        worker.join()
     if worker_errors:
         raise RuntimeError(f"ASR 佇列失敗：{worker_errors[0]}") from worker_errors[0]
     if len(completed) != len(ranges):
@@ -1217,6 +1375,7 @@ def process_full_video_from_grid(
     force: bool = False,
     work_bucket: str = "03_videos",
     archive_grid_on_done: bool = True,
+    moss_worker: MossAsrWorker | None = None,
 ) -> Path:
     """
     單支來源循序流程：從九宮格或影片取得 URL，低畫質代理 → ASR/翻譯 →
@@ -1360,7 +1519,9 @@ def process_full_video_from_grid(
                         f"ASR 已關閉，但字幕快取無法讀取：{exc}"
                     ) from exc
                 _log(f"  [!] 讀取字幕快取失敗，改重新 ASR：{exc}")
-                asr, duration = run_streamed_asr(video_url, work_dir, video_stem)
+                asr, duration = run_streamed_asr(
+                    video_url, work_dir, video_stem, moss_worker=moss_worker
+                )
         elif not enable_asr:
             if enable_translation or enable_dialogue_trim:
                 raise RuntimeError(
@@ -1377,7 +1538,9 @@ def process_full_video_from_grid(
             }
             duration = remote_duration(video_url) or 0.0
         else:
-            asr, duration = run_streamed_asr(video_url, work_dir, video_stem)
+            asr, duration = run_streamed_asr(
+                video_url, work_dir, video_stem, moss_worker=moss_worker
+            )
             asr["source_duration"] = duration
             try:
                 asr_cache.write_text(
@@ -1564,6 +1727,11 @@ def main(argv: list[str] | None = None) -> int:
         metavar="AUDIO",
         help="對多個已分離人聲軌做 MOSS 批次 ASR，寫入 --result JSON 陣列",
     )
+    parser.add_argument(
+        "--asr-worker",
+        action="store_true",
+        help="啟動常駐 MOSS ASR worker（供主程序內部呼叫）",
+    )
     parser.add_argument("--result", type=Path, help="ASR 結果 JSON 路徑")
     parser.add_argument(
         "--grid",
@@ -1582,6 +1750,12 @@ def main(argv: list[str] | None = None) -> int:
         help="保留 work_dir 代理與分段暫存",
     )
     args = parser.parse_args(argv)
+
+    if args.asr_worker:
+        if args.asr_only or args.asr_batch or args.result:
+            print("--asr-worker 不可與其他 ASR 參數同時使用", file=sys.stderr)
+            return 2
+        return run_moss_asr_worker()
 
     if args.asr_only or args.asr_batch:
         if not args.result:

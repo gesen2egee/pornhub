@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
@@ -320,16 +320,32 @@ def feature_environment(options: FeatureSwitches):
                 os.environ[name] = value
 
 
-def run_stage(stage_name: str, options: FeatureSwitches) -> int:
+def run_stage(
+    stage_name: str,
+    options: FeatureSwitches,
+    *,
+    moss_worker=None,
+) -> int:
     ensure_output_directories()
     options = resolve_stage_options(stage_name, options)
     validate_stage_options(stage_name, options)
     print_effective_options(stage_name, options)
     with feature_environment(options):
-        return _execute_stage(stage_name, options)
+        if moss_worker is not None:
+            return _execute_stage(stage_name, options, moss_worker=moss_worker)
+        # 直接執行單層時，也讓該層所有來源共用同一個 MOSS 權重。
+        import full_video_pipeline
+
+        session = (
+            full_video_pipeline.moss_asr_session()
+            if options.asr and options.asr_backend == "moss"
+            else nullcontext(None)
+        )
+        with session as owned_worker:
+            return _execute_stage(stage_name, options, moss_worker=owned_worker)
 
 
-def _execute_stage(stage_name: str, options: FeatureSwitches) -> int:
+def _execute_stage(stage_name: str, options: FeatureSwitches, *, moss_worker=None) -> int:
     sources = list_stage_sources(
         stage_name, include_published=bool(options.force)
     )
@@ -357,6 +373,7 @@ def _execute_stage(stage_name: str, options: FeatureSwitches) -> int:
                     dialogue_trim_threshold=options.trim_threshold,
                     segment_gap=options.segment_gap,
                     force=options.force,
+                    moss_worker=moss_worker,
                 )
             except Exception as exc:
                 print(f"  [FAIL] {exc}")
@@ -399,6 +416,7 @@ def _execute_stage(stage_name: str, options: FeatureSwitches) -> int:
                     force=options.force,
                     work_bucket="03_videos",
                     archive_grid_on_done=options.archive_grid,
+                    moss_worker=moss_worker,
                 )
             except Exception as exc:
                 print(f"  [FAIL] {exc}")
@@ -422,17 +440,52 @@ def _execute_stage(stage_name: str, options: FeatureSwitches) -> int:
         dialogue_trim_threshold=options.trim_threshold,
         segment_gap=options.segment_gap,
         force=options.force,
+        moss_worker=moss_worker,
     )
     print(f"[chosen] 完成：成功 {successes}；失敗 {failures}")
     return failures
 
 
 def run_stages(stage_names: Iterable[str], options: FeatureSwitches) -> int:
-    failures = 0
-    for stage_name in stage_names:
-        print_stage_inventory(stage_name)
-        failures += run_stage(stage_name, options)
-    return failures
+    names = list(stage_names)
+    use_moss = any(
+        resolve_stage_options(stage_name, options).asr
+        and resolve_stage_options(stage_name, options).asr_backend == "moss"
+        for stage_name in names
+    )
+    has_sources = any(
+        list_stage_sources(
+            stage_name,
+            include_published=bool(resolve_stage_options(stage_name, options).force),
+        )
+        for stage_name in names
+    )
+    if not use_moss or not has_sources:
+        failures = 0
+        for stage_name in names:
+            print_stage_inventory(stage_name)
+            failures += run_stage(stage_name, options)
+        return failures
+
+    # 一次 BAT 執行共用同一個 MOSS worker，跨 Preview／Video／Chosen 也不重載。
+    import full_video_pipeline
+
+    previous_backend = os.environ.get("ASR_BACKEND")
+    os.environ["ASR_BACKEND"] = "moss"
+    try:
+        with full_video_pipeline.moss_asr_session() as moss_worker:
+            failures = 0
+            for stage_name in names:
+                print_stage_inventory(stage_name)
+                failures += run_stage(
+                    stage_name, options, moss_worker=moss_worker
+                )
+            return failures
+    finally:
+        if previous_backend is None:
+            os.environ.pop("ASR_BACKEND", None)
+        else:
+            os.environ["ASR_BACKEND"] = previous_backend
 
 
 def run_interactive(

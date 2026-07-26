@@ -184,6 +184,8 @@ def collect_preview_until_dialogue(
     work_dir: Path,
     video_stem: str,
     dialogue_threshold: float,
+    *,
+    moss_worker=None,
 ) -> tuple[dict, Path, float, bool, bool]:
     """每 3 分鐘取樣與 ASR；達對話門檻即停止，否則取到影片結束。"""
     import full_video_pipeline as fvp
@@ -212,7 +214,12 @@ def collect_preview_until_dialogue(
         part = work_dir / f"{video_stem}.preview{index:03d}.mp4"
         download_preview_range(video_url, part, start, end)
         parts.append(part)
-        result = fvp.run_asr_batch([part], work_dir / f"preview-asr-{index:03d}")[0]
+        asr_work = work_dir / f"preview-asr-{index:03d}"
+        result = (
+            fvp.run_asr_batch([part], asr_work)
+            if moss_worker is None
+            else fvp.run_asr_batch([part], asr_work, moss_worker=moss_worker)
+        )[0]
         cues = result.get("cues") or []
         merged_cues.extend(fvp._offset_asr_cues(cues, start, len(merged_cues) + 1))
         language = result.get("language")
@@ -278,6 +285,7 @@ def process_preview_from_grid(
     dialogue_trim_threshold: float = PREVIEW_TRIM_THRESHOLD,
     segment_gap: float = SEGMENT_GAP,
     force: bool = False,
+    moss_worker=None,
 ) -> Path:
     """單支預覽：3 分鐘低畫質 → MOSS → 語音剪片 → 自動 enhance → 軟 SRT。"""
     import full_video_pipeline as fvp
@@ -398,6 +406,7 @@ def process_preview_from_grid(
                 work_dir,
                 video_stem,
                 dialogue_trim_threshold,
+                moss_worker=moss_worker,
             )
         )
         _log(
