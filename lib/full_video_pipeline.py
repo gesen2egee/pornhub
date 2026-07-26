@@ -509,7 +509,7 @@ def run_asr_translate_local(proxy_path: Path) -> dict[str, Any]:
     os.environ.setdefault("MOSS_MAX_NEW_TOKENS", "4096")
 
     backend = create_backend().load()
-    _log(f"  [2/5] {backend.display_name} 辨識（代理音訊）")
+    _log(f"  [2/5] {backend.display_name} 辨識（Demucs 人聲軌）")
     cues, language = run_subtitle._transcribe_with_chunks(proxy_path, backend)
     _log(f"  語言：{language}；字幕段落：{len(cues)}")
     original_srt = format_srt(cues) if cues else ""
@@ -537,9 +537,11 @@ def run_asr_translate_local(proxy_path: Path) -> dict[str, Any]:
 
 
 def run_asr_translate(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
-    """依 ASR_BACKEND 選擇本機直接跑或 MOSS 子程序。"""
+    """先以 Demucs 分離人聲，再依 ASR_BACKEND 執行轉寫與翻譯。"""
+    from asr_audio import prepare_asr_audio
     from asr_backends import selected_asr_backend_name
 
+    asr_audio = prepare_asr_audio(proxy_path, work_dir)
     backend_name = selected_asr_backend_name()
     current = Path(sys.executable).resolve()
 
@@ -551,11 +553,11 @@ def run_asr_translate(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
             "whisper": "faster-whisper",
         }.get(backend_name, backend_name)
         _log(f"  [2/5] 使用 {label} 轉寫（本程序）…")
-        return run_asr_translate_local(proxy_path)
+        return run_asr_translate_local(asr_audio)
 
     # MOSS：需在 moss venv
     if "moss" in str(current).casefold() and current.exists():
-        return run_asr_translate_local(proxy_path)
+        return run_asr_translate_local(asr_audio)
 
     moss_python = Path(os.getenv("MOSS_PYTHON", str(DEFAULT_MOSS_PYTHON)))
     if not moss_python.is_file():
@@ -572,7 +574,7 @@ def run_asr_translate(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
         str(moss_python),
         str(Path(__file__).resolve()),
         "--asr-only",
-        str(proxy_path),
+        str(asr_audio),
         "--result",
         str(result_path),
     ]

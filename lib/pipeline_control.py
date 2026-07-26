@@ -37,6 +37,7 @@ class FeatureSwitches:
     """None 表示使用該層預設值，True/False 表示明確覆寫。"""
 
     asr: bool | None = None
+    demucs_asr: bool | None = None
     subtitles: bool | None = None
     translation: bool | None = None
     dialogue_trim: bool | None = None
@@ -159,6 +160,7 @@ def _set_bool_env(name: str, value: bool | None) -> None:
 
 def apply_feature_switches(options: FeatureSwitches) -> None:
     _set_bool_env("ENABLE_ASR", options.asr)
+    _set_bool_env("ENABLE_DEMUCS_ASR", options.demucs_asr)
     _set_bool_env("EXPORT_SUBTITLES", options.subtitles)
     _set_bool_env("ENABLE_TRANSLATION", options.translation)
     _set_bool_env("ENABLE_DIALOGUE_TRIM", options.dialogue_trim)
@@ -185,6 +187,7 @@ def resolve_stage_options(
     """補上該層預設值；不改動或連帶切換任何其他功能。"""
     defaults = {
         "asr": True,
+        "demucs_asr": True,
         "subtitles": True,
         "translation": True,
         "dialogue_trim": True,
@@ -230,7 +233,8 @@ def print_effective_options(stage_name: str, options: FeatureSwitches) -> None:
 
     print(
         "實際設定："
-        f"ASR={state(options.asr)}｜SRT={state(options.subtitles)}｜"
+        f"ASR={state(options.asr)}｜Demucs={state(options.demucs_asr)}｜"
+        f"SRT={state(options.subtitles)}｜"
         f"翻譯={state(options.translation)}｜剪片={state(options.dialogue_trim)}｜"
         f"增強={state(options.enhance)}｜Meta={state(options.metadata)}｜"
         f"歸檔={state(options.archive_grid)}｜快取={state(options.reuse_cache)}｜"
@@ -248,6 +252,7 @@ def feature_environment(options: FeatureSwitches):
     """每一層使用隔離環境，完成後還原，避免設定污染下一層。"""
     names = (
         "ENABLE_ASR",
+        "ENABLE_DEMUCS_ASR",
         "EXPORT_SUBTITLES",
         "ENABLE_TRANSLATION",
         "ENABLE_DIALOGUE_TRIM",

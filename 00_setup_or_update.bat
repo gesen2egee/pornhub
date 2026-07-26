@@ -64,6 +64,8 @@ echo [3/5] Updating MOSS and CUDA dependencies in the shared environment...
 if errorlevel 1 exit /b %ERRORLEVEL%
 "%MOSS_PYTHON%" -m pip install --index-url https://download.pytorch.org/whl/cu128 torch torchaudio
 if errorlevel 1 exit /b %ERRORLEVEL%
+"%MOSS_PYTHON%" -m pip install demucs==4.1.0
+if errorlevel 1 exit /b %ERRORLEVEL%
 "%MOSS_PYTHON%" -m pip install "git+https://github.com/OpenMOSS/MOSS-Transcribe-Diarize.git@%MOSS_COMMIT%" modelscope requests mutagen Pillow
 if errorlevel 1 exit /b %ERRORLEVEL%
 "%MOSS_PYTHON%" -m pip install librosa pyloudnorm scipy soundfile tqdm
@@ -82,6 +84,8 @@ if errorlevel 1 exit /b %ERRORLEVEL%
 echo [5/5] Verifying CUDA and downloading required models...
 "%MOSS_PYTHON%" "%LIB%\moss_setup.py"
 if errorlevel 1 exit /b %ERRORLEVEL%
+"%MOSS_PYTHON%" -c "from demucs.pretrained import get_model; get_model('htdemucs'); print('Demucs htdemucs ready')"
+if errorlevel 1 exit /b %ERRORLEVEL%
 
 echo.
 echo [DONE] Setup and update completed successfully.
@@ -94,7 +98,7 @@ if not exist "%PYTHON%" (
 )
 "%PYTHON%" -c "import yt_dlp, PIL, numpy, curl_cffi, mutagen, requests"
 if errorlevel 1 exit /b %ERRORLEVEL%
-"%MOSS_PYTHON%" -c "import mutagen, PIL, requests"
+"%MOSS_PYTHON%" -c "import demucs, mutagen, PIL, requests"
 if errorlevel 1 exit /b %ERRORLEVEL%
 "%PYTHON%" "%LIB%\web_app\server.py" --check
 if errorlevel 1 exit /b %ERRORLEVEL%

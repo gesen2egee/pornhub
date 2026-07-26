@@ -35,9 +35,9 @@ output/
 
 | 流程 | 放入 | 畫質 | 字幕 | enhance | 輸出 |
 |------|------|------|------|---------|------|
-| 預覽 | `02_preview_videos` 九宮格或含 URL 影片 | 前 3 分鐘低畫質；語音>30s 剪片否則全留 | Whisper + Grok 4.3 none 軟 SRT | 否 | 同目錄 |
-| 標準全片 | `03_videos` 九宮格或含 URL 影片 | 480P（Whisper 剪片） | Whisper + **Grok 4.3 none**（便宜） | 否 | `03_videos` |
-| 精選 | `05_chosen` 九宮格或影片 | 1080P | MOSS + **Grok 4.5 minimal** | 判斷 | `06_good` |
+| 預覽 | `02_preview_videos` 九宮格或含 URL 影片 | 前 3 分鐘低畫質；語音>30s 剪片否則全留 | Demucs 人聲 → Whisper + Grok 4.3 none 軟 SRT | 否 | 同目錄 |
+| 標準全片 | `03_videos` 九宮格或含 URL 影片 | 480P（Whisper 剪片） | Demucs 人聲 → Whisper + **Grok 4.3 none**（便宜） | 否 | `03_videos` |
+| 精選 | `05_chosen` 九宮格或影片 | 1080P | Demucs 人聲 → MOSS + **Grok 4.5 minimal** | 判斷 | `06_good` |
 | 歸檔 | （自動） | — | — | — | 九宮格→`04_downloaded`；chosen 來源影片刪除 |
 
 可用 `PORN_OUTPUT_DIR` 環境變數整體改寫 `output/` 位置，程式內的子目錄名稱由 `lib/project_paths.py` 統一管理。
@@ -145,7 +145,7 @@ output/01_preview_images/
 02_run_download.bat --stages chosen --chosen-height 1080 --translation-model x-ai/grok-4.5 --reasoning-effort minimal
 ```
 
-可控制項目包含：`asr`、`subtitles`、`translation`、`dialogue-trim`、`enhance`、
+可控制項目包含：`asr`、`demucs-asr`、`subtitles`、`translation`、`dialogue-trim`、`enhance`、
 `metadata`、`archive`、`keep-work`、`reuse-cache`、`force`。每個布林項目都可使用
 `--功能` 或 `--no-功能`；完整說明請執行 `02_run_download.bat --help`。
 
@@ -153,6 +153,8 @@ output/01_preview_images/
 翻譯或剪片；`--no-translation` 也不會關閉 ASR。若關閉 ASR 但仍開啟翻譯
 或剪片，程式只會使用既有 ASR 快取；沒有快取時會明確報錯，不會偷偷替你
 開啟 ASR 或順帶關閉其他功能。每層開始前都會印出實際 ON/OFF 設定。
+`demucs-asr` 預設開啟，會在 ASR 前分離 vocals 人聲；它和最終成品的
+`enhance` 完全獨立，需要時可用 `--no-demucs-asr` 關閉。
 若要讓新設定重新套用到既有成品，請明確加上 `--force`；預設會保護既有成品。
 Chosen 有 URL 時不會拿既有高畫質成品接續，會重新下載規劃出的高畫質片段；
 若連 ASR 字幕快取也要重做，請加上 `--no-reuse-cache`。

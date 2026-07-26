@@ -36,6 +36,8 @@ if errorlevel 1 exit /b %ERRORLEVEL%
 
 "%PYTHON%" -m pip install --index-url https://download.pytorch.org/whl/cu128 torch torchaudio
 if errorlevel 1 exit /b %ERRORLEVEL%
+"%PYTHON%" -m pip install demucs==4.1.0
+if errorlevel 1 exit /b %ERRORLEVEL%
 
 "%PYTHON%" -m pip install "git+https://github.com/OpenMOSS/MOSS-Transcribe-Diarize.git@9990574e6ac62390a21bcce25a914d66ac92c25e" modelscope requests mutagen Pillow
 if errorlevel 1 exit /b %ERRORLEVEL%
@@ -55,6 +57,8 @@ git -C "%ASMR_DIR%" checkout --detach %ASMR_COMMIT%
 if errorlevel 1 exit /b %ERRORLEVEL%
 
 "%PYTHON%" "%ROOT%moss_setup.py"
+if errorlevel 1 exit /b %ERRORLEVEL%
+"%PYTHON%" -c "from demucs.pretrained import get_model; get_model('htdemucs'); print('Demucs htdemucs ready')"
 if errorlevel 1 exit /b %ERRORLEVEL%
 
 echo [完成] MOSS、音訊分類器依賴與 ASMR Enhancer 已就緒。

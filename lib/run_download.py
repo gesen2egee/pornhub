@@ -160,6 +160,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _boolean_switch(parser, "translation", "開啟或關閉 OpenRouter 翻譯")
     _boolean_switch(parser, "asr", "開啟或關閉語音辨識")
+    _boolean_switch(parser, "demucs-asr", "開啟或關閉 ASR 前 Demucs 人聲分離")
     _boolean_switch(parser, "subtitles", "開啟或關閉外掛 SRT 輸出")
     _boolean_switch(parser, "dialogue-trim", "開啟或關閉依對白剪片")
     _boolean_switch(parser, "enhance", "開啟或關閉音訊增強")
@@ -235,6 +236,7 @@ def run_maintenance(args: argparse.Namespace) -> int | None:
             "video",
             FeatureSwitches(
                 asr=args.asr,
+                demucs_asr=args.demucs_asr,
                 subtitles=args.subtitles,
                 translation=args.translation,
                 dialogue_trim=args.dialogue_trim,
@@ -310,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
         getattr(args, name) is not None
         for name in (
             "asr",
+            "demucs_asr",
             "subtitles",
             "translation",
             "dialogue_trim",
@@ -339,6 +342,7 @@ def main(argv: list[str] | None = None) -> int:
             getattr(args, name) is not None
             for name in (
                 "asr",
+                "demucs_asr",
                 "subtitles",
                 "translation",
                 "dialogue_trim",
@@ -377,6 +381,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--chosen-height 只能用於 chosen 層")
     options = FeatureSwitches(
         asr=args.asr,
+        demucs_asr=args.demucs_asr,
         subtitles=args.subtitles,
         translation=args.translation,
         dialogue_trim=args.dialogue_trim,
