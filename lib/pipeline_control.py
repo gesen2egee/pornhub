@@ -344,27 +344,51 @@ def run_stage(
     options: FeatureSwitches,
     *,
     moss_worker=None,
+    audio_worker=None,
 ) -> int:
     ensure_output_directories()
     options = resolve_stage_options(stage_name, options)
     validate_stage_options(stage_name, options)
     print_effective_options(stage_name, options)
     with feature_environment(options):
-        if moss_worker is not None:
-            return _execute_stage(stage_name, options, moss_worker=moss_worker)
-        # 直接執行單層時，也讓該層所有來源共用同一個 MOSS 權重。
+        # 直接執行單層時，也讓該層所有來源共用 MOSS 與音訊 Enhance 權重。
         import full_video_pipeline
+        import audio_enhance_stage
 
-        session = (
+        moss_session = (
+            nullcontext(moss_worker)
+            if moss_worker is not None
+            else (
             full_video_pipeline.moss_asr_session()
             if options.asr and options.asr_backend == "moss"
             else nullcontext(None)
+            )
         )
-        with session as owned_worker:
-            return _execute_stage(stage_name, options, moss_worker=owned_worker)
+        enhance_session = (
+            nullcontext(audio_worker)
+            if audio_worker is not None
+            else (
+                audio_enhance_stage.audio_enhance_session()
+                if options.enhance
+                else nullcontext(None)
+            )
+        )
+        with moss_session as owned_moss, enhance_session as owned_audio:
+            return _execute_stage(
+                stage_name,
+                options,
+                moss_worker=owned_moss,
+                audio_worker=owned_audio,
+            )
 
 
-def _execute_stage(stage_name: str, options: FeatureSwitches, *, moss_worker=None) -> int:
+def _execute_stage(
+    stage_name: str,
+    options: FeatureSwitches,
+    *,
+    moss_worker=None,
+    audio_worker=None,
+) -> int:
     sources = list_stage_sources(
         stage_name, include_published=bool(options.force)
     )
@@ -393,6 +417,7 @@ def _execute_stage(stage_name: str, options: FeatureSwitches, *, moss_worker=Non
                     segment_gap=options.segment_gap,
                     force=options.force,
                     moss_worker=moss_worker,
+                    audio_worker=audio_worker,
                 )
             except Exception as exc:
                 print(f"  [FAIL] {exc}")
@@ -436,6 +461,7 @@ def _execute_stage(stage_name: str, options: FeatureSwitches, *, moss_worker=Non
                     work_bucket="03_videos",
                     archive_grid_on_done=options.archive_grid,
                     moss_worker=moss_worker,
+                    audio_worker=audio_worker,
                 )
             except Exception as exc:
                 print(f"  [FAIL] {exc}")
@@ -460,6 +486,7 @@ def _execute_stage(stage_name: str, options: FeatureSwitches, *, moss_worker=Non
         segment_gap=options.segment_gap,
         force=options.force,
         moss_worker=moss_worker,
+        audio_worker=audio_worker,
     )
     print(f"[chosen] 完成：成功 {successes}；失敗 {failures}")
     return failures
@@ -472,6 +499,10 @@ def run_stages(stage_names: Iterable[str], options: FeatureSwitches) -> int:
         and resolve_stage_options(stage_name, options).asr_backend == "moss"
         for stage_name in names
     )
+    use_enhance = any(
+        resolve_stage_options(stage_name, options).enhance
+        for stage_name in names
+    )
     has_sources = any(
         list_stage_sources(
             stage_name,
@@ -479,32 +510,48 @@ def run_stages(stage_names: Iterable[str], options: FeatureSwitches) -> int:
         )
         for stage_name in names
     )
-    if not use_moss or not has_sources:
+    if not has_sources:
         failures = 0
         for stage_name in names:
             print_stage_inventory(stage_name)
             failures += run_stage(stage_name, options)
         return failures
 
-    # 一次 BAT 執行共用同一個 MOSS worker，跨 Preview／Video／Chosen 也不重載。
+    # 一次 BAT 執行共用 MOSS 與音訊 Enhance worker，跨各層也不重載。
     import full_video_pipeline
+    import audio_enhance_stage
 
     previous_backend = os.environ.get("ASR_BACKEND")
-    os.environ["ASR_BACKEND"] = "moss"
+    if use_moss:
+        os.environ["ASR_BACKEND"] = "moss"
     try:
-        with full_video_pipeline.moss_asr_session() as moss_worker:
+        moss_session = (
+            full_video_pipeline.moss_asr_session()
+            if use_moss
+            else nullcontext(None)
+        )
+        enhance_session = (
+            audio_enhance_stage.audio_enhance_session()
+            if use_enhance
+            else nullcontext(None)
+        )
+        with moss_session as moss_worker, enhance_session as audio_worker:
             failures = 0
             for stage_name in names:
                 print_stage_inventory(stage_name)
                 failures += run_stage(
-                    stage_name, options, moss_worker=moss_worker
+                    stage_name,
+                    options,
+                    moss_worker=moss_worker,
+                    audio_worker=audio_worker,
                 )
             return failures
     finally:
-        if previous_backend is None:
-            os.environ.pop("ASR_BACKEND", None)
-        else:
-            os.environ["ASR_BACKEND"] = previous_backend
+        if use_moss:
+            if previous_backend is None:
+                os.environ.pop("ASR_BACKEND", None)
+            else:
+                os.environ["ASR_BACKEND"] = previous_backend
 
 
 def run_interactive(

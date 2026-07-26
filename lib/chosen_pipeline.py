@@ -200,6 +200,7 @@ def process_chosen_grid(
     segment_gap: float = 1.5,
     force: bool = False,
     moss_worker=None,
+    audio_worker=None,
 ) -> Path:
     """九宮格：代理 → MOSS → 1080P（可分段）→ 判斷 enhance → 06_good，JPG→04。"""
     import full_video_pipeline
@@ -228,6 +229,7 @@ def process_chosen_grid(
         work_bucket="05_chosen",
         archive_grid_on_done=archive_grid,
         moss_worker=moss_worker,
+        audio_worker=audio_worker,
     )
 
 
@@ -247,6 +249,7 @@ def process_chosen_video(
     segment_gap: float = 1.5,
     force: bool = False,
     moss_worker=None,
+    audio_worker=None,
 ) -> Path:
     """影片只作為 URL 載體；所有處理都重新走 Chosen 的高畫質管線。
 
@@ -361,6 +364,7 @@ def process_chosen_video(
         enable_translation=translation_enabled,
         enable_enhance=enhance_enabled,
         asr_cache=cache,
+        audio_worker=audio_worker,
     )
     if final_video.exists():
         final_video.unlink()

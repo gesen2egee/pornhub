@@ -7,6 +7,7 @@ import glob
 import os
 import re
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import download_maintenance as maintenance
@@ -242,6 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run_maintenance(args: argparse.Namespace) -> int | None:
     if args.grid:
+        import audio_enhance_stage
         import full_video_pipeline
 
         ensure_output_directories()
@@ -273,23 +275,36 @@ def run_maintenance(args: argparse.Namespace) -> int | None:
         try:
             validate_stage_options("video", options)
             with feature_environment(options):
-                full_video_pipeline.process_full_video_from_grid(
-                    args.grid.resolve(),
-                    final_dir=VIDEOS_DIR,
-                    archive_dir=DOWNLOADED_DIR,
-                    keep_proxy=args.keep_proxy or options.keep_work,
-                    max_height=options.video_height,
-                    enable_enhance=options.enhance,
-                    enable_asr=options.asr,
-                    export_subtitles=options.subtitles,
-                    enable_dialogue_trim=options.dialogue_trim,
-                    enable_translation=options.translation,
-                    enable_metadata=options.metadata,
-                    archive_grid_on_done=options.archive_grid,
-                    dialogue_trim_threshold=options.trim_threshold,
-                    segment_gap=options.segment_gap,
-                    force=options.force,
+                moss_session = (
+                    full_video_pipeline.moss_asr_session()
+                    if options.asr and options.asr_backend == "moss"
+                    else nullcontext(None)
                 )
+                enhance_session = (
+                    audio_enhance_stage.audio_enhance_session()
+                    if options.enhance
+                    else nullcontext(None)
+                )
+                with moss_session as moss_worker, enhance_session as audio_worker:
+                    full_video_pipeline.process_full_video_from_grid(
+                        args.grid.resolve(),
+                        final_dir=VIDEOS_DIR,
+                        archive_dir=DOWNLOADED_DIR,
+                        keep_proxy=args.keep_proxy or options.keep_work,
+                        max_height=options.video_height,
+                        enable_enhance=options.enhance,
+                        enable_asr=options.asr,
+                        export_subtitles=options.subtitles,
+                        enable_dialogue_trim=options.dialogue_trim,
+                        enable_translation=options.translation,
+                        enable_metadata=options.metadata,
+                        archive_grid_on_done=options.archive_grid,
+                        dialogue_trim_threshold=options.trim_threshold,
+                        segment_gap=options.segment_gap,
+                        force=options.force,
+                        moss_worker=moss_worker,
+                        audio_worker=audio_worker,
+                    )
             return 0
         except Exception as exc:
             print(f"[FAIL] {exc}", file=sys.stderr)

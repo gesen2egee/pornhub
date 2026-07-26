@@ -1182,13 +1182,27 @@ enh.process_file({str(part)!r}, {str(enhanced_path)!r}, settings)
     return out_parts, any_enhanced
 
 
-def enhance_full_video(video: Path) -> tuple[Path, bool]:
+def enhance_full_video(
+    video: Path,
+    audio_worker=None,
+) -> tuple[Path, bool]:
     """整片走既有 prepare_audio_media。"""
     from audio_enhance_stage import auto_enhance_enabled, prepare_audio_media
 
     if not auto_enhance_enabled():
         return video, False
-    prepared = prepare_audio_media([video])
+    try:
+        prepared = (
+            prepare_audio_media([video])
+            if audio_worker is None
+            else audio_worker.prepare([video])
+        )
+    except RuntimeError as exc:
+        if audio_worker is None:
+            raise
+        _log(f"  [音訊 Enhance 常駐] 失敗，回退單次程序：{exc}")
+        audio_worker.close()
+        prepared = prepare_audio_media([video])
     media = prepared.get(video)
     if not media:
         return video, False
@@ -1226,6 +1240,7 @@ def run_parallel_delivery_phase(
     enable_translation: bool,
     enable_enhance: bool,
     asr_cache: Path,
+    audio_worker=None,
 ) -> tuple[Path, str, str, bool]:
     """平行執行 OpenRouter、切塊下載與切塊後 enhance，全部完成才回傳。"""
     high_path = work_dir / f"{video_stem}.high.mp4"
@@ -1235,6 +1250,11 @@ def run_parallel_delivery_phase(
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="translate") as translator, ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="enhance"
     ) as enhancer:
+        def submit_enhance(path: Path) -> Future[tuple[Path, bool]]:
+            if audio_worker is None:
+                return enhancer.submit(enhance_full_video, path)
+            return enhancer.submit(enhance_full_video, path, audio_worker)
+
         translation_future: Future[dict[str, Any]] | None = None
         if enable_translation:
             _log("  [第二階段] OpenRouter 翻譯、高畫質下載、Enhance 可同時進行")
@@ -1249,7 +1269,7 @@ def run_parallel_delivery_phase(
             _log("  [第二階段] 下載完整高畫質影片")
             download_high_full(video_url, high_path)
             enhance_future = (
-                enhancer.submit(enhance_full_video, high_path)
+                submit_enhance(high_path)
                 if enable_enhance
                 else None
             )
@@ -1265,7 +1285,7 @@ def run_parallel_delivery_phase(
                 part_futures.append(
                     (
                         part,
-                        enhancer.submit(enhance_full_video, part)
+                        submit_enhance(part)
                         if enable_enhance
                         else None,
                     )
@@ -1376,6 +1396,7 @@ def process_full_video_from_grid(
     work_bucket: str = "03_videos",
     archive_grid_on_done: bool = True,
     moss_worker: MossAsrWorker | None = None,
+    audio_worker=None,
 ) -> Path:
     """
     單支來源循序流程：從九宮格或影片取得 URL，低畫質代理 → ASR/翻譯 →
@@ -1616,6 +1637,7 @@ def process_full_video_from_grid(
                 enable_translation=enable_translation,
                 enable_enhance=enable_enhance,
                 asr_cache=asr_cache,
+                audio_worker=audio_worker,
             )
         )
     outcome = asr.get("outcome") or outcome

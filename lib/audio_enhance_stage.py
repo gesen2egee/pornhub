@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import uuid
+from contextlib import contextmanager, redirect_stdout
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -419,8 +420,31 @@ def _write_report(analyses: list[AudioAnalysis]) -> None:
     )
 
 
-def _prepare_audio_media_local(videos: list[Path]) -> dict[Path, PreparedMedia]:
-    """先分類全部影片，釋放分類器後再增強，最後交給 ASR。"""
+class AudioEnhanceSession:
+    """在整個下載任務內重用音訊分類器與 ASMR Enhancer 權重。"""
+
+    def __init__(self) -> None:
+        self.classifier: AudioClassifier | None = None
+        self.enhancer: Any | None = None
+        self.settings: Any | None = None
+
+    def prepare(self, videos: list[Path]) -> dict[Path, PreparedMedia]:
+        return _prepare_audio_media_local(videos, session=self)
+
+    def close(self) -> None:
+        if self.classifier is not None:
+            self.classifier.close()
+            self.classifier = None
+        self.enhancer = None
+        self.settings = None
+
+
+def _prepare_audio_media_local(
+    videos: list[Path],
+    *,
+    session: AudioEnhanceSession | None = None,
+) -> dict[Path, PreparedMedia]:
+    """分析並增強；提供 session 時權重會保留給下一批影片。"""
     if not videos:
         return {}
     raw: list[tuple[Path, list[np.ndarray], AudioMetrics]] = []
@@ -452,9 +476,12 @@ def _prepare_audio_media_local(videos: list[Path]) -> dict[Path, PreparedMedia]:
             prepared[video] = PreparedMedia(video, video, False, analysis)
 
     if raw:
-        classifier: AudioClassifier | None = None
+        classifier = session.classifier if session is not None else None
         try:
-            classifier = AudioClassifier()
+            if classifier is None:
+                classifier = AudioClassifier()
+                if session is not None:
+                    session.classifier = classifier
             for video, clips, metrics in raw:
                 music_score, speech_score = classifier.classify(clips)
                 analysis = decide_audio(
@@ -490,7 +517,7 @@ def _prepare_audio_media_local(videos: list[Path]) -> dict[Path, PreparedMedia]:
                 analyses.append(analysis)
                 prepared[video] = PreparedMedia(video, video, False, analysis)
         finally:
-            if classifier is not None:
+            if classifier is not None and session is None:
                 classifier.close()
 
     targets = [
@@ -499,10 +526,16 @@ def _prepare_audio_media_local(videos: list[Path]) -> dict[Path, PreparedMedia]:
         if prepared[video].analysis.decision == "enhance"
     ]
     if targets:
-        enhancer = _load_enhancer()
-        settings = enhancer.Settings(
-            device=os.getenv("ASMR_ENHANCER_DEVICE", "auto")
-        )
+        enhancer = session.enhancer if session is not None else None
+        settings = session.settings if session is not None else None
+        if enhancer is None or settings is None:
+            enhancer = _load_enhancer()
+            settings = enhancer.Settings(
+                device=os.getenv("ASMR_ENHANCER_DEVICE", "auto")
+            )
+            if session is not None:
+                session.enhancer = enhancer
+                session.settings = settings
         for index, video in enumerate(targets, 1):
             temporary = _temporary_output(video)
             print(f"音訊增強 {index}/{len(targets)}：{video.name}", flush=True)
@@ -533,6 +566,106 @@ def _analysis_from_dict(data: dict[str, Any]) -> AudioAnalysis:
         music_score=data.get("music_score"),
         speech_score=data.get("speech_score"),
     )
+
+
+def _prepared_entries(prepared: dict[Path, PreparedMedia]) -> list[dict[str, Any]]:
+    return [
+        {
+            "source": str(item.source),
+            "media_input": str(item.media_input),
+            "enhanced": item.enhanced,
+            "analysis": asdict(item.analysis),
+        }
+        for item in prepared.values()
+    ]
+
+
+def _prepared_from_entries(entries: list[dict[str, Any]]) -> dict[Path, PreparedMedia]:
+    prepared: dict[Path, PreparedMedia] = {}
+    for entry in entries:
+        source = Path(entry["source"])
+        prepared[source] = PreparedMedia(
+            source=source,
+            media_input=Path(entry["media_input"]),
+            enhanced=bool(entry["enhanced"]),
+            analysis=_analysis_from_dict(entry["analysis"]),
+        )
+    return prepared
+
+
+class AudioEnhanceWorker:
+    """常駐音訊 worker；整次任務僅載入一次分類器／Enhancer。"""
+
+    def __init__(self) -> None:
+        python = Path(os.getenv("AUDIO_STAGE_PYTHON", str(DEFAULT_STAGE_PYTHON)))
+        if not python.is_file():
+            raise RuntimeError(
+                f"找不到字幕音訊處理環境：{python}。請先執行 00_setup_or_update.bat。"
+            )
+        environment = os.environ.copy()
+        environment["PYTHONUTF8"] = "1"
+        self._process = subprocess.Popen(
+            [str(python), str(Path(__file__).resolve()), "--prepare-worker"],
+            cwd=str(ROOT),
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+        )
+        self._closed = False
+        print("[音訊 Enhance 常駐] 已啟動；權重將在首次使用後保留", flush=True)
+
+    def prepare(self, videos: list[Path]) -> dict[Path, PreparedMedia]:
+        if self._closed or self._process.stdin is None or self._process.stdout is None:
+            raise RuntimeError("音訊 Enhance 常駐程序已關閉")
+        request = {"videos": [str(Path(video).resolve()) for video in videos]}
+        try:
+            self._process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+            self._process.stdin.flush()
+            line = self._process.stdout.readline()
+        except OSError as exc:
+            raise RuntimeError("音訊 Enhance 常駐程序通訊失敗") from exc
+        if not line:
+            raise RuntimeError(
+                f"音訊 Enhance 常駐程序提早結束，ExitCode={self._process.poll()}"
+            )
+        try:
+            reply = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"音訊 Enhance 常駐程序回傳無效 JSON：{line[:160]}") from exc
+        if reply.get("error"):
+            raise RuntimeError(f"音訊 Enhance 常駐程序失敗：{reply['error']}")
+        entries = reply.get("prepared")
+        if not isinstance(entries, list):
+            raise RuntimeError("音訊 Enhance 常駐程序回傳格式不符。")
+        return _prepared_from_entries(entries)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self._process.stdin is not None and self._process.poll() is None:
+                self._process.stdin.write('{"command":"shutdown"}\n')
+                self._process.stdin.flush()
+                self._process.stdin.close()
+            self._process.wait(timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            self._process.kill()
+            self._process.wait(timeout=15)
+
+
+@contextmanager
+def audio_enhance_session():
+    """建立任務範圍的常駐音訊 Enhance worker。"""
+    worker = AudioEnhanceWorker()
+    try:
+        yield worker
+    finally:
+        worker.close()
 
 
 def prepare_audio_media(videos: list[Path]) -> dict[Path, PreparedMedia]:
@@ -573,17 +706,7 @@ def prepare_audio_media(videos: list[Path]) -> dict[Path, PreparedMedia]:
             raise RuntimeError(
                 f"字幕音訊處理子程序失敗，ExitCode={result.returncode}。"
             )
-        entries = json.loads(result_path.read_text(encoding="utf-8"))
-        prepared: dict[Path, PreparedMedia] = {}
-        for entry in entries:
-            source = Path(entry["source"])
-            prepared[source] = PreparedMedia(
-                source=source,
-                media_input=Path(entry["media_input"]),
-                enhanced=bool(entry["enhanced"]),
-                analysis=_analysis_from_dict(entry["analysis"]),
-            )
-        return prepared
+        return _prepared_from_entries(json.loads(result_path.read_text(encoding="utf-8")))
     finally:
         manifest.unlink(missing_ok=True)
         result_path.unlink(missing_ok=True)
@@ -597,20 +720,37 @@ def _run_manifest(manifest: Path, result_path: Path) -> int:
     prepared = _prepare_audio_media_local(videos)
     result_path.write_text(
         json.dumps(
-            [
-                {
-                    "source": str(item.source),
-                    "media_input": str(item.media_input),
-                    "enhanced": item.enhanced,
-                    "analysis": asdict(item.analysis),
-                }
-                for item in prepared.values()
-            ],
+            _prepared_entries(prepared),
             ensure_ascii=False,
             indent=2,
         ),
         encoding="utf-8",
     )
+    return 0
+
+
+def _run_prepare_worker() -> int:
+    """stdin/stdout JSON worker；日誌改走 stderr，避免干擾協定。"""
+    protocol_stdout = sys.stdout
+    session = AudioEnhanceSession()
+    try:
+        for raw in sys.stdin:
+            try:
+                request = json.loads(raw)
+                if request.get("command") == "shutdown":
+                    return 0
+                videos = request.get("videos")
+                if not isinstance(videos, list) or not videos:
+                    raise ValueError("videos 必須是非空陣列")
+                with redirect_stdout(sys.stderr):
+                    prepared = session.prepare([Path(value) for value in videos])
+                reply: dict[str, Any] = {"prepared": _prepared_entries(prepared)}
+            except Exception as exc:
+                reply = {"error": str(exc)}
+            protocol_stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
+            protocol_stdout.flush()
+    finally:
+        session.close()
     return 0
 
 
@@ -660,9 +800,16 @@ def main() -> int:
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--prepare-manifest", type=Path, required=True)
-    parser.add_argument("--result", type=Path, required=True)
+    parser.add_argument("--prepare-manifest", type=Path)
+    parser.add_argument("--result", type=Path)
+    parser.add_argument("--prepare-worker", action="store_true")
     args = parser.parse_args()
+    if args.prepare_worker:
+        if args.prepare_manifest or args.result:
+            parser.error("--prepare-worker 不可與 manifest/result 同時使用")
+        return _run_prepare_worker()
+    if not args.prepare_manifest or not args.result:
+        parser.error("--prepare-manifest 與 --result 必須同時提供")
     return _run_manifest(args.prepare_manifest, args.result)
 
 

@@ -248,6 +248,7 @@ def process_preview_from_grid(
     segment_gap: float = SEGMENT_GAP,
     force: bool = False,
     moss_worker=None,
+    audio_worker=None,
 ) -> Path:
     """單支預覽：3 分鐘低畫質 → MOSS → 語音剪片 → 自動 enhance → 軟 SRT。"""
     import full_video_pipeline as fvp
@@ -463,7 +464,11 @@ def process_preview_from_grid(
     enhanced = False
     if enable_enhance:
         _log("  [增強] Preview 音訊增強已開啟")
-        publish_src, enhanced = fvp.enhance_full_video(publish_src)
+        publish_src, enhanced = (
+            fvp.enhance_full_video(publish_src)
+            if audio_worker is None
+            else fvp.enhance_full_video(publish_src, audio_worker)
+        )
 
     # 4) 發布 + 軟 SRT
     _log(f"  [4/4] 發布 → {final_video.name} + .srt")
