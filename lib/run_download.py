@@ -216,6 +216,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="240P 串流下載與 ASR 的區段秒數，預設 180",
     )
     parser.add_argument(
+        "--asr-batch-size",
+        type=int,
+        metavar="COUNT",
+        help="MOSS 動態 ASR 佇列的最大 batch 數，預設 3",
+    )
+    parser.add_argument(
         "--retry-subtitles",
         action="store_true",
         help="只修復舊字幕，不下載新影片",
@@ -261,6 +267,7 @@ def run_maintenance(args: argparse.Namespace) -> int | None:
                 trim_threshold=args.trim_threshold,
                 segment_gap=args.segment_gap,
                 asr_chunk_seconds=args.asr_chunk_seconds,
+                asr_batch_size=args.asr_batch_size,
             ),
         )
         try:
@@ -304,6 +311,7 @@ def main(argv: list[str] | None = None) -> int:
         "chosen_height",
         "trim_threshold",
         "asr_chunk_seconds",
+        "asr_batch_size",
     ):
         value = getattr(args, name)
         if value is not None and value <= 0:
@@ -342,6 +350,7 @@ def main(argv: list[str] | None = None) -> int:
             "trim_threshold",
             "segment_gap",
             "asr_chunk_seconds",
+            "asr_batch_size",
         )
     ):
         parser.error("--list 只盤點檔案，不能混用功能開關")
@@ -374,6 +383,7 @@ def main(argv: list[str] | None = None) -> int:
                 "trim_threshold",
                 "segment_gap",
                 "asr_chunk_seconds",
+                "asr_batch_size",
             )
         )
     ):
@@ -415,6 +425,7 @@ def main(argv: list[str] | None = None) -> int:
         trim_threshold=args.trim_threshold,
         segment_gap=args.segment_gap,
         asr_chunk_seconds=args.asr_chunk_seconds,
+        asr_batch_size=args.asr_batch_size,
     )
     if args.list:
         for stage in stages:

@@ -57,6 +57,7 @@ class FeatureSwitches:
     trim_threshold: float | None = None
     segment_gap: float | None = None
     asr_chunk_seconds: int | None = None
+    asr_batch_size: int | None = None
 
 
 STAGES = {
@@ -174,6 +175,8 @@ def apply_feature_switches(options: FeatureSwitches) -> None:
         os.environ["PREVIEW_SECONDS"] = str(options.preview_seconds)
     if options.asr_chunk_seconds is not None:
         os.environ["ASR_STREAM_CHUNK_SECONDS"] = str(options.asr_chunk_seconds)
+    if options.asr_batch_size is not None:
+        os.environ["MOSS_ASR_BATCH_SIZE"] = str(options.asr_batch_size)
     if options.asr_backend:
         os.environ["ASR_BACKEND"] = options.asr_backend
         os.environ["CHOSEN_ASR_BACKEND"] = options.asr_backend
@@ -197,7 +200,7 @@ def resolve_stage_options(
         "subtitles": True,
         "translation": True,
         "dialogue_trim": True,
-        "enhance": stage_name == "chosen",
+        "enhance": True,
         "metadata": True,
         "archive_grid": stage_name != "preview",
         "keep_work": False,
@@ -206,7 +209,7 @@ def resolve_stage_options(
         "preview_seconds": 180,
         "video_height": 480,
         "chosen_height": 1080,
-        "asr_backend": "moss" if stage_name == "chosen" else "whisper",
+        "asr_backend": "moss",
         "translation_model": (
             "x-ai/grok-4.5" if stage_name == "chosen" else "x-ai/grok-4.3"
         ),
@@ -214,6 +217,7 @@ def resolve_stage_options(
         "trim_threshold": 30.0,
         "segment_gap": 1.5,
         "asr_chunk_seconds": 180,
+        "asr_batch_size": 3,
     }
     values = {
         name: getattr(options, name)
@@ -252,7 +256,7 @@ def print_effective_options(stage_name: str, options: FeatureSwitches) -> None:
         f"Backend={options.asr_backend}｜Model={options.translation_model}｜"
         f"Reasoning={options.reasoning_effort}｜"
         f"剪片門檻={options.trim_threshold}s｜段落間隔={options.segment_gap}s"
-        f"｜ASR區段={options.asr_chunk_seconds}s"
+        f"｜ASR區段={options.asr_chunk_seconds}s｜ASR批次上限={options.asr_batch_size}"
     )
 
 
@@ -271,6 +275,7 @@ def feature_environment(options: FeatureSwitches):
         "REUSE_ASR_RESULT",
         "PREVIEW_SECONDS",
         "ASR_STREAM_CHUNK_SECONDS",
+        "MOSS_ASR_BATCH_SIZE",
         "ASR_BACKEND",
         "CHOSEN_ASR_BACKEND",
         "OPENROUTER_MODEL",

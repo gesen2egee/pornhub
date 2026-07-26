@@ -108,8 +108,8 @@ output/01_preview_images/
 
 將素材放入對應目錄：
 
-- `output/02_preview_videos/`：九宮格 → **前 3 分鐘低畫質**，**Whisper** 估語音後剪片（淨語音 ≤30s 則保留整段），**軟 SRT**（不硬字幕），**不 enhance**。
-- `output/03_videos/`：九宮格 → **480P**，**Whisper** 字幕並據此剪片（對白淨長 >30s），同名**軟 SRT**，**不 enhance**。
+- `output/02_preview_videos/`：九宮格 → **前 3 分鐘低畫質**，**MOSS** 語音辨識後剪片（淨語音 ≤30s 則保留整段），自動判斷並 **enhance**，輸出軟 SRT。
+- `output/03_videos/`：九宮格 → **480P**，**MOSS** 字幕並據此剪片（對白淨長 >30s），高畫質切塊下載完成就排入自動 **enhance**，輸出同名軟 SRT。
 - `output/05_chosen/`：九宮格**或含 URL 的影片**（影片只作 URL 載體）→ **1080P + MOSS + Grok 4.5（minimal）**，**判斷 enhance**；先用低畫質分析，再只下載需要的高畫質區段，完成進 `06_good`；九宮格歸檔 `04_downloaded`，來源影片刪除。
 
 ### 3. 下載與字幕
@@ -125,7 +125,7 @@ yt-dlp DEBUG 與下載百分比訊息。
 1. 以 240P 每 180 秒下載一段；每段下載完成立刻排入 `Demucs → ASR`，下載與 ASR 可重疊。必須等全部低畫質區段與 ASR 都完成，才進下一階段。
 2. 同時執行 OpenRouter 翻譯、高畫質切塊下載，以及每個已下載切塊的自動 `enhance`；三條工作都完成後才 retime 字幕、拼接與發布。
 
-Preview 本身最多只有 180 秒，因此仍是一個低畫質片段的 `Demucs → ASR` 流程，沒有高畫質切塊與 enhance 工作。
+Preview 本身最多只有 180 秒，因此是單一低畫質片段的 `Demucs → MOSS` 流程；下載與剪片完成後同樣會自動判斷 enhance。
 
 只盤點、不下載：
 
@@ -147,8 +147,8 @@ Preview 本身最多只有 180 秒，因此仍是一個低畫質片段的 `Demuc
 02_run_download.bat --stages video --no-translation --no-dialogue-trim
 02_run_download.bat --stages chosen --subtitles --enhance --metadata --archive
 02_run_download.bat --stages preview --preview-seconds 90 --no-keep-work
-02_run_download.bat --stages video --video-height 480 --asr-backend whisper
-02_run_download.bat --stages video --asr-stream --asr-chunk-seconds 180
+02_run_download.bat --stages video --video-height 480 --asr-backend moss
+02_run_download.bat --stages video --asr-stream --asr-chunk-seconds 180 --asr-batch-size 3
 02_run_download.bat --stages chosen --no-asr-stream
 02_run_download.bat --stages chosen --chosen-height 1080 --translation-model x-ai/grok-4.5 --reasoning-effort minimal
 ```
@@ -167,7 +167,7 @@ Preview 本身最多只有 180 秒，因此仍是一個低畫質片段的 `Demuc
 Chosen 有 URL 時不會拿既有高畫質成品接續，會重新下載規劃出的高畫質片段；
 若連 ASR 字幕快取也要重做，請加上 `--no-reuse-cache`。
 剪片門檻與區段合併間隔可分別用 `--trim-threshold`、`--segment-gap` 調整。
-`asr-stream` 預設開啟；`--asr-chunk-seconds` 預設為 180。關閉 `--asr-stream` 時，會退回完整 240P 代理下載完成後再 ASR，其他功能不會被連帶關閉。
+`asr-stream` 預設開啟；`--asr-chunk-seconds` 預設為 180。下載速度領先 ASR 時，已就緒片段會進入佇列，並在 `--asr-batch-size`（預設 3）上限內自動提高 MOSS 的實際 batch。關閉 `--asr-stream` 時，會退回完整 240P 代理下載完成後再 ASR，其他功能不會被連帶關閉。
 目前剪片規則是：停頓小於門檻時完整保留；停頓大於或等於門檻時整段移除，
 不會再對字幕前後自動增加 0.75 秒緩衝。
 

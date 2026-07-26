@@ -187,7 +187,7 @@ def process_preview_from_grid(
     segment_gap: float = SEGMENT_GAP,
     force: bool = False,
 ) -> Path:
-    """單支預覽：3 分鐘低畫質 → Whisper → 語音剪片 → 軟 SRT。"""
+    """單支預覽：3 分鐘低畫質 → MOSS → 語音剪片 → 自動 enhance → 軟 SRT。"""
     import full_video_pipeline as fvp
     import video_meta
 
@@ -210,7 +210,7 @@ def process_preview_from_grid(
         ).strip().casefold() not in {"0", "false", "no", "off"}
     if enable_enhance is None:
         enable_enhance = os.getenv(
-            "AUDIO_AUTO_ENHANCE", "0"
+            "AUDIO_AUTO_ENHANCE", "1"
         ).strip().casefold() not in {"0", "false", "no", "off"}
     translation_enabled = os.getenv(
         "ENABLE_TRANSLATION", "1"
@@ -247,6 +247,7 @@ def process_preview_from_grid(
                 and meta.get("translated_srt_present")
                 and status.get("outcome") != "failed"
                 and (not export_subtitles or final_srt.exists())
+                and (not enable_enhance or status.get("audio_enhanced"))
             )
         ):
             _log(f"[SKIP] 預覽已完成：{final_video.name}")
@@ -363,9 +364,10 @@ def process_preview_from_grid(
             f" → 保留整段預覽（不剪）"
         )
 
+    enhanced = False
     if enable_enhance:
         _log("  [增強] Preview 音訊增強已開啟")
-        publish_src, _enhanced = fvp.enhance_full_video(publish_src)
+        publish_src, enhanced = fvp.enhance_full_video(publish_src)
 
     # 4) 發布 + 軟 SRT
     _log(f"  [4/4] 發布 → {final_video.name} + .srt")
@@ -405,7 +407,7 @@ def process_preview_from_grid(
                 translated_srt=translated_srt or None,
                 subtitle_status=video_meta.build_subtitle_status(
                     outcome,
-                    audio_enhanced=False,
+                    audio_enhanced=enhanced,
                 ),
             )
             if source_is_grid and jpg_path.exists():
@@ -439,7 +441,7 @@ def process_preview_directory(preview_dir: Path | None = None) -> int:
         return 0
     _log(
         f"[+] 預覽管線 [{root}/] 共 {len(jpgs)} 張"
-        f"（前 {PREVIEW_SECONDS}s 低畫質 → Whisper → 語音剪片 → 軟 SRT）"
+        f"（前 {PREVIEW_SECONDS}s 低畫質 → MOSS → 語音剪片 → enhance → 軟 SRT）"
     )
     fail = 0
     for idx, jpg in enumerate(jpgs, 1):

@@ -18,6 +18,8 @@ import sys
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Thread
 from typing import Any, Iterator
 
 import segment_cutter
@@ -722,6 +724,106 @@ def run_asr_only(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
     return json.loads(result_path.read_text(encoding="utf-8"))
 
 
+def run_asr_batch_local(proxy_paths: list[Path]) -> list[dict[str, Any]]:
+    """同一個 backend 載入一次，對多個已就緒 ASR 片段做真正的 batch。"""
+    from asr_backends import create_backend
+    from translate_srt_openrouter import format_srt
+
+    if not proxy_paths:
+        return []
+    backend = create_backend().load()
+    _log(f"  [2/5] {backend.display_name} 批次辨識：BS={len(proxy_paths)}")
+    release = getattr(backend, "release_transient_memory", None)
+    try:
+        batch_fn = getattr(backend, "transcribe_batch", None)
+        if callable(batch_fn):
+            values = list(batch_fn(proxy_paths))
+        else:
+            values = [backend.transcribe(path) for path in proxy_paths]
+    finally:
+        if callable(release):
+            release()
+    if len(values) != len(proxy_paths):
+        raise RuntimeError(
+            f"ASR 批次回傳 {len(values)} 筆，預期 {len(proxy_paths)} 筆。"
+        )
+    results: list[dict[str, Any]] = []
+    for cues, language in values:
+        results.append(
+            {
+                "language": language,
+                "original_srt": format_srt(cues) if cues else "",
+                "translated_srt": "",
+                "outcome": "transcribed" if cues else "empty",
+                "cues": cues,
+            }
+        )
+    return results
+
+
+def _safe_asr_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """讓 MOSS 子程序輸出的 cues 一定可 JSON 序列化。"""
+    safe_cues = []
+    for cue in payload.get("cues") or []:
+        safe_cues.append(
+            {
+                "id": cue.get("id"),
+                "time": cue.get("time"),
+                "text": cue.get("text"),
+            }
+        )
+    result = dict(payload)
+    result["cues"] = safe_cues
+    return result
+
+
+def run_asr_batch(proxy_paths: list[Path], work_dir: Path) -> list[dict[str, Any]]:
+    """每段先 Demucs，再以目前可用的動態 BS 做 ASR。"""
+    from asr_audio import prepare_asr_audio
+    from asr_backends import selected_asr_backend_name
+
+    if not proxy_paths:
+        return []
+    asr_audio = [
+        prepare_asr_audio(path, work_dir / f"demucs-{index:03d}")
+        for index, path in enumerate(proxy_paths, 1)
+    ]
+    backend_name = selected_asr_backend_name()
+    current = Path(sys.executable).resolve()
+    if backend_name in {"voxtral", "grok-stt", "whisper"} or (
+        "moss" in str(current).casefold() and current.exists()
+    ):
+        return run_asr_batch_local(asr_audio)
+
+    moss_python = Path(os.getenv("MOSS_PYTHON", str(DEFAULT_MOSS_PYTHON)))
+    if not moss_python.is_file():
+        raise RuntimeError(
+            f"找不到 MOSS 環境：{moss_python}。請先執行 00_setup_or_update.bat。"
+        )
+    result_path = work_dir / "asr_batch_result.json"
+    result_path.unlink(missing_ok=True)
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["ENABLE_TRANSLATION"] = "0"
+    env.setdefault("ASR_BACKEND", "moss")
+    cmd = [
+        str(moss_python),
+        str(Path(__file__).resolve()),
+        "--asr-batch",
+        *(str(path) for path in asr_audio),
+        "--result",
+        str(result_path),
+    ]
+    _log(f"  [2/5] 啟動 MOSS 子程序批次 ASR：BS={len(asr_audio)}")
+    proc = subprocess.run(cmd, cwd=str(ROOT), env=env, check=False)
+    if proc.returncode != 0 or not result_path.is_file():
+        raise RuntimeError(f"MOSS 批次 ASR 子程序失敗，ExitCode={proc.returncode}")
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list) or len(payload) != len(proxy_paths):
+        raise RuntimeError("MOSS 批次 ASR 回傳格式或數量不符。")
+    return payload
+
+
 def _offset_asr_cues(cues: list[dict], offset: float, first_id: int) -> list[dict]:
     """把單一 3 分鐘 ASR 結果換回原影片的絕對時間軸。"""
     adjusted: list[dict] = []
@@ -768,24 +870,76 @@ def run_streamed_asr(
         f"  [ASR 串流] 240P 共 {len(ranges)} 段，每段最多 {chunk_seconds / 60:.1f} 分鐘；"
         "下載與 Demucs+ASR 同步排隊"
     )
-    futures: list[tuple[float, Future[dict[str, Any]]]] = []
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr") as executor:
-        for index, (start, end) in enumerate(ranges, 1):
-            proxy_part = work_dir / f"{video_stem}.proxy.asr{index:03d}.mp4"
-            download_proxy_range(video_url, proxy_part, start, end)
-            asr_work = work_dir / f"asr-{index:03d}"
-            futures.append((start, executor.submit(run_asr_only, proxy_part, asr_work)))
+    from asr_backends import asr_batch_size
 
-        merged: list[dict] = []
-        languages: list[str] = []
-        for index, (start, future) in enumerate(futures, 1):
-            result = future.result()
-            cues = result.get("cues") or []
-            merged.extend(_offset_asr_cues(cues, start, len(merged) + 1))
-            language = result.get("language")
-            if language and language not in languages:
-                languages.append(str(language))
-            _log(f"  [ASR 串流] 完成 {index}/{len(futures)}：{len(cues)} 段字幕")
+    job_queue: Queue[tuple[int, float, Path] | None] = Queue()
+    completed: dict[int, tuple[float, dict[str, Any]]] = {}
+    worker_errors: list[BaseException] = []
+    batch_limit = asr_batch_size()
+
+    def consume_asr_queue() -> None:
+        while True:
+            first = job_queue.get()
+            if first is None:
+                job_queue.task_done()
+                return
+            jobs = [first]
+            # 下載領先時，將已排隊的片段合併到既有 BS 上限；下載落後時自然維持 BS=1。
+            while len(jobs) < batch_limit:
+                try:
+                    next_job = job_queue.get_nowait()
+                except Empty:
+                    break
+                if next_job is None:
+                    job_queue.task_done()
+                    job_queue.put(None)
+                    break
+                jobs.append(next_job)
+            try:
+                queued = job_queue.qsize()
+                _log(
+                    f"  [ASR 佇列] 已就緒 {queued + len(jobs)} 段；"
+                    f"本批 BS={len(jobs)}/{batch_limit}"
+                )
+                batch_work = work_dir / f"asr-batch-{jobs[0][0]:03d}"
+                results = run_asr_batch([job[2] for job in jobs], batch_work)
+                for job, result in zip(jobs, results):
+                    completed[job[0]] = (job[1], result)
+            except BaseException as exc:
+                worker_errors.append(exc)
+                return
+            finally:
+                for _job in jobs:
+                    job_queue.task_done()
+
+    worker = Thread(target=consume_asr_queue, name="asr-queue", daemon=True)
+    worker.start()
+    for index, (start, end) in enumerate(ranges, 1):
+        if worker_errors:
+            break
+        proxy_part = work_dir / f"{video_stem}.proxy.asr{index:03d}.mp4"
+        download_proxy_range(video_url, proxy_part, start, end)
+        job_queue.put((index, start, proxy_part))
+        _log(f"  [ASR 佇列] 已排入第 {index}/{len(ranges)} 段；等待中 {job_queue.qsize()} 段")
+    job_queue.put(None)
+    worker.join()
+    if worker_errors:
+        raise RuntimeError(f"ASR 佇列失敗：{worker_errors[0]}") from worker_errors[0]
+    if len(completed) != len(ranges):
+        raise RuntimeError(
+            f"ASR 佇列完成數量不符：{len(completed)}/{len(ranges)}"
+        )
+
+    merged: list[dict] = []
+    languages: list[str] = []
+    for index in range(1, len(ranges) + 1):
+        start, result = completed[index]
+        cues = result.get("cues") or []
+        merged.extend(_offset_asr_cues(cues, start, len(merged) + 1))
+        language = result.get("language")
+        if language and language not in languages:
+            languages.append(str(language))
+        _log(f"  [ASR 串流] 完成 {index}/{len(ranges)}：{len(cues)} 段字幕")
 
     return {
         "language": ",".join(languages) or "multilingual",
@@ -1400,7 +1554,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--asr-only",
         type=Path,
-        help="僅對代理影片跑 ASR+翻譯，寫入 --result JSON",
+        help="僅對代理影片跑 ASR，寫入 --result JSON",
+    )
+    parser.add_argument(
+        "--asr-batch",
+        type=Path,
+        nargs="+",
+        metavar="AUDIO",
+        help="對多個已分離人聲軌做 MOSS 批次 ASR，寫入 --result JSON 陣列",
     )
     parser.add_argument("--result", type=Path, help="ASR 結果 JSON 路徑")
     parser.add_argument(
@@ -1421,22 +1582,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.asr_only:
+    if args.asr_only or args.asr_batch:
         if not args.result:
-            print("--asr-only 需要 --result", file=sys.stderr)
+            print("--asr-only 或 --asr-batch 需要 --result", file=sys.stderr)
             return 2
-        payload = run_asr_translate_local(args.asr_only.resolve())
-        # cues 可能含不可 JSON 的型別；只保留必要欄位
-        safe_cues = []
-        for cue in payload.get("cues") or []:
-            safe_cues.append(
-                {
-                    "id": cue.get("id"),
-                    "time": cue.get("time"),
-                    "text": cue.get("text"),
-                }
+        if args.asr_only and args.asr_batch:
+            print("--asr-only 不能與 --asr-batch 同時使用", file=sys.stderr)
+            return 2
+        if args.asr_batch:
+            payload: Any = run_asr_batch_local(
+                [path.resolve() for path in args.asr_batch]
             )
-        payload["cues"] = safe_cues
+            payload = [_safe_asr_payload(item) for item in payload]
+        else:
+            payload = _safe_asr_payload(run_asr_only_local(args.asr_only.resolve()))
         args.result.parent.mkdir(parents=True, exist_ok=True)
         args.result.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
