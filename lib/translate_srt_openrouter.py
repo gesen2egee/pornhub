@@ -34,6 +34,39 @@ SYSTEM_PROMPT = (
     "不要 Markdown、不要 JSON、不要前後文說明。"
 )
 
+# 精選下載：劇情整理 + 只譯必要句。歌詞則改完整翻譯（給 LLM 的備註）。
+SELECTIVE_SYSTEM_PROMPT = (
+    "你是成人影片字幕編輯與繁中翻譯。你會一次收到整部影片的 ASR 字幕"
+    "（每行 id|原文，可能是日文/英文/其他）。\n"
+    "\n"
+    "請嚴格依下列兩段輸出，不要 Markdown、不要 JSON、不要多餘說明：\n"
+    "\n"
+    "===PLOT===\n"
+    "用繁體中文整理本片劇情與對白主線，150–300 字。\n"
+    "寫清楚：人物關係、場景推進、關鍵衝突/指令/轉折、情緒走向。\n"
+    "不要逐句翻譯。\n"
+    "\n"
+    "===TRANSLATIONS===\n"
+    "只輸出「拿掉就會讓上下文看不懂或劇情斷裂」的字幕譯文。\n"
+    "格式：每行一條 id|繁體中文譯文\n"
+    "\n"
+    "刪句原則（寧可多刪、少留）：\n"
+    "1. 上下文看起來拿掉也沒問題的，就拿掉。\n"
+    "2. 可省略：填充語、重複句、無意義感嘆/呻吟、客套寒暄、"
+    "資訊已被前後句覆蓋的句子。\n"
+    "3. 可濃縮：連續同義句只留一句代表；不必每句都譯。\n"
+    "4. 必須保留：推進劇情、交代關係/動機、關鍵指令或轉折、"
+    "沒有它會聽不懂的句子。\n"
+    "5. id 必須是輸入原編號，不可改號、不可合併多 id 成一行。\n"
+    "6. 允許跳號（1|… 下一行直接 6|…）。\n"
+    "7. 譯文：自然口語繁體中文；禁止英文/日文/簡體殘留；保留成人語氣。\n"
+    "8. 不要輸出未出現在輸入的 id。\n"
+    "\n"
+    "【重要備註】若你判斷這些字幕主要是歌詞（歌曲/MV/卡拉 OK 唱詞、"
+    "反覆副歌等），不啟用精選省略：請在 ===TRANSLATIONS=== "
+    "對輸入的每一條 id 都輸出完整譯文，不要跳號刪句。"
+)
+
 
 def strip_speaker_labels(
     cues: list[dict[str, Any]],
@@ -444,6 +477,255 @@ def translate_cues(
         "batches": stats_sink,
     }
     return translated_cues
+
+
+def parse_plot_and_translations(raw: str) -> tuple[str, dict[int, str]]:
+    """解析精選翻譯回傳：===PLOT=== 與 ===TRANSLATIONS===。"""
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = text.replace("```", "").strip()
+
+    plot = ""
+    trans_body = text
+    plot_m = re.search(
+        r"===PLOT===\s*(.*?)(?====TRANSLATIONS===|\Z)",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    trans_m = re.search(
+        r"===TRANSLATIONS===\s*(.*)\Z",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if plot_m:
+        plot = plot_m.group(1).strip()
+    if trans_m:
+        trans_body = trans_m.group(1).strip()
+    elif not plot_m:
+        lines = text.splitlines()
+        plot_lines: list[str] = []
+        body_lines: list[str] = []
+        hit_trans = False
+        for line in lines:
+            if LINE_PATTERN.match(line.strip()):
+                hit_trans = True
+                body_lines.append(line)
+            elif not hit_trans:
+                plot_lines.append(line)
+            else:
+                body_lines.append(line)
+        plot = "\n".join(plot_lines).strip()
+        trans_body = "\n".join(body_lines)
+
+    translations = _parse_flat_lines(trans_body)
+    cleaned: dict[int, str] = {}
+    for cue_id, value in translations.items():
+        body = SPEAKER_LABEL_PATTERN.sub("", value).strip()
+        if body:
+            cleaned[int(cue_id)] = body
+    return plot, cleaned
+
+
+def is_selective_full_translation(
+    input_ids: set[int],
+    translated_ids: set[int],
+    *,
+    full_ratio: float = 0.95,
+) -> bool:
+    """保留比例夠高時視為完整翻譯（含 LLM 判斷為歌詞的情況）。"""
+    if not input_ids:
+        return True
+    if not translated_ids:
+        return False
+    return len(translated_ids & input_ids) >= max(
+        1, int(len(input_ids) * full_ratio + 0.999)
+    )
+
+
+def translate_cues_selective(
+    cues: list[dict[str, Any]],
+    api_key: str,
+    model: str = DEFAULT_MODEL,
+) -> dict[str, Any]:
+    """一次送全字幕：劇情整理 + 精選翻譯（可跳號）。
+
+    回傳：
+      plot, translations{id:text}, kept_cues, dropped_ids,
+      is_full（歌詞等完整翻譯）, raw, usage
+    用量寫入 LAST_TRANSLATE_STATS。
+    """
+    global LAST_TRANSLATE_STATS
+
+    prepared: list[dict[str, Any]] = []
+    speaker_prefixes: dict[int, str] = {}
+    by_id: dict[int, dict[str, Any]] = {}
+    for source in cues:
+        cue = dict(source)
+        text = str(cue.get("text", ""))
+        match = SPEAKER_LABEL_PATTERN.match(text)
+        cid = int(cue["id"])
+        speaker_prefixes[cid] = match.group(0).strip() if match else ""
+        cue["text"] = SPEAKER_LABEL_PATTERN.sub("", text).strip()
+        prepared.append(cue)
+        by_id[cid] = cue
+
+    if not prepared:
+        LAST_TRANSLATE_STATS = {
+            "model": model,
+            "mode": "selective",
+            "cues": 0,
+            "kept": 0,
+            "is_full": True,
+        }
+        return {
+            "plot": "",
+            "translations": {},
+            "kept_cues": [],
+            "dropped_ids": [],
+            "is_full": True,
+            "raw": "",
+            "usage": {},
+        }
+
+    flat = _format_flat_lines(
+        [{"id": c["id"], "text": c["text"]} for c in prepared]
+    )
+    user_content = (
+        f"以下是整部影片共 {len(prepared)} 條字幕（id|原文）。"
+        f"請先寫 ===PLOT=== 再寫 ===TRANSLATIONS===。\n"
+        f"刪句原則：上下文拿掉也沒問題的就拿掉；"
+        f"若判斷是歌詞則對每條 id 完整翻譯、不要省略。\n\n"
+        f"{flat}"
+    )
+
+    effort = (
+        os.getenv("TRANSLATE_REASONING_EFFORT", "minimal").strip() or "minimal"
+    )
+    model_l = model.casefold()
+    if effort == "none" and ("grok-4.5" in model_l or "grok-4-5" in model_l):
+        effort = "minimal"
+    max_tokens = int(os.getenv("TRANSLATE_MAX_TOKENS", "32000"))
+    read_timeout = int(os.getenv("TRANSLATE_TIMEOUT_SECONDS", "1200"))
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SELECTIVE_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "reasoning": {"effort": effort, "exclude": True},
+        "max_tokens": max_tokens,
+        "stream": False,
+        "usage": {"include": True},
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/openrouter-ai/openrouter",
+        "X-Title": "pornhub selective download translate",
+    }
+
+    t0 = time.perf_counter()
+    last_err: Exception | None = None
+    data: dict[str, Any] | None = None
+    for attempt in range(3):
+        try:
+            with requests.Session() as session:
+                response = session.post(
+                    OPENROUTER_URL,
+                    headers=headers,
+                    json=body,
+                    timeout=(20, read_timeout),
+                )
+            if response.status_code == 400:
+                err_text = (response.text or "")[:400]
+                if (
+                    "reasoning" in err_text.casefold()
+                    and "mandatory" in err_text.casefold()
+                    and body.get("reasoning", {}).get("effort") == "none"
+                ):
+                    body = dict(body)
+                    body["reasoning"] = {
+                        "effort": "minimal",
+                        "exclude": True,
+                    }
+                    continue
+            if response.status_code == 429 or response.status_code >= 500:
+                raise RuntimeError(
+                    f"OpenRouter 暫時錯誤 HTTP {response.status_code}"
+                )
+            response.raise_for_status()
+            data = response.json()
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            if attempt < 2:
+                time.sleep(2**attempt)
+            else:
+                raise RuntimeError(
+                    f"精選翻譯失敗：{last_err}"
+                ) from last_err
+    assert data is not None
+    wall = time.perf_counter() - t0
+    usage = _usage_from_response(data)
+    usage["wall_sec"] = round(wall, 3)
+    raw = _content_to_text(data["choices"][0]["message"]["content"])
+    plot, translations = parse_plot_and_translations(raw)
+    if not translations:
+        raise RuntimeError("精選翻譯回傳沒有可用的 id|譯文")
+
+    input_ids = {int(c["id"]) for c in prepared}
+    kept_ids = sorted(cid for cid in translations if cid in input_ids)
+    dropped_ids = sorted(input_ids - set(kept_ids))
+    is_full = is_selective_full_translation(input_ids, set(kept_ids))
+
+    kept_cues: list[dict[str, Any]] = []
+    for cid in kept_ids:
+        src = by_id[cid]
+        body_text = translations[cid]
+        prefix = speaker_prefixes.get(cid, "")
+        kept_cues.append(
+            {
+                "id": cid,
+                "time": src.get("time"),
+                "text": f"{prefix} {body_text}".strip(),
+                "source_text": src.get("text"),
+            }
+        )
+
+    print(
+        f"OpenRouter 精選翻譯：保留 {len(kept_cues)}/{len(prepared)} 條"
+        f"（{'完整/歌詞' if is_full else '精選省略'}；model={model}）",
+        flush=True,
+    )
+
+    LAST_TRANSLATE_STATS = {
+        "model": data.get("model") or model,
+        "mode": "selective",
+        "reasoning_effort": effort,
+        "format": "plot_plus_flat_id_pipe",
+        "cues": len(prepared),
+        "kept": len(kept_cues),
+        "dropped": len(dropped_ids),
+        "is_full": is_full,
+        "plot_chars": len(plot),
+        "api_calls": 1,
+        "wall_sec": round(wall, 3),
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+        "reasoning_tokens": usage.get("reasoning_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+        "cost_usd": usage.get("cost_usd"),
+        "batches": [usage],
+    }
+    return {
+        "plot": plot,
+        "translations": {c["id"]: c["text"] for c in kept_cues},
+        "kept_cues": kept_cues,
+        "dropped_ids": dropped_ids,
+        "is_full": is_full,
+        "raw": raw,
+        "usage": usage,
+    }
 
 
 def main() -> None:

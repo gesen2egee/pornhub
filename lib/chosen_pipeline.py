@@ -85,6 +85,7 @@ def _chosen_segment_plan(
     threshold: float,
     segment_gap: float,
     max_dur: float,
+    edge_padding: float = 0.75,
 ) -> tuple[list[tuple[float, float]] | None, str, str]:
     """依 Chosen 的 ASR 字幕決定是否需要高畫質分段下載。"""
     import full_video_pipeline as fvp
@@ -108,10 +109,11 @@ def _chosen_segment_plan(
         entries,
         max_gap=segment_gap,
         max_dur=max_dur if max_dur > 0 else 99999.0,
+        edge_padding=edge_padding,
     )
     _log(
-        f"  [剪片] 對白 > {threshold}s → 低畫質分析後只下載 "
-        f"{len(segments)} 個高畫質區段"
+        f"  [剪片] 停頓≥{segment_gap}s 剪掉；前後備援={edge_padding}s；"
+        f"對白 > {threshold}s → 只下載 {len(segments)} 個高畫質區段"
     )
     return segments, original, translated
 
@@ -193,6 +195,8 @@ def process_chosen_grid(
     export_subtitles: bool | None = None,
     enable_translation: bool | None = None,
     enable_dialogue_trim: bool | None = None,
+    enable_selective_download: bool | None = None,
+    enable_edge_padding: bool | None = None,
     enable_enhance: bool | None = None,
     enable_metadata: bool | None = None,
     max_height: int | None = None,
@@ -222,6 +226,8 @@ def process_chosen_grid(
         export_subtitles=export_subtitles,
         enable_dialogue_trim=enable_dialogue_trim,
         enable_translation=enable_translation,
+        enable_selective_download=enable_selective_download,
+        enable_edge_padding=enable_edge_padding,
         enable_metadata=enable_metadata,
         dialogue_trim_threshold=dialogue_trim_threshold,
         segment_gap=segment_gap,
@@ -242,6 +248,8 @@ def process_chosen_video(
     export_subtitles: bool | None = None,
     enable_translation: bool | None = None,
     enable_dialogue_trim: bool | None = None,
+    enable_selective_download: bool | None = None,
+    enable_edge_padding: bool | None = None,
     enable_enhance: bool | None = None,
     enable_metadata: bool | None = None,
     max_height: int | None = None,
@@ -285,15 +293,34 @@ def process_chosen_video(
         else enable_metadata
     )
     enhance_enabled = True if enable_enhance is None else enable_enhance
-    translation_enabled = os.getenv(
-        "ENABLE_TRANSLATION", "1"
-    ).strip().casefold() not in {"0", "false", "no", "off"}
+    translation_enabled = (
+        os.getenv("ENABLE_TRANSLATION", "1").strip().casefold()
+        not in {"0", "false", "no", "off"}
+        if enable_translation is None
+        else enable_translation
+    )
     trim_enabled = (
         os.getenv("ENABLE_DIALOGUE_TRIM", "1").strip().casefold()
         not in {"0", "false", "no", "off"}
         if enable_dialogue_trim is None
         else enable_dialogue_trim
     )
+    selective_enabled = (
+        full_video_pipeline.selective_download_enabled()
+        if enable_selective_download is None
+        else bool(enable_selective_download)
+    )
+    if selective_enabled and not translation_enabled:
+        _log("  [精選下載] 翻譯已關閉，精選下載自動改為 OFF")
+        selective_enabled = False
+    edge_pad_on = (
+        full_video_pipeline.edge_padding_enabled()
+        if enable_edge_padding is None
+        else bool(enable_edge_padding)
+    )
+    edge_pad = full_video_pipeline.resolve_edge_padding_seconds(edge_pad_on)
+    os.environ["ENABLE_SELECTIVE_DOWNLOAD"] = "1" if selective_enabled else "0"
+    os.environ["ENABLE_EDGE_PADDING"] = "1" if edge_pad_on else "0"
     video_path = Path(video_path).resolve()
     ensure_output_directories()
     final_dir = Path(final_dir)
@@ -348,12 +375,33 @@ def process_chosen_video(
         asr = chosen_asr
         source_duration = float(asr.get("source_duration") or 0.0)
     os.environ["HIGH_VIDEO_HEIGHT"] = str(max_height or 1080)
+
+    selective_done = False
+    if selective_enabled and translation_enabled:
+        _log("  [精選下載] 先劇情整理 + 選擇性翻譯（歌詞則完整翻譯）…")
+        try:
+            asr = full_video_pipeline.complete_cached_translation(
+                asr, cache, selective=True
+            )
+            selective_done = True
+            is_full = bool(asr.get("selective_is_full"))
+            _log(
+                f"  [精選下載] "
+                f"{'完整/歌詞' if is_full else '精選省略'}："
+                f"保留 {len(asr.get('selective_kept_ids') or [])} 條"
+            )
+        except Exception as exc:
+            _log(f"  [!] 精選翻譯失敗，回退一般流程：{exc}")
+            selective_enabled = False
+
+    # 精選後（或完整）對白淨長判斷 > 門檻再分段；停頓≥1.5s 剪；0.75 備援可關
     segments, original, translated = _chosen_segment_plan(
         asr,
         enabled=trim_enabled,
         threshold=dialogue_trim_threshold,
         segment_gap=segment_gap,
         max_dur=source_duration if source_duration > 0 else 99999.0,
+        edge_padding=edge_pad,
     )
     high, original, translated, enhanced = full_video_pipeline.run_parallel_delivery_phase(
         url,
@@ -361,7 +409,7 @@ def process_chosen_video(
         stem,
         asr,
         segments,
-        enable_translation=translation_enabled,
+        enable_translation=translation_enabled and not selective_done,
         enable_enhance=enhance_enabled,
         asr_cache=cache,
         audio_worker=audio_worker,

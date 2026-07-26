@@ -241,6 +241,8 @@ def process_preview_from_grid(
     enable_asr: bool | None = None,
     export_subtitles: bool | None = None,
     enable_dialogue_trim: bool | None = None,
+    enable_selective_download: bool | None = None,
+    enable_edge_padding: bool | None = None,
     enable_enhance: bool | None = None,
     enable_metadata: bool | None = None,
     archive_grid_on_done: bool = False,
@@ -250,7 +252,7 @@ def process_preview_from_grid(
     moss_worker=None,
     audio_worker=None,
 ) -> Path:
-    """單支預覽：3 分鐘低畫質 → MOSS → 語音剪片 → 自動 enhance → 軟 SRT。"""
+    """單支預覽：3 分鐘低畫質 → MOSS → 精選翻譯 → 語音剪片 → enhance → 軟 SRT。"""
     import full_video_pipeline as fvp
     import video_meta
 
@@ -278,6 +280,18 @@ def process_preview_from_grid(
     translation_enabled = os.getenv(
         "ENABLE_TRANSLATION", "1"
     ).strip().casefold() not in {"0", "false", "no", "off"}
+    if enable_selective_download is None:
+        enable_selective_download = fvp.selective_download_enabled()
+    if enable_selective_download and not translation_enabled:
+        _log("  [精選] 翻譯已關閉，精選翻譯自動改為 OFF")
+        enable_selective_download = False
+    if enable_edge_padding is None:
+        enable_edge_padding = fvp.edge_padding_enabled()
+    edge_pad = fvp.resolve_edge_padding_seconds(enable_edge_padding)
+    os.environ["ENABLE_SELECTIVE_DOWNLOAD"] = (
+        "1" if enable_selective_download else "0"
+    )
+    os.environ["ENABLE_EDGE_PADDING"] = "1" if enable_edge_padding else "0"
     ensure_output_directories()
     jpg_path = Path(jpg_path).resolve()
     source_suffix = jpg_path.suffix.casefold()
@@ -398,13 +412,32 @@ def process_preview_from_grid(
             "preview_source_ended": False,
         }
 
-    # 所有需要的 Preview ASR 完成後，才一次送出 OpenRouter 翻譯。
+    # 所有 Preview ASR 完成後再翻譯；預設精選翻譯，以保留對白淨長判斷 >30s。
     if not translation_enabled:
         asr["translated_srt"] = ""
         if asr.get("outcome") != "disabled":
             asr["outcome"] = "transcribed"
     elif asr.get("original_srt") or asr.get("cues"):
-        asr = fvp.complete_cached_translation(asr, asr_cache)
+        if enable_selective_download:
+            _log("  [2/4] 精選翻譯（劇情 + 選擇性譯文；歌詞則完整）…")
+            try:
+                asr = fvp.complete_cached_translation(
+                    asr, asr_cache, selective=True
+                )
+                is_full = bool(asr.get("selective_is_full"))
+                _log(
+                    f"  [精選] {'完整/歌詞' if is_full else '精選省略'}："
+                    f"保留 {len(asr.get('selective_kept_ids') or [])} 條"
+                )
+            except Exception as exc:
+                _log(f"  [!] 精選翻譯失敗，回退一般翻譯：{exc}")
+                asr = fvp.complete_cached_translation(
+                    asr, asr_cache, selective=False
+                )
+        else:
+            asr = fvp.complete_cached_translation(
+                asr, asr_cache, selective=False
+            )
     original_srt = asr.get("original_srt") or ""
     translated_srt = asr.get("translated_srt") or ""
     outcome = asr.get("outcome") or "empty"
@@ -416,24 +449,44 @@ def process_preview_from_grid(
     if not entries and asr.get("cues"):
         entries = fvp.cues_to_entries(asr["cues"])
 
+    # 精選後的保留對白淨長（歌詞完整時=全句）用來判斷是否 > 門檻
     net_dur = segment_cutter.calculate_net_dialogue_duration(entries)
+    duration_source = (
+        "精選對白"
+        if (
+            enable_selective_download
+            and asr.get("selective_kept_ids") is not None
+            and not bool(asr.get("selective_is_full"))
+        )
+        else (
+            "完整/歌詞對白"
+            if (
+                enable_selective_download
+                and bool(asr.get("selective_is_full"))
+            )
+            else "ASR/譯文對白"
+        )
+    )
     _log(
-        f"  [2/4] 語音淨長 {net_dur:.1f}s"
+        f"  [2/4] {duration_source}淨長 {net_dur:.1f}s"
         f"（門檻 {dialogue_trim_threshold}s）"
     )
 
-    # 3) 只有累計對話達門檻才剪片；影片結束仍不足時保留完整影片。
+    # 3) 只有精選（或完整）對白淨長 > 門檻才剪片
     publish_src = clip_path
     segments: list[tuple[float, float]] | None = None
-    if enable_dialogue_trim and net_dur >= dialogue_trim_threshold and entries:
+    if enable_dialogue_trim and net_dur > dialogue_trim_threshold and entries:
         segments = segment_cutter.build_continuous_segments(
             entries,
             max_gap=segment_gap,
             max_dur=duration if duration > 0 else 99999.0,
+            edge_padding=edge_pad,
         )
         trimmed = sum(e - s for s, e in segments)
         _log(
-            f"  [3/4] 語音充足 → 剪成 {len(segments)} 段"
+            f"  [3/4] 停頓≥{segment_gap}s 剪掉；前後備援={edge_pad}s；"
+            f"{duration_source} {net_dur:.1f}s "
+            f"> {dialogue_trim_threshold}s → 剪成 {len(segments)} 段"
             f"（約 {trimmed:.1f}s）"
         )
         cut_local_segments(clip_path, segments, cut_path)
@@ -452,12 +505,14 @@ def process_preview_from_grid(
     else:
         if asr.get("preview_source_ended") and entries:
             _log(
-                f"  [3/4] 影片已結束且累計對話未達 {dialogue_trim_threshold}s"
+                f"  [3/4] 影片已結束且 {duration_source} "
+                f"{net_dur:.1f}s ≤ {dialogue_trim_threshold}s"
                 " → 發布完整影片（不剪）"
             )
         else:
             _log(
-                f"  [3/4] 剪片關閉、語音未達 {dialogue_trim_threshold}s 或無字幕"
+                f"  [3/4] 剪片關閉、{duration_source} "
+                f"未達 {dialogue_trim_threshold}s 或無字幕"
                 " → 保留目前完整 Preview（不剪）"
             )
 

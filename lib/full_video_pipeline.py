@@ -51,7 +51,27 @@ HIGH_FORMAT_SORT = ["res:720"]
 # yt-dlp --concurrent-fragments（分片並行下載）
 HIGH_CONCURRENT_FRAGMENTS = 8
 DIALOGUE_TRIM_THRESHOLD = 30.0
+# 停頓 ≥ 1.5s 剪掉中間空白
 SEGMENT_GAP = 1.5
+# 前後備援 0.75s（由 ENABLE_EDGE_PADDING 開關控制，關則 0）
+SEGMENT_EDGE_PADDING = 0.75
+
+
+def edge_padding_enabled(environment: dict[str, str] | None = None) -> bool:
+    """對白前後 0.75s 備援；預設 ON。"""
+    environment = os.environ if environment is None else environment
+    value = environment.get("ENABLE_EDGE_PADDING", "1").strip().casefold()
+    return value not in {"0", "false", "no", "off"}
+
+
+def resolve_edge_padding_seconds(
+    enabled: bool | None = None,
+    environment: dict[str, str] | None = None,
+) -> float:
+    """回傳實際 edge_padding 秒數：開=0.75，關=0。"""
+    if enabled is None:
+        enabled = edge_padding_enabled(environment)
+    return float(SEGMENT_EDGE_PADDING) if enabled else 0.0
 DOWNLOAD_SOCKET_TIMEOUT = 30
 DOWNLOAD_RETRIES = 3
 ASR_STREAM_CHUNK_SECONDS = 180.0
@@ -534,32 +554,93 @@ def srt_text_to_entries(srt_text: str) -> list[dict]:
         temp.unlink(missing_ok=True)
 
 
+def selective_download_enabled(
+    environment: dict[str, str] | None = None,
+) -> bool:
+    """精選下載：先劇情+選擇性翻譯，再以保留對白時長判斷剪片／下載區段。
+
+    預設 ON（ENABLE_SELECTIVE_DOWNLOAD 未設或為 1）。
+    """
+    environment = os.environ if environment is None else environment
+    value = environment.get("ENABLE_SELECTIVE_DOWNLOAD", "1").strip().casefold()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _cues_for_translation(asr: dict[str, Any]) -> list[dict[str, Any]]:
+    cues = asr.get("cues") or []
+    if not cues and asr.get("original_srt"):
+        cues = entries_to_cues(srt_text_to_entries(asr["original_srt"]))
+    return list(cues)
+
+
+def _filter_cues_by_ids(
+    cues: list[dict[str, Any]],
+    keep_ids: set[int],
+) -> list[dict[str, Any]]:
+    return [dict(c) for c in cues if int(c.get("id", -1)) in keep_ids]
+
+
 def complete_cached_translation(
     asr: dict[str, Any],
     cache_path: Path | None = None,
+    *,
+    selective: bool | None = None,
 ) -> dict[str, Any]:
-    """翻譯既有 ASR；開關為 ON 卻缺 key/時間軸時明確失敗。"""
+    """翻譯既有 ASR；開關為 ON 卻缺 key/時間軸時明確失敗。
+
+    selective=True 時走精選翻譯（劇情 + 可跳號）；歌詞由 LLM 自行改完整翻譯。
+    """
+    use_selective = (
+        selective_download_enabled() if selective is None else bool(selective)
+    )
+    # 一般翻譯已完成可直接重用；精選需有 selective_kept_ids 才算完成
     if (asr.get("translated_srt") or "").strip():
-        return asr
+        if not use_selective or asr.get("selective_kept_ids") is not None:
+            return asr
+        # 舊快取只有完整譯文、無精選標記 → 清掉後重跑精選
+        asr = dict(asr)
+        asr["translated_srt"] = ""
     if not (asr.get("original_srt") or asr.get("cues")):
         return asr
     api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY")
     if not api_key:
         raise RuntimeError("翻譯已開啟，但找不到 OPENROUTER_API_KEY")
-    from translate_srt_openrouter import DEFAULT_MODEL, format_srt, translate_cues
+    from translate_srt_openrouter import (
+        DEFAULT_MODEL,
+        format_srt,
+        translate_cues,
+        translate_cues_selective,
+    )
 
-    cues = asr.get("cues") or []
-    if not cues and asr.get("original_srt"):
-        cues = entries_to_cues(srt_text_to_entries(asr["original_srt"]))
+    cues = _cues_for_translation(asr)
     if not cues:
         raise RuntimeError("翻譯已開啟，但 ASR 快取沒有可翻譯的 cues")
     model_name = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
     try:
-        translated = translate_cues(cues, api_key, model_name)
+        if use_selective:
+            result = translate_cues_selective(cues, api_key, model_name)
+            kept = result["kept_cues"]
+            asr["translated_srt"] = format_srt(kept)
+            asr["plot_summary"] = result.get("plot") or ""
+            asr["selective_is_full"] = bool(result.get("is_full"))
+            asr["selective_kept_ids"] = [
+                int(c["id"]) for c in kept
+            ]
+            asr["selective_dropped_ids"] = list(result.get("dropped_ids") or [])
+            # 精選省略時原文也只留對應句，方便 retime／剪片對齊
+            if not result.get("is_full"):
+                keep_ids = {int(c["id"]) for c in kept}
+                filtered = _filter_cues_by_ids(cues, keep_ids)
+                if filtered:
+                    asr["cues"] = filtered
+                    asr["original_srt"] = format_srt(filtered)
+            asr["outcome"] = "translated"
+        else:
+            translated = translate_cues(cues, api_key, model_name)
+            asr["translated_srt"] = format_srt(translated)
+            asr["outcome"] = "translated"
     except Exception as exc:
         raise RuntimeError(f"翻譯已開啟，但 OpenRouter 翻譯失敗：{exc}") from exc
-    asr["translated_srt"] = format_srt(translated)
-    asr["outcome"] = "translated"
     if cache_path is not None:
         cache_path.write_text(
             json.dumps(asr, ensure_ascii=False, indent=2),
@@ -1219,7 +1300,9 @@ def enhance_full_video(
 def _translate_after_asr(asr: dict[str, Any], cache_path: Path) -> dict[str, Any]:
     """第二階段的 OpenRouter 工作；翻譯失敗時保留原文並讓其他並行工作完成。"""
     try:
-        return complete_cached_translation(asr, cache_path)
+        # 精選翻譯會在分段規劃前同步完成；能進到背景翻譯的都是一般翻譯。
+        # 明確關閉 selective，避免精選失敗回退後仍受環境開關影響而再次走精選。
+        return complete_cached_translation(asr, cache_path, selective=False)
     except Exception as exc:
         _log(f"  [!] OpenRouter 翻譯失敗，保留原文：{exc}")
         asr["translated_srt"] = ""
@@ -1389,9 +1472,11 @@ def process_full_video_from_grid(
     export_subtitles: bool | None = None,
     enable_dialogue_trim: bool | None = None,
     enable_translation: bool | None = None,
+    enable_selective_download: bool | None = None,
     enable_metadata: bool | None = None,
     dialogue_trim_threshold: float = DIALOGUE_TRIM_THRESHOLD,
     segment_gap: float = SEGMENT_GAP,
+    enable_edge_padding: bool | None = None,
     force: bool = False,
     work_bucket: str = "03_videos",
     archive_grid_on_done: bool = True,
@@ -1405,6 +1490,9 @@ def process_full_video_from_grid(
     max_height：高畫質上限（預設讀 HIGH_VIDEO_HEIGHT，否則 720）
     enable_enhance：是否允許音訊增強（預設讀 AUDIO_AUTO_ENHANCE）
     enable_dialogue_trim：是否依停頓門檻移除長停頓並分段下載
+    enable_selective_download：精選下載——先劇情+選擇性翻譯，再只下載保留對白
+    segment_gap：相鄰對白停頓 ≥ 此秒數則剪開（預設 1.5）
+    enable_edge_padding：對白前後 0.75s 備援開關（關=0）
     """
     ensure_output_directories()
     jpg_path = Path(jpg_path).resolve()
@@ -1441,13 +1529,26 @@ def process_full_video_from_grid(
         enable_translation = os.getenv(
             "ENABLE_TRANSLATION", "1"
         ).strip().lower() not in {"0", "false", "no", "off"}
+    if enable_selective_download is None:
+        enable_selective_download = selective_download_enabled()
     if enable_metadata is None:
         enable_metadata = os.getenv(
             "ENABLE_METADATA", "1"
         ).strip().lower() not in {"0", "false", "no", "off"}
+    # 精選下載需要翻譯；關閉翻譯時自動關閉精選
+    if enable_selective_download and not enable_translation:
+        _log("  [精選下載] 翻譯已關閉，精選下載自動改為 OFF")
+        enable_selective_download = False
+    if enable_edge_padding is None:
+        enable_edge_padding = edge_padding_enabled()
+    edge_pad = resolve_edge_padding_seconds(enable_edge_padding)
     # 下載高度寫入 env，供 _high_format_opts 使用
     os.environ["HIGH_VIDEO_HEIGHT"] = str(max_height)
     os.environ["ENABLE_TRANSLATION"] = "1" if enable_translation else "0"
+    os.environ["ENABLE_SELECTIVE_DOWNLOAD"] = (
+        "1" if enable_selective_download else "0"
+    )
+    os.environ["ENABLE_EDGE_PADDING"] = "1" if enable_edge_padding else "0"
     os.environ["AUDIO_AUTO_ENHANCE"] = "1" if enable_enhance else "0"
 
     raw_stem = jpg_path.stem
@@ -1586,6 +1687,48 @@ def process_full_video_from_grid(
     translated_srt = asr.get("translated_srt") or ""
     outcome = asr.get("outcome") or "empty"
 
+    # 精選下載：必須先完成選擇性翻譯，才能依保留 id 規劃高畫質下載區段
+    # （不能與下載平行）。歌詞由 LLM 改完整翻譯時 is_full=True。
+    selective_done = False
+    if enable_selective_download and enable_translation:
+        with _stage("02a_selective_translate"):
+            if (asr.get("translated_srt") or "").strip() and asr.get(
+                "selective_kept_ids"
+            ) is not None:
+                _log("  [精選下載] 重用快取內已有精選翻譯結果")
+                selective_done = True
+            else:
+                _log(
+                    "  [精選下載] 先劇情整理 + 選擇性翻譯"
+                    "（歌詞則完整翻譯）…"
+                )
+                try:
+                    asr = complete_cached_translation(
+                        asr, asr_cache, selective=True
+                    )
+                    selective_done = True
+                except Exception as exc:
+                    _log(f"  [!] 精選翻譯失敗，回退一般翻譯：{exc}")
+                    enable_selective_download = False
+                    asr.pop("selective_kept_ids", None)
+                    asr.pop("selective_is_full", None)
+                    asr.pop("plot_summary", None)
+        original_srt = asr.get("original_srt") or original_srt
+        translated_srt = asr.get("translated_srt") or translated_srt
+        outcome = asr.get("outcome") or outcome
+        if selective_done:
+            is_full = bool(asr.get("selective_is_full"))
+            kept_n = len(asr.get("selective_kept_ids") or [])
+            drop_n = len(asr.get("selective_dropped_ids") or [])
+            _log(
+                f"  [精選下載] "
+                f"{'完整/歌詞' if is_full else '精選省略'}："
+                f"保留 {kept_n} 條、省略 {drop_n} 條"
+            )
+            plot = (asr.get("plot_summary") or "").strip()
+            if plot:
+                _log(f"  [劇情] {plot[:180]}{'…' if len(plot) > 180 else ''}")
+
     # 優先用譯文估對話；否則用原文
     srt_for_segments = translated_srt.strip() or original_srt
     entries = srt_text_to_entries(srt_for_segments) if srt_for_segments else []
@@ -1593,16 +1736,37 @@ def process_full_video_from_grid(
         entries = cues_to_entries(asr["cues"])
 
     with _stage("03_segment_plan"):
+        # 精選開啟時 entries 已是保留句（或歌詞完整句），用它算淨長再比 >30s
         net_dur = segment_cutter.calculate_net_dialogue_duration(entries)
+        duration_source = (
+            "精選對白"
+            if (
+                enable_selective_download
+                and selective_done
+                and not bool(asr.get("selective_is_full"))
+            )
+            else (
+                "完整/歌詞對白"
+                if (
+                    enable_selective_download
+                    and selective_done
+                    and bool(asr.get("selective_is_full"))
+                )
+                else "ASR/譯文對白"
+            )
+        )
         _log(
-            f"  [對話淨長度] {net_dur:.2f}s（門檻 {dialogue_trim_threshold}s）；"
+            f"  [對話淨長度] {net_dur:.2f}s（{duration_source}；"
+            f"門檻 {dialogue_trim_threshold}s）；"
             f"trim={'on' if enable_dialogue_trim else 'off'}；"
+            f"selective={'on' if enable_selective_download else 'off'}；"
             f"enhance={'on' if enable_enhance else 'off'}；"
             f"max_height={max_height}"
         )
 
         any_enhanced = False
         segments: list[tuple[float, float]] | None = None
+        # 一律用「精選後（或完整）對白淨長」判斷是否 > 門檻再剪片／分段下載
         if (
             enable_dialogue_trim
             and net_dur > dialogue_trim_threshold
@@ -1612,11 +1776,16 @@ def process_full_video_from_grid(
                 entries,
                 max_gap=segment_gap,
                 max_dur=duration if duration > 0 else 99999.0,
+                edge_padding=edge_pad,
             )
             trimmed = sum(e - s for s, e in segments)
             _log(
-                f"  [分段] 對話 > {dialogue_trim_threshold}s → "
-                f"{len(segments)} 段連貫區間（約 {trimmed:.1f}s，gap={segment_gap}s）"
+                f"  [分段] 停頓≥{segment_gap}s 剪掉；"
+                f"前後備援={edge_pad}s（開關"
+                f"{'ON' if enable_edge_padding else 'OFF'}）；"
+                f"{duration_source} {net_dur:.1f}s "
+                f"> {dialogue_trim_threshold}s → "
+                f"{len(segments)} 段（約 {trimmed:.1f}s）"
             )
             for i, (s, e) in enumerate(segments, 1):
                 _log(f"    段 {i:02d}: {s:.2f} → {e:.2f} ({e - s:.2f}s)")
@@ -1624,8 +1793,14 @@ def process_full_video_from_grid(
         else:
             segments = None
             trimmed = duration
+            if enable_dialogue_trim and entries:
+                _log(
+                    f"  [分段] {duration_source} {net_dur:.1f}s "
+                    f"≤ {dialogue_trim_threshold}s → 不剪片／下全片"
+                )
 
-    # 第二階段三條工作並行：翻譯、高畫質切塊下載、完成切塊後的 Enhance。
+    # 第二階段：高畫質切塊下載 + Enhance。
+    # 精選已先譯完時不再平行翻譯；否則翻譯與下載可同時進行。
     with _stage("02_parallel_translate_download_enhance"):
         high_path, original_srt, translated_srt, any_enhanced = (
             run_parallel_delivery_phase(
@@ -1634,7 +1809,9 @@ def process_full_video_from_grid(
                 video_stem,
                 asr,
                 segments,
-                enable_translation=enable_translation,
+                enable_translation=(
+                    enable_translation and not selective_done
+                ),
                 enable_enhance=enable_enhance,
                 asr_cache=asr_cache,
                 audio_worker=audio_worker,

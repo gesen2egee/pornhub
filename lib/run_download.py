@@ -165,6 +165,17 @@ def build_parser() -> argparse.ArgumentParser:
     _boolean_switch(parser, "asr-stream", "開啟或關閉 240P 分段下載與 ASR 串流")
     _boolean_switch(parser, "subtitles", "開啟或關閉外掛 SRT 輸出")
     _boolean_switch(parser, "dialogue-trim", "開啟或關閉依對白剪片")
+    _boolean_switch(
+        parser,
+        "selective-download",
+        "開啟或關閉精選翻譯／下載（預設開；一二三層皆用；"
+        "以保留對白淨長判斷 >30s 剪片；歌詞則完整翻譯）",
+    )
+    _boolean_switch(
+        parser,
+        "edge-padding",
+        "開啟或關閉對白前後 0.75s 備援（預設開；剪片仍固定停頓≥1.5s 剪掉）",
+    )
     _boolean_switch(parser, "enhance", "開啟或關閉音訊增強")
     _boolean_switch(parser, "metadata", "開啟或關閉 MP4/JPG Metadata 寫入")
     _boolean_switch(parser, "archive", "開啟或關閉完成後九宮格歸檔")
@@ -208,7 +219,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--segment-gap",
         type=float,
         metavar="SECONDS",
-        help="合併相鄰對白區段的間隔秒數，預設 1.5",
+        help="對白停頓≥此秒數就剪掉中間空白，預設 1.5",
     )
     parser.add_argument(
         "--asr-chunk-seconds",
@@ -256,6 +267,8 @@ def run_maintenance(args: argparse.Namespace) -> int | None:
                 subtitles=args.subtitles,
                 translation=args.translation,
                 dialogue_trim=args.dialogue_trim,
+                selective_download=args.selective_download,
+                edge_padding=args.edge_padding,
                 enhance=args.enhance,
                 metadata=args.metadata,
                 archive_grid=args.archive,
@@ -297,6 +310,8 @@ def run_maintenance(args: argparse.Namespace) -> int | None:
                         export_subtitles=options.subtitles,
                         enable_dialogue_trim=options.dialogue_trim,
                         enable_translation=options.translation,
+                        enable_selective_download=options.selective_download,
+                        enable_edge_padding=options.edge_padding,
                         enable_metadata=options.metadata,
                         archive_grid_on_done=options.archive_grid,
                         dialogue_trim_threshold=options.trim_threshold,
@@ -350,6 +365,8 @@ def main(argv: list[str] | None = None) -> int:
             "subtitles",
             "translation",
             "dialogue_trim",
+            "selective_download",
+            "edge_padding",
             "enhance",
             "metadata",
             "archive",
@@ -383,6 +400,8 @@ def main(argv: list[str] | None = None) -> int:
                 "subtitles",
                 "translation",
                 "dialogue_trim",
+                "selective_download",
+                "edge_padding",
                 "enhance",
                 "metadata",
                 "archive",
@@ -425,6 +444,8 @@ def main(argv: list[str] | None = None) -> int:
         subtitles=args.subtitles,
         translation=args.translation,
         dialogue_trim=args.dialogue_trim,
+        selective_download=args.selective_download,
+        edge_padding=args.edge_padding,
         enhance=args.enhance,
         metadata=args.metadata,
         archive_grid=args.archive,

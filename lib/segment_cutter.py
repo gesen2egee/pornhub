@@ -82,19 +82,29 @@ def calculate_net_dialogue_duration(entries: list[dict]) -> float:
     return sum(e - s for s, e in merged)
 
 
+# 剪片預設：對白之間停頓 ≥ 此值就切開（中間空白丟掉）
+DEFAULT_MAX_GAP = 1.5
+# 每段對白前後各延伸的備援秒數（呼吸／語尾），不影響「是否切段」判斷
+DEFAULT_EDGE_PADDING = 0.75
+
+
 def build_continuous_segments(
     entries: list[dict],
-    max_gap: float = 1.5,
+    max_gap: float = DEFAULT_MAX_GAP,
     max_dur: float = 99999.0,
-    edge_padding: float = 0.75,
+    edge_padding: float = DEFAULT_EDGE_PADDING,
 ) -> list[tuple[float, float]]:
     """
     依字幕之間的停頓建立影片保留區段。
 
-    停頓小於 max_gap 時完整保留；停頓大於或等於 max_gap 時切段。
-    每個保留段前後各保留 edge_padding 秒（預設 0.75 秒），避免切掉
-    說話前後的呼吸與語尾；因此 max_gap=1.5 時，剛好 1.5 秒的停頓
-    會由兩側緩衝接起來，較長停頓才會留下實際剪除的空白。
+    剪片規則：
+    - 相鄰對白停頓 **≥ max_gap**（預設 1.5s）→ 切開，中間長靜音剪掉
+    - 停頓 **< max_gap** → 併成同一保留段
+    - 每段對白前後各延伸 **edge_padding**（預設 0.75s）當備援，
+      只加在保留範圍，不參與「要不要切」的判斷
+
+    例：max_gap=1.5、edge_padding=0.75 時，剛好 1.5s 停頓兩側備援會接上；
+    更長停頓才會真正剪掉中間空白。
     """
     if not entries:
         return []
@@ -123,10 +133,10 @@ def build_continuous_segments(
         # 是否切段只看原始對白的間距；緩衝僅影響保留範圍。
         pause = start - previous_dialogue_end
         if pause < max_gap:
-            # 短停頓與對白放在同一個保留區段，保留尾端緩衝。
+            # 短停頓（< 1.5s）：併段，只延伸尾端備援
             current_end = max(current_end, min(float(max_dur), end + edge_padding))
         else:
-            # 長停頓只保留前後 0.75 秒緩衝，其餘在串接時移除。
+            # 停頓 ≥ max_gap：切開；只在兩端各留 edge_padding 備援，中間剪掉
             segments.append((current_start, current_end))
             current_start = max(0.0, start - edge_padding)
             current_end = min(float(max_dur), end + edge_padding)

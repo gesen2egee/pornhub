@@ -42,6 +42,8 @@ class FeatureSwitches:
     subtitles: bool | None = None
     translation: bool | None = None
     dialogue_trim: bool | None = None
+    selective_download: bool | None = None
+    edge_padding: bool | None = None  # 對白前後 0.75s 備援
     enhance: bool | None = None
     metadata: bool | None = None
     archive_grid: bool | None = None
@@ -66,7 +68,7 @@ STAGES = {
         "第一層：Preview Video",
         PREVIEW_VIDEOS_DIR,
         "$ 低預算",
-        "每段 3 分鐘低畫質、MOSS、對話不足會續抓、自動 enhance、軟字幕",
+        "每段 3 分鐘低畫質、MOSS、精選翻譯、保留對白>30s 剪片、enhance、軟字幕",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
     "video": StageDefinition(
@@ -74,7 +76,7 @@ STAGES = {
         "第二層：Video",
         VIDEOS_DIR,
         "$$ 中預算",
-        "480P 全片、MOSS、Grok 4.3、自動 enhance",
+        "480P、MOSS、精選翻譯、保留對白>30s 分段下載、Grok、enhance",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
     "chosen": StageDefinition(
@@ -82,7 +84,7 @@ STAGES = {
         "第三層：Chosen",
         CHOSEN_DIR,
         "$$$ 高預算",
-        "1080P、MOSS、Grok 4.5、音訊增強",
+        "1080P、MOSS、精選翻譯、保留對白>30s 分段、Grok 4.5、enhance",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
 }
@@ -212,6 +214,8 @@ def apply_feature_switches(options: FeatureSwitches) -> None:
     _set_bool_env("EXPORT_SUBTITLES", options.subtitles)
     _set_bool_env("ENABLE_TRANSLATION", options.translation)
     _set_bool_env("ENABLE_DIALOGUE_TRIM", options.dialogue_trim)
+    _set_bool_env("ENABLE_SELECTIVE_DOWNLOAD", options.selective_download)
+    _set_bool_env("ENABLE_EDGE_PADDING", options.edge_padding)
     _set_bool_env("AUDIO_AUTO_ENHANCE", options.enhance)
     _set_bool_env("ENABLE_METADATA", options.metadata)
     _set_bool_env("REUSE_ASR_RESULT", options.reuse_cache)
@@ -244,6 +248,10 @@ def resolve_stage_options(
         "subtitles": True,
         "translation": True,
         "dialogue_trim": True,
+        # 一二三層預設 ON：先精選翻譯，再以保留對白淨長判斷 >30s 剪片
+        "selective_download": True,
+        # 停頓 ≥1.5s 剪掉；0.75s 前後備援可關
+        "edge_padding": True,
         "enhance": True,
         "metadata": True,
         "archive_grid": stage_name != "preview",
@@ -274,11 +282,16 @@ def resolve_stage_options(
 
 def validate_stage_options(stage_name: str, options: FeatureSwitches) -> None:
     if not options.asr and not options.reuse_cache and (
-        options.translation or options.dialogue_trim
+        options.translation or options.dialogue_trim or options.selective_download
     ):
         raise ValueError(
             f"{STAGES[stage_name].title}：關閉 ASR 且不重用快取時，"
-            "翻譯與對白剪片沒有時間軸來源；請個別關閉它們，或開啟 --reuse-cache。"
+            "翻譯、對白剪片與精選下載沒有時間軸來源；請個別關閉它們，或開啟 --reuse-cache。"
+        )
+    if options.selective_download and options.translation is False:
+        raise ValueError(
+            f"{STAGES[stage_name].title}：精選下載需要翻譯；"
+            "請開啟 --translation，或關閉 --selective-download。"
         )
 
 
@@ -292,6 +305,8 @@ def print_effective_options(stage_name: str, options: FeatureSwitches) -> None:
         f"ASR串流={state(options.asr_stream)}｜"
         f"SRT={state(options.subtitles)}｜"
         f"翻譯={state(options.translation)}｜剪片={state(options.dialogue_trim)}｜"
+        f"精選下載={state(options.selective_download)}｜"
+        f"0.75備援={state(options.edge_padding)}｜"
         f"增強={state(options.enhance)}｜Meta={state(options.metadata)}｜"
         f"歸檔={state(options.archive_grid)}｜快取={state(options.reuse_cache)}｜"
         f"強制重跑={state(options.force)}"
@@ -299,7 +314,8 @@ def print_effective_options(stage_name: str, options: FeatureSwitches) -> None:
     print(
         f"Backend={options.asr_backend}｜Model={options.translation_model}｜"
         f"Reasoning={options.reasoning_effort}｜"
-        f"剪片門檻={options.trim_threshold}s｜段落間隔={options.segment_gap}s"
+        f"剪片門檻={options.trim_threshold}s｜停頓切段={options.segment_gap}s"
+        f"｜備援={0.75 if options.edge_padding else 0}s"
         f"｜ASR區段={options.asr_chunk_seconds}s｜ASR批次上限={options.asr_batch_size}"
     )
 
@@ -314,6 +330,8 @@ def feature_environment(options: FeatureSwitches):
         "EXPORT_SUBTITLES",
         "ENABLE_TRANSLATION",
         "ENABLE_DIALOGUE_TRIM",
+        "ENABLE_SELECTIVE_DOWNLOAD",
+        "ENABLE_EDGE_PADDING",
         "AUDIO_AUTO_ENHANCE",
         "ENABLE_METADATA",
         "REUSE_ASR_RESULT",
@@ -410,6 +428,8 @@ def _execute_stage(
                     enable_asr=options.asr,
                     export_subtitles=options.subtitles,
                     enable_dialogue_trim=options.dialogue_trim,
+                    enable_selective_download=options.selective_download,
+                    enable_edge_padding=options.edge_padding,
                     enable_enhance=options.enhance,
                     enable_metadata=options.metadata,
                     archive_grid_on_done=options.archive_grid,
@@ -454,6 +474,8 @@ def _execute_stage(
                     export_subtitles=options.subtitles,
                     enable_dialogue_trim=options.dialogue_trim,
                     enable_translation=options.translation,
+                    enable_selective_download=options.selective_download,
+                    enable_edge_padding=options.edge_padding,
                     enable_metadata=options.metadata,
                     dialogue_trim_threshold=options.trim_threshold,
                     segment_gap=options.segment_gap,
@@ -479,6 +501,8 @@ def _execute_stage(
         export_subtitles=options.subtitles,
         enable_translation=options.translation,
         enable_dialogue_trim=options.dialogue_trim,
+        enable_selective_download=options.selective_download,
+        enable_edge_padding=options.edge_padding,
         enable_enhance=options.enhance,
         enable_metadata=options.metadata,
         max_height=options.chosen_height,
