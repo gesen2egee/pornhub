@@ -87,12 +87,43 @@ def _trim_chosen_media(
     """Chosen 本機媒體的獨立對白剪片開關。"""
     import full_video_pipeline as fvp
     import preview_pipeline
+
+    segments, original, translated = _chosen_segment_plan(
+        asr,
+        enabled=enabled,
+        threshold=threshold,
+        segment_gap=segment_gap,
+        max_dur=fvp.probe_duration(media) or 99999.0,
+    )
+    if segments is None:
+        return media, original, translated
+
+    trimmed = work / f"{media.stem}.trimmed.mp4"
+    preview_pipeline.cut_local_segments(media, segments, trimmed)
+    original, translated = _retime_chosen_subtitles(
+        original, translated, segments
+    )
+    _log(f"  [剪片] 已保留 {len(segments)} 個對白區段")
+    return trimmed, original, translated
+
+
+def _chosen_segment_plan(
+    asr: dict,
+    *,
+    enabled: bool,
+    threshold: float,
+    segment_gap: float,
+    max_dur: float,
+) -> tuple[list[tuple[float, float]] | None, str, str]:
+    """依 Chosen 的 ASR 字幕決定是否需要高畫質分段下載。"""
+    import full_video_pipeline as fvp
     import segment_cutter
 
     original = asr.get("original_srt") or ""
     translated = asr.get("translated_srt") or ""
     if not enabled:
-        return media, original, translated
+        return None, original, translated
+
     source_srt = translated.strip() or original
     entries = fvp.srt_text_to_entries(source_srt) if source_srt else []
     if not entries and asr.get("cues"):
@@ -100,15 +131,29 @@ def _trim_chosen_media(
     net_duration = segment_cutter.calculate_net_dialogue_duration(entries)
     if net_duration <= threshold or not entries:
         _log("  [剪片] 對白未達門檻，保留全片")
-        return media, original, translated
-    duration = fvp.probe_duration(media) or 99999.0
+        return None, original, translated
+
     segments = segment_cutter.build_continuous_segments(
         entries,
         max_gap=segment_gap,
-        max_dur=duration,
+        max_dur=max_dur if max_dur > 0 else 99999.0,
     )
-    trimmed = work / f"{media.stem}.trimmed.mp4"
-    preview_pipeline.cut_local_segments(media, segments, trimmed)
+    _log(
+        f"  [剪片] 對白 > {threshold}s → 低畫質分析後只下載 "
+        f"{len(segments)} 個高畫質區段"
+    )
+    return segments, original, translated
+
+
+def _retime_chosen_subtitles(
+    original: str,
+    translated: str,
+    segments: list[tuple[float, float]],
+) -> tuple[str, str]:
+    """把 Chosen 字幕重排到高畫質分段串接後的時間軸。"""
+    import full_video_pipeline as fvp
+    import segment_cutter
+
     if original.strip():
         original = fvp._entries_to_srt(
             segment_cutter.retime_subtitles(
@@ -121,8 +166,7 @@ def _trim_chosen_media(
                 fvp.srt_text_to_entries(translated), segments
             )
         )
-    _log(f"  [剪片] 已保留 {len(segments)} 個對白區段")
-    return trimmed, original, translated
+    return original, translated
 
 
 def _apply_chosen_env(
@@ -232,7 +276,8 @@ def process_chosen_video(
 ) -> Path:
     """本機影片：用檔案做 ASR/翻譯，1080 若可從 meta 取 URL 則重下；否則直接處理。
 
-    規格：精選最高品質——若有 URL 走 1080P 管線；純本機檔則 ASR+翻譯+可 enhance 後搬到 06_good。
+    規格：精選最高品質——若有 URL，先用低畫質完成 ASR/區段規劃，
+    再只下載需要的 1080P 區段；純本機檔則 ASR+翻譯+可 enhance 後搬到 06_good。
     完成後刪除 05_chosen 來源影片。
     """
     import full_video_pipeline
@@ -296,7 +341,7 @@ def process_chosen_video(
 
     if isinstance(url, str) and url.startswith("http"):
         # 用暫存九宮格流程：直接 full pipeline 需要 jpg；改手動 1080 下載+字幕
-        _log(f"  [chosen-video] 偵測到 URL，走 1080P 完整下載：{stem}")
+        _log(f"  [chosen-video] 偵測到 URL，先低畫質分析再下載 1080P：{stem}")
         work = (
             Path(full_video_pipeline.TEMP_DIR)
             / "pipeline"
@@ -320,15 +365,38 @@ def process_chosen_video(
             enable_dialogue_trim=trim_enabled,
         )
         os.environ["HIGH_VIDEO_HEIGHT"] = str(max_height or 1080)
-        full_video_pipeline.download_high_full(url, high)
-        high, original, translated = _trim_chosen_media(
-            high,
-            work,
+        source_duration = (
+            full_video_pipeline.probe_duration(proxy)
+            if proxy.exists()
+            else full_video_pipeline.probe_duration(video_path)
+        ) or 99999.0
+        segments, original, translated = _chosen_segment_plan(
             asr,
-            trim_enabled,
-            dialogue_trim_threshold,
-            segment_gap,
+            enabled=trim_enabled,
+            threshold=dialogue_trim_threshold,
+            segment_gap=segment_gap,
+            max_dur=source_duration,
         )
+        if segments is None:
+            full_video_pipeline.download_high_full(url, high)
+        else:
+            high.unlink(missing_ok=True)
+            parts: list[Path] = []
+            for index, (start, end) in enumerate(segments):
+                part = work / f"{stem}.seg{index:03d}.mp4"
+                _log(
+                    f"  [chosen] 高畫質分段下載 {index + 1}/{len(segments)}："
+                    f"{start:.2f}-{end:.2f}s"
+                )
+                full_video_pipeline.download_high_range(
+                    url, part, start, end
+                )
+                parts.append(part)
+            full_video_pipeline.concat_videos(parts, high)
+            original, translated = _retime_chosen_subtitles(
+                original, translated, segments
+            )
+            _log("  [chosen] 字幕已依高畫質分段串接後時間軸 retime")
         if enhance_enabled:
             high, enhanced = full_video_pipeline.enhance_full_video(high)
         else:

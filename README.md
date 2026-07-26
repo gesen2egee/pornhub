@@ -110,7 +110,7 @@ output/01_preview_images/
 
 - `output/02_preview_videos/`：九宮格 → **前 3 分鐘低畫質**，**Whisper** 估語音後剪片（淨語音 ≤30s 則保留整段），**軟 SRT**（不硬字幕），**不 enhance**。
 - `output/03_videos/`：九宮格 → **480P**，**Whisper** 字幕並據此剪片（對白淨長 >30s），同名**軟 SRT**，**不 enhance**。
-- `output/05_chosen/`：九宮格**或本機影片** → **1080P + MOSS + Grok 4.5（minimal）**，**判斷 enhance**，完成進 `06_good`；九宮格歸檔 `04_downloaded`，來源影片刪除。
+- `output/05_chosen/`：九宮格**或本機影片** → **1080P + MOSS + Grok 4.5（minimal）**，**判斷 enhance**；有 URL 時先用低畫質分析，再只下載需要的高畫質區段，完成進 `06_good`；九宮格歸檔 `04_downloaded`，來源影片刪除。
 
 ### 3. 下載與字幕
 
@@ -154,6 +154,8 @@ output/01_preview_images/
 或剪片，程式只會使用既有 ASR 快取；沒有快取時會明確報錯，不會偷偷替你
 開啟 ASR 或順帶關閉其他功能。每層開始前都會印出實際 ON/OFF 設定。
 若要讓新設定重新套用到既有成品，請明確加上 `--force`；預設會保護既有成品。
+Chosen 有 URL 時不會拿既有高畫質成品接續，會重新下載規劃出的高畫質片段；
+若連 ASR 字幕快取也要重做，請加上 `--no-reuse-cache`。
 剪片門檻與區段合併間隔可分別用 `--trim-threshold`、`--segment-gap` 調整。
 目前剪片規則是：停頓小於門檻時完整保留；停頓大於或等於門檻時整段移除，
 不會再對字幕前後自動增加 0.75 秒緩衝。
