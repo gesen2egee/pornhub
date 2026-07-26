@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import importlib.util
+import io
 import json
 import math
 import os
@@ -11,7 +12,7 @@ import re
 import subprocess
 import sys
 import uuid
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -604,6 +605,8 @@ class AudioEnhanceWorker:
             )
         environment = os.environ.copy()
         environment["PYTHONUTF8"] = "1"
+        # pipeline 已有整體進度條，子程序只回傳結果，不逐段洗版。
+        environment.setdefault("AUDIO_ENHANCE_QUIET", "1")
         self._process = subprocess.Popen(
             [str(python), str(Path(__file__).resolve()), "--prepare-worker"],
             cwd=str(ROOT),
@@ -688,6 +691,7 @@ def prepare_audio_media(videos: list[Path]) -> dict[Path, PreparedMedia]:
     )
     environment = os.environ.copy()
     environment["PYTHONUTF8"] = "1"
+    environment.setdefault("AUDIO_ENHANCE_QUIET", "1")
     try:
         result = subprocess.run(
             [
@@ -717,7 +721,12 @@ def _run_manifest(manifest: Path, result_path: Path) -> int:
         Path(value)
         for value in json.loads(manifest.read_text(encoding="utf-8"))
     ]
-    prepared = _prepare_audio_media_local(videos)
+    if os.getenv("AUDIO_ENHANCE_QUIET", "0") == "1":
+        sink = io.StringIO()
+        with redirect_stdout(sink), redirect_stderr(sink):
+            prepared = _prepare_audio_media_local(videos)
+    else:
+        prepared = _prepare_audio_media_local(videos)
     result_path.write_text(
         json.dumps(
             _prepared_entries(prepared),
@@ -742,8 +751,17 @@ def _run_prepare_worker() -> int:
                 videos = request.get("videos")
                 if not isinstance(videos, list) or not videos:
                     raise ValueError("videos 必須是非空陣列")
-                with redirect_stdout(sys.stderr):
-                    prepared = session.prepare([Path(value) for value in videos])
+                if os.getenv("AUDIO_ENHANCE_QUIET", "0") == "1":
+                    sink = io.StringIO()
+                    with redirect_stdout(sink), redirect_stderr(sink):
+                        prepared = session.prepare(
+                            [Path(value) for value in videos]
+                        )
+                else:
+                    with redirect_stdout(sys.stderr):
+                        prepared = session.prepare(
+                            [Path(value) for value in videos]
+                        )
                 reply: dict[str, Any] = {"prepared": _prepared_entries(prepared)}
             except Exception as exc:
                 reply = {"error": str(exc)}

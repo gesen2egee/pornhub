@@ -19,7 +19,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext, redirect_stdout
 from pathlib import Path
 from queue import Empty, Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Iterator
 
 import segment_cutter
@@ -74,6 +74,8 @@ def resolve_edge_padding_seconds(
     return float(SEGMENT_EDGE_PADDING) if enabled else 0.0
 DOWNLOAD_SOCKET_TIMEOUT = 30
 DOWNLOAD_RETRIES = 3
+SEGMENT_DOWNLOAD_ATTEMPTS = 2
+SEGMENT_RECOVERY_ATTEMPTS = 1
 ASR_STREAM_CHUNK_SECONDS = 180.0
 
 # 由外部 benchmark 注入 PipelineMetrics；未注入則不計時
@@ -97,6 +99,76 @@ def _stage(name: str, **extra: Any) -> Iterator[None]:
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
+
+
+class _SegmentProgress:
+    """以單行顯示分段下載與 Enhance 的整體進度。"""
+
+    def __init__(self, total: int, *, enhance_enabled: bool) -> None:
+        self.total = max(1, int(total))
+        self.enhance_enabled = enhance_enabled
+        self.downloaded = 0
+        self.enhanced = 0
+        self.retries = 0
+        self.pending_failures = 0
+        self.enhance_failures = 0
+        self._lock = Lock()
+        self._last_line_length = 0
+
+    def _render(self) -> None:
+        work_total = self.total * (2 if self.enhance_enabled else 1)
+        completed = self.downloaded + (
+            self.enhanced if self.enhance_enabled else 0
+        )
+        ratio = min(1.0, completed / work_total)
+        width = 28
+        filled = round(width * ratio)
+        bar = "█" * filled + "░" * (width - filled)
+        details = f"下載 {self.downloaded}/{self.total}"
+        if self.enhance_enabled:
+            details += f"｜增強 {self.enhanced}/{self.total}"
+        if self.retries:
+            details += f"｜重試 {self.retries}"
+        if self.pending_failures:
+            details += f"｜待補 {self.pending_failures}"
+        if self.enhance_failures:
+            details += f"｜增強失敗 {self.enhance_failures}"
+        line = f"  [{bar}] {ratio * 100:5.1f}%｜{details}"
+        padding = " " * max(0, self._last_line_length - len(line))
+        sys.stdout.write(f"\r{line}{padding}")
+        sys.stdout.flush()
+        self._last_line_length = len(line)
+
+    def update(
+        self,
+        *,
+        downloaded: int = 0,
+        enhanced: int = 0,
+        retries: int = 0,
+        pending_failures: int = 0,
+        enhance_failures: int = 0,
+    ) -> None:
+        with self._lock:
+            self.downloaded += downloaded
+            self.enhanced += enhanced
+            self.retries += retries
+            self.pending_failures += pending_failures
+            self.enhance_failures += enhance_failures
+            self.pending_failures = max(0, self.pending_failures)
+            self._render()
+
+    def finish(self) -> None:
+        with self._lock:
+            self._render()
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
 
 
 def get_video_url_from_image(jpg_path: str | Path) -> str | None:
@@ -421,10 +493,6 @@ def download_high_range(
     opts["concurrent_fragment_downloads"] = concurrent
     opts["download_ranges"] = _ranges
     opts["force_keyframes_at_cuts"] = True
-    _log(
-        f"    [dl] {out_path.name} {start:.2f}-{end:.2f}s "
-        f"res≤{fsort[0]} cf={concurrent}"
-    )
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([video_url])
     if not out_path.exists() or has_video_stream(out_path) is not True:
@@ -1360,29 +1428,131 @@ def run_parallel_delivery_phase(
                 high_path, enhanced = enhance_future.result()
         else:
             _log(f"  [第二階段] 下載 {len(segments)} 個高畫質切塊")
-            part_futures: list[tuple[Path, Future[tuple[Path, bool]] | None]] = []
+            progress = _SegmentProgress(
+                len(segments),
+                enhance_enabled=enable_enhance,
+            )
+            progress.update()
+            part_futures: dict[
+                int,
+                tuple[Path, Future[tuple[Path, bool]] | None],
+            ] = {}
+            failed_downloads: list[
+                tuple[int, Path, float, float, Exception]
+            ] = []
+
+            def queue_enhance(
+                index: int,
+                part: Path,
+            ) -> None:
+                future = submit_enhance(part) if enable_enhance else None
+                part_futures[index] = (part, future)
+                progress.update(
+                    downloaded=1,
+                    enhanced=1 if future is None else 0,
+                )
+                if future is not None:
+                    future.add_done_callback(
+                        lambda completed: progress.update(
+                            enhanced=1,
+                            enhance_failures=(
+                                1 if completed.exception() is not None else 0
+                            ),
+                        )
+                    )
+
+            def try_download(
+                index: int,
+                part: Path,
+                start: float,
+                end: float,
+                attempts: int,
+            ) -> Exception | None:
+                last_error: Exception | None = None
+                for attempt in range(attempts):
+                    try:
+                        download_high_range(
+                            video_url,
+                            part,
+                            start,
+                            end,
+                        )
+                        return None
+                    except Exception as exc:
+                        last_error = exc
+                        if attempt + 1 < attempts:
+                            progress.update(retries=1)
+                return last_error
+
+            normal_attempts = _positive_int_env(
+                "SEGMENT_DOWNLOAD_ATTEMPTS",
+                SEGMENT_DOWNLOAD_ATTEMPTS,
+            )
             for index, (start, end) in enumerate(segments):
                 part = work_dir / f"{video_stem}.seg{index:03d}.mp4"
-                _log(f"    下載段 {index + 1}/{len(segments)}：{start:.2f}-{end:.2f}s")
-                download_high_range(video_url, part, start, end)
-                part_futures.append(
-                    (
-                        part,
-                        submit_enhance(part)
-                        if enable_enhance
-                        else None,
-                    )
+                if part.exists() and has_video_stream(part) is True:
+                    queue_enhance(index, part)
+                    continue
+                error = try_download(
+                    index,
+                    part,
+                    start,
+                    end,
+                    normal_attempts,
                 )
+                if error is None:
+                    queue_enhance(index, part)
+                else:
+                    failed_downloads.append((index, part, start, end, error))
+                    progress.update(pending_failures=1)
+
+            recovery_attempts = _positive_int_env(
+                "SEGMENT_RECOVERY_ATTEMPTS",
+                SEGMENT_RECOVERY_ATTEMPTS,
+            )
+            still_failed: list[
+                tuple[int, Path, float, float, Exception]
+            ] = []
+            for index, part, start, end, previous_error in failed_downloads:
+                progress.update(retries=1)
+                error = try_download(
+                    index,
+                    part,
+                    start,
+                    end,
+                    recovery_attempts,
+                )
+                if error is None:
+                    progress.update(pending_failures=-1)
+                    queue_enhance(index, part)
+                else:
+                    still_failed.append(
+                        (index, part, start, end, error or previous_error)
+                    )
 
             parts: list[Path] = []
-            for index, (part, future) in enumerate(part_futures, 1):
+            for index in sorted(part_futures):
+                part, future = part_futures[index]
                 if future is None:
                     parts.append(part)
                     continue
-                enhanced_part, part_enhanced = future.result()
-                parts.append(enhanced_part)
-                enhanced = enhanced or part_enhanced
-                _log(f"    Enhance 段 {index}/{len(part_futures)} 完成")
+                try:
+                    enhanced_part, part_enhanced = future.result()
+                    parts.append(enhanced_part)
+                    enhanced = enhanced or part_enhanced
+                except Exception:
+                    # Enhance 失敗不應浪費已下載區段；保留原音繼續合併。
+                    parts.append(part)
+            progress.finish()
+            if still_failed:
+                failed_text = "、".join(
+                    f"{index + 1}({start:.2f}-{end:.2f}s)"
+                    for index, _part, start, end, _error in still_failed
+                )
+                raise RuntimeError(
+                    f"{len(still_failed)} 個高畫質區段多次重試仍失敗："
+                    f"{failed_text}；已完成區段會保留供下次續跑。"
+                ) from still_failed[0][4]
             concat_videos(parts, high_path)
 
         if translation_future is not None:
