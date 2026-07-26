@@ -63,7 +63,7 @@ STAGES = {
         PREVIEW_VIDEOS_DIR,
         "$ 低預算",
         "前 3 分鐘低畫質、Whisper、軟字幕",
-        frozenset(GRID_EXTENSIONS),
+        frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
     "video": StageDefinition(
         "video",
@@ -71,7 +71,7 @@ STAGES = {
         VIDEOS_DIR,
         "$$ 中預算",
         "480P 全片、Whisper、Grok 4.3",
-        frozenset(GRID_EXTENSIONS),
+        frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
     "chosen": StageDefinition(
         "chosen",

@@ -217,6 +217,8 @@ def process_preview_from_grid(
     ).strip().casefold() not in {"0", "false", "no", "off"}
     ensure_output_directories()
     jpg_path = Path(jpg_path).resolve()
+    source_suffix = jpg_path.suffix.casefold()
+    source_is_grid = source_suffix in {".jpg", ".jpeg", ".png"}
     final_dir = Path(final_dir or PREVIEW_VIDEOS_DIR).resolve()
     final_dir.mkdir(parents=True, exist_ok=True)
 
@@ -233,18 +235,26 @@ def process_preview_from_grid(
     ):
         meta = video_meta.read_mp4_meta(final_video)
         status = meta.get("subtitle_status") or {}
+        source_meta = meta.get("web_meta") or {}
+        same_stage_video = (
+            source_suffix in {".mp4", ".mkv", ".mov", ".webm", ".m4v"}
+            and source_meta.get("pipeline_stage") == "preview"
+        )
         if (
-            meta.get("original_srt_present")
-            and meta.get("translated_srt_present")
-            and status.get("outcome") != "failed"
-            and (not export_subtitles or final_srt.exists())
+            (source_is_grid or same_stage_video)
+            and (
+                meta.get("original_srt_present")
+                and meta.get("translated_srt_present")
+                and status.get("outcome") != "failed"
+                and (not export_subtitles or final_srt.exists())
+            )
         ):
             _log(f"[SKIP] 預覽已完成：{final_video.name}")
             return final_video
 
-    video_url = fvp.get_video_url_from_image(jpg_path)
+    video_url = fvp.get_video_url_from_source(jpg_path)
     if not video_url:
-        raise RuntimeError(f"九宮格沒有內嵌 URL：{jpg_path.name}")
+        raise RuntimeError(f"來源沒有可用 URL：{jpg_path.name}")
 
     work_dir = TEMP_DIR / "pipeline" / "02_preview_videos" / f"_work_{video_stem}"
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -381,8 +391,9 @@ def process_preview_from_grid(
             info = dict(resolved.get("info") or {})
             info.setdefault("webpage_url", video_url)
             web_meta = video_meta.build_web_meta(info)
+            web_meta = dict(web_meta)
+            web_meta["pipeline_stage"] = "preview"
             if segments is not None:
-                web_meta = dict(web_meta)
                 web_meta["preview_trimmed_segments"] = [
                     [round(s, 3), round(e, 3)] for s, e in segments
                 ]
@@ -397,7 +408,7 @@ def process_preview_from_grid(
                     audio_enhanced=False,
                 ),
             )
-            if jpg_path.exists():
+            if source_is_grid and jpg_path.exists():
                 video_meta.write_grid_jpg_web_meta(
                     str(jpg_path), web_meta, url=video_url
                 )
@@ -406,7 +417,7 @@ def process_preview_from_grid(
     except Exception as exc:
         _log(f"  [!] Meta 寫入失敗：{exc}")
 
-    if archive_grid_on_done and jpg_path.exists():
+    if archive_grid_on_done and source_is_grid and jpg_path.exists():
         from project_paths import DOWNLOADED_DIR
 
         fvp.archive_grid(jpg_path, DOWNLOADED_DIR)
@@ -414,7 +425,7 @@ def process_preview_from_grid(
     if not keep_work:
         shutil.rmtree(work_dir, ignore_errors=True)
 
-    _log(f"[DONE] 預覽 {final_video}（九宮格保留原位）")
+    _log(f"[DONE] 預覽 {final_video}")
     return final_video
 
 

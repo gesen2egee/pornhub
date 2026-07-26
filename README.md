@@ -35,8 +35,8 @@ output/
 
 | 流程 | 放入 | 畫質 | 字幕 | enhance | 輸出 |
 |------|------|------|------|---------|------|
-| 預覽 | `02_preview_videos` 九宮格 | 前 3 分鐘低畫質；語音>30s 剪片否則全留 | Whisper + Grok 4.3 none 軟 SRT | 否 | 同目錄 |
-| 標準全片 | `03_videos` 九宮格 | 480P（Whisper 剪片） | Whisper + **Grok 4.3 none**（便宜） | 否 | `03_videos` |
+| 預覽 | `02_preview_videos` 九宮格或含 URL 影片 | 前 3 分鐘低畫質；語音>30s 剪片否則全留 | Whisper + Grok 4.3 none 軟 SRT | 否 | 同目錄 |
+| 標準全片 | `03_videos` 九宮格或含 URL 影片 | 480P（Whisper 剪片） | Whisper + **Grok 4.3 none**（便宜） | 否 | `03_videos` |
 | 精選 | `05_chosen` 九宮格或影片 | 1080P | MOSS + **Grok 4.5 minimal** | 判斷 | `06_good` |
 | 歸檔 | （自動） | — | — | — | 九宮格→`04_downloaded`；chosen 來源影片刪除 |
 

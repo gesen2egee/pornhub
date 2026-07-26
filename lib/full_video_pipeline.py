@@ -91,6 +91,35 @@ def get_video_url_from_image(jpg_path: str | Path) -> str | None:
     return None
 
 
+def get_video_url_from_source(source_path: str | Path) -> str | None:
+    """從九宮格 EXIF 或影片 Metadata 取得來源 URL。"""
+    path = Path(source_path).resolve()
+    if path.suffix.casefold() in {".jpg", ".jpeg", ".png"}:
+        return get_video_url_from_image(path)
+    if path.suffix.casefold() not in {
+        ".mp4", ".mkv", ".mov", ".webm", ".m4v",
+    }:
+        return None
+    try:
+        import video_meta
+
+        meta = video_meta.read_mp4_meta(path)
+    except Exception:
+        return None
+    web = meta.get("web_meta") or {}
+    for candidate in (
+        web.get("webpage_url"),
+        web.get("url"),
+        meta.get("webpage_url"),
+    ):
+        if not isinstance(candidate, str):
+            continue
+        candidate = candidate.strip()
+        if candidate.startswith(("http://", "https://")):
+            return candidate
+    return None
+
+
 def probe_duration(path: Path) -> float | None:
     try:
         result = subprocess.run(
@@ -714,7 +743,8 @@ def process_full_video_from_grid(
     archive_grid_on_done: bool = True,
 ) -> Path:
     """
-    單支九宮格循序流程：低畫質代理 → ASR/翻譯 → 高畫質 →（可）enhance → 發布。
+    單支來源循序流程：從九宮格或影片取得 URL，低畫質代理 → ASR/翻譯 →
+    高畫質 →（可）enhance → 發布。
 
     max_height：高畫質上限（預設讀 HIGH_VIDEO_HEIGHT，否則 720）
     enable_enhance：是否允許音訊增強（預設讀 AUDIO_AUTO_ENHANCE）
@@ -722,6 +752,9 @@ def process_full_video_from_grid(
     """
     ensure_output_directories()
     jpg_path = Path(jpg_path).resolve()
+    source_suffix = jpg_path.suffix.casefold()
+    source_is_grid = source_suffix in {".jpg", ".jpeg", ".png"}
+    pipeline_stage = "chosen" if work_bucket == "05_chosen" else "video"
     final_dir = Path(final_dir or VIDEOS_DIR).resolve()
     archive_dir = Path(archive_dir or DOWNLOADED_DIR).resolve()
     final_dir.mkdir(parents=True, exist_ok=True)
@@ -775,28 +808,36 @@ def process_full_video_from_grid(
 
         meta = video_meta.read_mp4_meta(final_video)
         status = meta.get("subtitle_status") or {}
+        source_meta = meta.get("web_meta") or {}
+        same_stage_video = (
+            source_suffix in {".mp4", ".mkv", ".mov", ".webm", ".m4v"}
+            and source_meta.get("pipeline_stage") == pipeline_stage
+        )
         if (
-            (
-                not enable_asr
-                and not enable_enhance
-                and not enable_dialogue_trim
-            )
-            or (
-                meta.get("original_srt_present")
-                and meta.get("translated_srt_present")
-                and status.get("outcome") != "failed"
-                and (not export_subtitles or final_srt.exists())
-                and (not enable_enhance or status.get("audio_enhanced"))
+            (source_is_grid or same_stage_video)
+            and (
+                (
+                    not enable_asr
+                    and not enable_enhance
+                    and not enable_dialogue_trim
+                )
+                or (
+                    meta.get("original_srt_present")
+                    and meta.get("translated_srt_present")
+                    and status.get("outcome") != "failed"
+                    and (not export_subtitles or final_srt.exists())
+                    and (not enable_enhance or status.get("audio_enhanced"))
+                )
             )
         ):
             _log(f"[SKIP] 正式成品已存在：{final_video.name}")
-            if archive_grid_on_done and jpg_path.exists():
+            if archive_grid_on_done and source_is_grid and jpg_path.exists():
                 archive_grid(jpg_path, archive_dir)
             return final_video
 
-    video_url = get_video_url_from_image(jpg_path)
+    video_url = get_video_url_from_source(jpg_path)
     if not video_url:
-        raise RuntimeError(f"九宮格沒有內嵌 URL：{jpg_path.name}")
+        raise RuntimeError(f"來源沒有可用 URL：{jpg_path.name}")
 
     work_dir = TEMP_DIR / "pipeline" / work_bucket / f"_work_{video_stem}"
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -1059,8 +1100,9 @@ def process_full_video_from_grid(
                 info = dict(resolved.get("info") or {})
                 info.setdefault("webpage_url", video_url)
                 web_meta = video_meta.build_web_meta(info)
+                web_meta = dict(web_meta)
+                web_meta["pipeline_stage"] = pipeline_stage
                 if segments is not None:
-                    web_meta = dict(web_meta)
                     web_meta["trimmed_segments"] = [
                         [round(s, 3), round(e, 3)] for s, e in segments
                     ]
@@ -1081,7 +1123,7 @@ def process_full_video_from_grid(
                     ),
                     base_comment=base_comment or None,
                 )
-                if archive_grid_on_done and jpg_path.exists():
+                if archive_grid_on_done and source_is_grid and jpg_path.exists():
                     video_meta.write_grid_jpg_web_meta(
                         str(jpg_path), web_meta, url=video_url
                     )
@@ -1091,7 +1133,7 @@ def process_full_video_from_grid(
         except Exception as exc:
             _log(f"  [!] Meta 寫入失敗（影片已發布）：{exc}")
 
-        if archive_grid_on_done and jpg_path.exists():
+        if archive_grid_on_done and source_is_grid and jpg_path.exists():
             archive_grid(jpg_path, archive_dir)
 
     if not keep_proxy:

@@ -384,9 +384,11 @@ def process_chosen_video(
         final_srt.unlink(missing_ok=True)
     try:
         if metadata_enabled:
+            chosen_web = dict(web) if isinstance(web, dict) else {}
+            chosen_web["pipeline_stage"] = "chosen"
             video_meta.merge_write_mp4_meta(
                 final_video,
-                web_meta=web if isinstance(web, dict) else None,
+                web_meta=chosen_web,
                 original_srt=original or None,
                 translated_srt=translated or None,
                 subtitle_status=video_meta.build_subtitle_status(
