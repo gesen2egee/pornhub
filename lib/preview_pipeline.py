@@ -46,95 +46,57 @@ def cut_local_segments(
     segments: list[tuple[float, float]],
     out_path: Path,
 ) -> Path:
-    """從本機影片依區段剪出並拼接。"""
-    import full_video_pipeline as fvp
+    """精準剪出並重建時間軸，避免 H.264 stream copy 造成音畫變速。"""
 
     if not segments:
         raise RuntimeError("沒有可剪的語音區段")
-    if len(segments) == 1:
-        s, e = segments[0]
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-ss",
-            f"{s:.3f}",
-            "-to",
-            f"{e:.3f}",
-            "-i",
-            str(source),
-            "-c",
-            "copy",
-            str(out_path),
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if proc.returncode != 0 or not out_path.exists():
-            # copy 失敗改 re-encode
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-ss",
-                f"{s:.3f}",
-                "-to",
-                f"{e:.3f}",
-                "-i",
-                str(source),
-                "-c:v",
-                "libx264",
-                "-c:a",
-                "aac",
-                "-movflags",
-                "+faststart",
-                str(out_path),
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.unlink(missing_ok=True)
+    filters: list[str] = []
+    maps: list[str] = []
+    for index, (start, end) in enumerate(segments):
+        filters.extend(
+            [
+                (
+                    f"[0:v]trim=start={start:.3f}:end={end:.3f},"
+                    f"setpts=PTS-STARTPTS[v{index}]"
+                ),
+                (
+                    f"[0:a]atrim=start={start:.3f}:end={end:.3f},"
+                    f"asetpts=PTS-STARTPTS[a{index}]"
+                ),
             ]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-            if proc.returncode != 0 or not out_path.exists():
-                raise RuntimeError(f"預覽剪片失敗：{proc.stderr[-400:]}")
-        return out_path
-
-    parts: list[Path] = []
-    work = out_path.parent
-    for i, (s, e) in enumerate(segments):
-        part = work / f"{out_path.stem}.p{i:03d}{out_path.suffix}"
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-ss",
-            f"{s:.3f}",
-            "-to",
-            f"{e:.3f}",
-            "-i",
-            str(source),
-            "-c",
-            "copy",
-            str(part),
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if proc.returncode != 0 or not part.exists():
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-ss",
-                f"{s:.3f}",
-                "-to",
-                f"{e:.3f}",
-                "-i",
-                str(source),
-                "-c:v",
-                "libx264",
-                "-c:a",
-                "aac",
-                str(part),
-            ]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-            if proc.returncode != 0 or not part.exists():
-                raise RuntimeError(
-                    f"預覽分段 {i} 剪失敗：{(proc.stderr or '')[-300:]}"
-                )
-        parts.append(part)
-    fvp.concat_videos(parts, out_path)
-    for part in parts:
-        part.unlink(missing_ok=True)
+        )
+        maps.append(f"[v{index}][a{index}]")
+    filters.append(
+        f"{''.join(maps)}concat=n={len(segments)}:v=1:a=1[outv][outa]"
+    )
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(source),
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        "[outv]",
+        "-map",
+        "[outa]",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "18",
+        "-preset",
+        "fast",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        str(out_path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    if proc.returncode != 0 or not out_path.exists():
+        raise RuntimeError(f"預覽剪片失敗：{(proc.stderr or '')[-500:]}")
     return out_path
 
 
