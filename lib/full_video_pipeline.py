@@ -213,8 +213,12 @@ def _base_ydl_opts(
             "temp": str(TEMP_DIR),
         },
         "outtmpl": {"default": out_path.name},
-        "quiet": False,
+        # 所有下載階段使用本程式自己的 [1/5]、[dl] 進度；不要混入 yt-dlp
+        # 的 DEBUG、格式選擇與百分比輸出。失敗仍會透過例外回報給各層流程。
+        "quiet": True,
         "no_warnings": True,
+        "noprogress": True,
+        "verbose": False,
         "socket_timeout": DOWNLOAD_SOCKET_TIMEOUT,
         "retries": DOWNLOAD_RETRIES,
         "fragment_retries": DOWNLOAD_RETRIES,

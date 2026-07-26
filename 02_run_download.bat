@@ -26,11 +26,11 @@ if /i "%~1"=="--check" (
 )
 
 echo [INFO] Three budget layers: Preview ^($^) -^> Video ^($$^) -^> Chosen ^($$$^)
-echo [INFO] Each layer lists its files before you choose Run, Skip, or Quit.
+echo [INFO] Each layer scans its folder and runs only when matching images or videos exist.
 echo [INFO] Use --help for all feature switches and arguments.
 
 if "%~1"=="" (
-    "%PYTHON%" "%SCRIPT%" --interactive
+    "%PYTHON%" "%SCRIPT%"
 ) else (
     "%PYTHON%" "%SCRIPT%" %*
 )
