@@ -27,7 +27,7 @@ output/
 ├── 02_preview_videos/   前 3 分鐘低畫質 → Whisper 語音剪片 + 軟 SRT，不硬字幕/不 enhance
 ├── 03_videos/           480P（對白>30s 剪片）+ 軟字幕，不 enhance
 ├── 04_downloaded/       已完成九宮格歸檔
-├── 05_chosen/           精選輸入（可丟九宮格或本機影片）
+├── 05_chosen/           精選輸入（可丟九宮格或含 URL 的影片）
 └── 06_good/             精選成品：1080P + MOSS + Grok 4.5 minimal + 判斷 enhance
 ```
 
@@ -110,7 +110,7 @@ output/01_preview_images/
 
 - `output/02_preview_videos/`：九宮格 → **前 3 分鐘低畫質**，**Whisper** 估語音後剪片（淨語音 ≤30s 則保留整段），**軟 SRT**（不硬字幕），**不 enhance**。
 - `output/03_videos/`：九宮格 → **480P**，**Whisper** 字幕並據此剪片（對白淨長 >30s），同名**軟 SRT**，**不 enhance**。
-- `output/05_chosen/`：九宮格**或本機影片** → **1080P + MOSS + Grok 4.5（minimal）**，**判斷 enhance**；有 URL 時先用低畫質分析，再只下載需要的高畫質區段，完成進 `06_good`；九宮格歸檔 `04_downloaded`，來源影片刪除。
+- `output/05_chosen/`：九宮格**或含 URL 的影片**（影片只作 URL 載體）→ **1080P + MOSS + Grok 4.5（minimal）**，**判斷 enhance**；先用低畫質分析，再只下載需要的高畫質區段，完成進 `06_good`；九宮格歸檔 `04_downloaded`，來源影片刪除。
 
 ### 3. 下載與字幕
 

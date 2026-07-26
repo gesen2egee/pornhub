@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""05_chosen 精選管線：九宮格或本機影片 → 1080P + MOSS + Grok 4.5 + enhance → 06_good。
+"""05_chosen 精選管線：九宮格或影片（只取 URL）→ 1080P + MOSS + Grok 4.5 + enhance → 06_good。
 
 來源清理：
   - 九宮格 JPG → 移到 04_downloaded
-  - 本機低解析度影片 → 處理完成後刪除
+  - 影片只提供 URL；處理完成後刪除來源
 """
 
 from __future__ import annotations
@@ -74,37 +74,6 @@ def _chosen_asr(
         encoding="utf-8",
     )
     return result
-
-
-def _trim_chosen_media(
-    media: Path,
-    work: Path,
-    asr: dict,
-    enabled: bool,
-    threshold: float,
-    segment_gap: float,
-) -> tuple[Path, str, str]:
-    """Chosen 本機媒體的獨立對白剪片開關。"""
-    import full_video_pipeline as fvp
-    import preview_pipeline
-
-    segments, original, translated = _chosen_segment_plan(
-        asr,
-        enabled=enabled,
-        threshold=threshold,
-        segment_gap=segment_gap,
-        max_dur=fvp.probe_duration(media) or 99999.0,
-    )
-    if segments is None:
-        return media, original, translated
-
-    trimmed = work / f"{media.stem}.trimmed.mp4"
-    preview_pipeline.cut_local_segments(media, segments, trimmed)
-    original, translated = _retime_chosen_subtitles(
-        original, translated, segments
-    )
-    _log(f"  [剪片] 已保留 {len(segments)} 個對白區段")
-    return trimmed, original, translated
 
 
 def _chosen_segment_plan(
@@ -274,11 +243,11 @@ def process_chosen_video(
     segment_gap: float = 1.5,
     force: bool = False,
 ) -> Path:
-    """本機影片：用檔案做 ASR/翻譯，1080 若可從 meta 取 URL 則重下；否則直接處理。
+    """影片只作為 URL 載體；所有處理都重新走 Chosen 的高畫質管線。
 
-    規格：精選最高品質——若有 URL，先用低畫質完成 ASR/區段規劃，
-    再只下載需要的 1080P 區段；純本機檔則 ASR+翻譯+可 enhance 後搬到 06_good。
-    完成後刪除 05_chosen 來源影片。
+    先用 URL 下載低畫質代理做 ASR/區段規劃，再只下載需要的 1080P
+    區段；沒有 URL 時直接報錯，不會改走本機影片剪輯。完成後刪除
+    05_chosen 來源影片。
     """
     import full_video_pipeline
     import video_meta
@@ -339,159 +308,98 @@ def process_chosen_video(
         url = None
         meta = {}
 
-    if isinstance(url, str) and url.startswith("http"):
-        # 用暫存九宮格流程：直接 full pipeline 需要 jpg；改手動 1080 下載+字幕
-        _log(f"  [chosen-video] 偵測到 URL，先低畫質分析再下載 1080P：{stem}")
-        work = (
-            Path(full_video_pipeline.TEMP_DIR)
-            / "pipeline"
-            / "05_chosen"
-            / f"_work_{stem}"
+    if not (isinstance(url, str) and url.startswith("http")):
+        raise RuntimeError(
+            "Chosen 影片只作為 URL 輸入；檔案沒有可用的 webpage_url，"
+            "請保留原始 Metadata 或改放含 URL 的九宮格。"
         )
-        work.mkdir(parents=True, exist_ok=True)
-        proxy = work / f"{stem}.proxy.mp4"
-        high = work / f"{stem}.high.mp4"
-        cache = work / "asr_result.json"
-        reuse = os.getenv("REUSE_ASR_RESULT", "1").strip().casefold() not in {
-            "0", "false", "no", "off",
-        }
-        if asr_enabled and not (reuse and cache.is_file()):
-            full_video_pipeline.download_proxy_low(url, proxy)
-        asr = _chosen_asr(
-            proxy if proxy.exists() else video_path,
-            work,
-            enable_asr=asr_enabled,
-            enable_translation=translation_enabled,
-            enable_dialogue_trim=trim_enabled,
-        )
-        os.environ["HIGH_VIDEO_HEIGHT"] = str(max_height or 1080)
-        source_duration = (
-            full_video_pipeline.probe_duration(proxy)
-            if proxy.exists()
-            else full_video_pipeline.probe_duration(video_path)
-        ) or 99999.0
-        segments, original, translated = _chosen_segment_plan(
-            asr,
-            enabled=trim_enabled,
-            threshold=dialogue_trim_threshold,
-            segment_gap=segment_gap,
-            max_dur=source_duration,
-        )
-        if segments is None:
-            full_video_pipeline.download_high_full(url, high)
-        else:
-            high.unlink(missing_ok=True)
-            parts: list[Path] = []
-            for index, (start, end) in enumerate(segments):
-                part = work / f"{stem}.seg{index:03d}.mp4"
-                _log(
-                    f"  [chosen] 高畫質分段下載 {index + 1}/{len(segments)}："
-                    f"{start:.2f}-{end:.2f}s"
-                )
-                full_video_pipeline.download_high_range(
-                    url, part, start, end
-                )
-                parts.append(part)
-            full_video_pipeline.concat_videos(parts, high)
-            original, translated = _retime_chosen_subtitles(
-                original, translated, segments
-            )
-            _log("  [chosen] 字幕已依高畫質分段串接後時間軸 retime")
-        if enhance_enabled:
-            high, enhanced = full_video_pipeline.enhance_full_video(high)
-        else:
-            enhanced = False
-        if final_video.exists():
-            final_video.unlink()
-        shutil.move(str(high), str(final_video))
-        translated = translated.strip()
-        original = original.strip()
-        if srt_enabled and translated:
-            full_video_pipeline.write_compatible_srt(final_srt, translated)
-        elif srt_enabled and original:
-            full_video_pipeline.write_compatible_srt(final_srt, original)
-        elif not srt_enabled:
-            final_srt.unlink(missing_ok=True)
-        try:
-            if metadata_enabled:
-                video_meta.merge_write_mp4_meta(
-                    final_video,
-                    web_meta=web if isinstance(web, dict) else None,
-                    original_srt=original or None,
-                    translated_srt=translated or None,
-                    subtitle_status=video_meta.build_subtitle_status(
-                        asr.get("outcome") or "empty",
-                        audio_enhanced=enhanced,
-                    ),
-                )
-            else:
-                _log("  [META] 已由開關停用")
-        except Exception as exc:
-            _log(f"  [!] meta 失敗：{exc}")
-        if not keep_work:
-            shutil.rmtree(work, ignore_errors=True)
-    else:
-        _log(f"  [chosen-video] 本機檔 ASR+翻譯+enhance：{video_path.name}")
-        # 直接用本機影片當媒體
-        work = (
-            Path(full_video_pipeline.TEMP_DIR)
-            / "pipeline"
-            / "05_chosen"
-            / f"_work_{stem}"
-        )
-        work.mkdir(parents=True, exist_ok=True)
-        asr = _chosen_asr(
-            video_path,
-            work,
-            enable_asr=asr_enabled,
-            enable_translation=translation_enabled,
-            enable_dialogue_trim=trim_enabled,
-        )
-        work_media = work / f"{stem}.source{video_path.suffix}"
-        if not work_media.exists() or work_media.stat().st_size != video_path.stat().st_size:
-            shutil.copy2(video_path, work_media)
-        media, original, translated = _trim_chosen_media(
-            work_media,
-            work,
-            asr,
-            trim_enabled,
-            dialogue_trim_threshold,
-            segment_gap,
-        )
-        if enhance_enabled:
-            media, enhanced = full_video_pipeline.enhance_full_video(media)
-        else:
-            enhanced = False
-        # enhance 可能改路徑；發布到 06_good
-        if final_video.exists():
-            final_video.unlink()
-        shutil.move(str(media), str(final_video))
-        translated = translated.strip()
-        original = original.strip()
-        if srt_enabled and translated:
-            full_video_pipeline.write_compatible_srt(final_srt, translated)
-        elif srt_enabled and original:
-            full_video_pipeline.write_compatible_srt(final_srt, original)
-        elif not srt_enabled:
-            final_srt.unlink(missing_ok=True)
-        try:
-            if metadata_enabled:
-                video_meta.merge_write_mp4_meta(
-                    final_video,
-                    original_srt=original or None,
-                    translated_srt=translated or None,
-                    subtitle_status=video_meta.build_subtitle_status(
-                        asr.get("outcome") or "empty",
-                        audio_enhanced=enhanced,
-                    ),
-                )
-            else:
-                _log("  [META] 已由開關停用")
-        except Exception as exc:
-            _log(f"  [!] meta 失敗：{exc}")
-        if not keep_work:
-            shutil.rmtree(work, ignore_errors=True)
 
+    # 用暫存九宮格流程：直接 full pipeline 需要 jpg；改手動 1080 下載+字幕
+    _log(f"  [chosen-video] 只取輸入 URL，先低畫質分析再下載 1080P：{stem}")
+    work = (
+        Path(full_video_pipeline.TEMP_DIR)
+        / "pipeline"
+        / "05_chosen"
+        / f"_work_{stem}"
+    )
+    work.mkdir(parents=True, exist_ok=True)
+    proxy = work / f"{stem}.proxy.mp4"
+    high = work / f"{stem}.high.mp4"
+    cache = work / "asr_result.json"
+    reuse = os.getenv("REUSE_ASR_RESULT", "1").strip().casefold() not in {
+        "0", "false", "no", "off",
+    }
+    if asr_enabled and not (reuse and cache.is_file()):
+        full_video_pipeline.download_proxy_low(url, proxy)
+    asr = _chosen_asr(
+        proxy,
+        work,
+        enable_asr=asr_enabled,
+        enable_translation=translation_enabled,
+        enable_dialogue_trim=trim_enabled,
+    )
+    os.environ["HIGH_VIDEO_HEIGHT"] = str(max_height or 1080)
+    source_duration = full_video_pipeline.probe_duration(proxy) or 99999.0
+    segments, original, translated = _chosen_segment_plan(
+        asr,
+        enabled=trim_enabled,
+        threshold=dialogue_trim_threshold,
+        segment_gap=segment_gap,
+        max_dur=source_duration,
+    )
+    if segments is None:
+        full_video_pipeline.download_high_full(url, high)
+    else:
+        high.unlink(missing_ok=True)
+        parts: list[Path] = []
+        for index, (start, end) in enumerate(segments):
+            part = work / f"{stem}.seg{index:03d}.mp4"
+            _log(
+                f"  [chosen] 高畫質分段下載 {index + 1}/{len(segments)}："
+                f"{start:.2f}-{end:.2f}s"
+            )
+            full_video_pipeline.download_high_range(
+                url, part, start, end
+            )
+            parts.append(part)
+        full_video_pipeline.concat_videos(parts, high)
+        original, translated = _retime_chosen_subtitles(
+            original, translated, segments
+        )
+        _log("  [chosen] 字幕已依高畫質分段串接後時間軸 retime")
+    if enhance_enabled:
+        high, enhanced = full_video_pipeline.enhance_full_video(high)
+    else:
+        enhanced = False
+    if final_video.exists():
+        final_video.unlink()
+    shutil.move(str(high), str(final_video))
+    translated = translated.strip()
+    original = original.strip()
+    if srt_enabled and translated:
+        full_video_pipeline.write_compatible_srt(final_srt, translated)
+    elif srt_enabled and original:
+        full_video_pipeline.write_compatible_srt(final_srt, original)
+    elif not srt_enabled:
+        final_srt.unlink(missing_ok=True)
+    try:
+        if metadata_enabled:
+            video_meta.merge_write_mp4_meta(
+                final_video,
+                web_meta=web if isinstance(web, dict) else None,
+                original_srt=original or None,
+                translated_srt=translated or None,
+                subtitle_status=video_meta.build_subtitle_status(
+                    asr.get("outcome") or "empty",
+                    audio_enhanced=enhanced,
+                ),
+            )
+        else:
+            _log("  [META] 已由開關停用")
+    except Exception as exc:
+        _log(f"  [!] meta 失敗：{exc}")
+    if not keep_work:
+        shutil.rmtree(work, ignore_errors=True)
     # 刪除 05_chosen 來源影片
     try:
         if video_path.exists() and video_path.resolve() != final_video.resolve():
