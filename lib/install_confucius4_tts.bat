@@ -4,9 +4,10 @@ chcp 65001 >nul
 cd /d "%~dp0"
 
 set "ROOT=%~dp0"
+set "PROJECT_ROOT=%ROOT%.."
 set "RUNTIME=%ROOT%confucius4_tts"
 set "SOURCE=%RUNTIME%\source"
-set "PYTHON=%RUNTIME%\.venv\Scripts\python.exe"
+set "PYTHON=%PROJECT_ROOT%\.venv-confucius4\Scripts\python.exe"
 set "REPOSITORY=https://github.com/netease-youdao/Confucius4-TTS.git"
 set "COMMIT=186983518e9e8ab9af69cabdda3436a76d6ccdfb"
 
@@ -29,7 +30,7 @@ if errorlevel 1 (
 )
 
 if not exist "%PYTHON%" (
-    py -3.10 -m venv "%RUNTIME%\.venv"
+    py -3.10 -m venv "%PROJECT_ROOT%\.venv-confucius4"
     if errorlevel 1 exit /b %ERRORLEVEL%
 )
 

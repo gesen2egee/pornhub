@@ -6,9 +6,9 @@ cd /d "%~dp0"
 
 set "ROOT=%~dp0"
 set "LIB=%ROOT%lib"
-set "PYTHON=%LIB%\.venv\Scripts\python.exe"
+set "PYTHON=%ROOT%\.venv\Scripts\python.exe"
 set "MOSS_ROOT=%LIB%\moss"
-set "MOSS_PYTHON=%MOSS_ROOT%\.venv\Scripts\python.exe"
+set "MOSS_PYTHON=%PYTHON%"
 set "ASMR_DIR=%MOSS_ROOT%\asmr-enhancer"
 set "ASMR_COMMIT=ade1a82b4f8b97abf088280d22156448cc0a888f"
 set "MOSS_COMMIT=9990574e6ac62390a21bcce25a914d66ac92c25e"
@@ -48,24 +48,18 @@ for %%D in (
 ) do if not exist "%%~D" mkdir "%%~D"
 
 if not exist "%PYTHON%" (
-    echo [1/6] Creating the Python 3.12 application environment...
-    py -3.12 -m venv "%LIB%\.venv"
+    echo [1/5] Creating the shared Python 3.12 environment...
+    py -3.12 -m venv "%ROOT%\.venv"
     if errorlevel 1 exit /b 1
 )
 
-echo [2/6] Updating application dependencies...
+echo [2/5] Updating application dependencies...
 "%PYTHON%" -m pip install --upgrade pip
 if errorlevel 1 exit /b %ERRORLEVEL%
 "%PYTHON%" -m pip install -r "%ROOT%requirements.txt"
 if errorlevel 1 exit /b %ERRORLEVEL%
 
-if not exist "%MOSS_PYTHON%" (
-    echo [3/6] Creating the Python 3.12 MOSS environment...
-    py -3.12 -m venv "%MOSS_ROOT%\.venv"
-    if errorlevel 1 exit /b 1
-)
-
-echo [4/6] Updating MOSS and CUDA dependencies...
+echo [3/5] Updating MOSS and CUDA dependencies in the shared environment...
 "%MOSS_PYTHON%" -m pip install --upgrade pip
 if errorlevel 1 exit /b %ERRORLEVEL%
 "%MOSS_PYTHON%" -m pip install --index-url https://download.pytorch.org/whl/cu128 torch torchaudio
@@ -75,7 +69,7 @@ if errorlevel 1 exit /b %ERRORLEVEL%
 "%MOSS_PYTHON%" -m pip install librosa pyloudnorm scipy soundfile tqdm
 if errorlevel 1 exit /b %ERRORLEVEL%
 
-echo [5/6] Updating ASMR Enhancer...
+echo [4/5] Updating ASMR Enhancer...
 if not exist "%ASMR_DIR%\.git" (
     git clone https://github.com/xmlans/asmr-enhancer.git "%ASMR_DIR%"
     if errorlevel 1 exit /b 1
@@ -85,7 +79,7 @@ if errorlevel 1 exit /b %ERRORLEVEL%
 git -C "%ASMR_DIR%" checkout --detach %ASMR_COMMIT%
 if errorlevel 1 exit /b %ERRORLEVEL%
 
-echo [6/6] Verifying CUDA and downloading required models...
+echo [5/5] Verifying CUDA and downloading required models...
 "%MOSS_PYTHON%" "%LIB%\moss_setup.py"
 if errorlevel 1 exit /b %ERRORLEVEL%
 
@@ -98,15 +92,11 @@ if not exist "%PYTHON%" (
     echo [ERROR] Application environment is missing. Run 00_setup_or_update.bat first.
     exit /b 2
 )
-if not exist "%MOSS_PYTHON%" (
-    echo [ERROR] MOSS environment is missing. Run 00_setup_or_update.bat first.
-    exit /b 2
-)
 "%PYTHON%" -c "import yt_dlp, PIL, numpy, curl_cffi, mutagen, requests"
 if errorlevel 1 exit /b %ERRORLEVEL%
 "%MOSS_PYTHON%" -c "import mutagen, PIL, requests"
 if errorlevel 1 exit /b %ERRORLEVEL%
 "%PYTHON%" "%LIB%\web_app\server.py" --check
 if errorlevel 1 exit /b %ERRORLEVEL%
-echo [OK] Application and MOSS environments are ready.
+echo [OK] The shared application and MOSS environment is ready.
 exit /b 0

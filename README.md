@@ -49,9 +49,9 @@ output/
 
 安裝程式會：
 
-1. 建立 `lib/.venv`。
+1. 在專案根目錄建立共用的 `.venv`。
 2. 安裝 `requirements.txt`。
-3. 建立 `lib/moss/.venv`。
+3. 將 MOSS 安裝到同一個 `.venv`，並以獨立子程序釋放 CUDA 資源。
 4. 安裝 CUDA 12.8 PyTorch、MOSS 與音訊處理依賴。
 5. 固定 MOSS commit `9990574e6ac62390a21bcce25a914d66ac92c25e`。
 6. 固定 ASMR Enhancer commit `ade1a82b4f8b97abf088280d22156448cc0a888f`。
@@ -166,27 +166,30 @@ OPENROUTER_API_KEY
 直接執行程式：
 
 ```powershell
-lib\.venv\Scripts\python.exe lib\capture_frames.py "影片網址"
-lib\.venv\Scripts\python.exe lib\run_download.py
+.venv\Scripts\python.exe lib\capture_frames.py "影片網址"
+.venv\Scripts\python.exe lib\run_download.py
 ```
 
 執行單元測試：
 
 ```powershell
-lib\.venv\Scripts\python.exe -m pytest -q lib\tests
+.venv\Scripts\python.exe -m pytest -q lib\tests
 ```
 
 多站真實連線 smoke（產物在 `tasks/tests/site-smoke/`，失敗會 skip）：
 
 ```powershell
-lib\.venv\Scripts\python.exe -m pytest -q tasks\tests\test_sites_smoke.py -m site_smoke
+.venv\Scripts\python.exe -m pytest -q tasks\tests\test_sites_smoke.py -m site_smoke
 ```
 
 查看或匯出影片 Meta：
 
 ```powershell
-lib\.venv\Scripts\python.exe lib\video_meta.py show "影片.mp4"
-lib\.venv\Scripts\python.exe lib\video_meta.py export "影片.mp4" --out-dir "輸出資料夾"
+.venv\Scripts\python.exe lib\video_meta.py show "影片.mp4"
+.venv\Scripts\python.exe lib\video_meta.py export "影片.mp4" --out-dir "輸出資料夾"
 ```
 
-Confucius4-TTS 等非主流程工具保留在 `lib/`，不會出現在根目錄的日常入口中。
+Confucius4-TTS 等非主流程工具保留在 `lib/`，並使用專案根目錄的
+`.venv-confucius4`（Python 3.10）隔離其 Torch／CUDA 依賴，不會出現在
+根目錄的日常入口中。ASMR Enhancer 只保留流程實際載入的原始碼，不建立
+第三個正式 venv。

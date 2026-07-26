@@ -22,10 +22,12 @@ VIDEOS_DIR = OUTPUT_ROOT / "03_videos"
 DOWNLOADED_DIR = OUTPUT_ROOT / "04_downloaded"
 
 TASKS_DIR = PROJECT_ROOT / "tasks"
-DOWNLOAD_VENV_DIR = LIB_DIR / ".venv"
+APP_VENV_DIR = PROJECT_ROOT / ".venv"
+DOWNLOAD_VENV_DIR = APP_VENV_DIR
 MOSS_DIR = LIB_DIR / "moss"
-MOSS_VENV_DIR = MOSS_DIR / ".venv"
+MOSS_VENV_DIR = APP_VENV_DIR
 CONFUCIUS_DIR = LIB_DIR / "confucius4_tts"
+CONFUCIUS_VENV_DIR = PROJECT_ROOT / ".venv-confucius4"
 
 
 def ensure_output_directories() -> None:

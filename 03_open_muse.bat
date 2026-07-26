@@ -5,7 +5,7 @@ title Muse Local Video Workspace
 cd /d "%~dp0"
 
 set "ROOT=%~dp0"
-set "PYTHON=%ROOT%lib\.venv\Scripts\python.exe"
+set "PYTHON=%ROOT%\.venv\Scripts\python.exe"
 set "SCRIPT=%ROOT%lib\web_app\server.py"
 
 if /i "%~1"=="--check" (

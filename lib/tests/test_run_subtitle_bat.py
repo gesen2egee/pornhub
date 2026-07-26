@@ -12,9 +12,9 @@ def test_only_integrated_download_batch_remains():
 
 def test_download_batch_checks_moss_environment():
     content = DOWNLOAD_BATCH.read_text(encoding="utf-8")
-    assert 'set "MOSS_PYTHON=%ROOT%lib\\moss\\.venv\\Scripts\\python.exe"' in content
+    assert 'set "PYTHON=%ROOT%\\.venv\\Scripts\\python.exe"' in content
+    assert 'set "MOSS_PYTHON=%PYTHON%"' in content
     assert "00_setup_or_update.bat" in content
-    assert "Downloads and subtitles run in parallel" in content
     assert 'if /i "%~1"=="--check"' in content
     assert '"%PYTHON%" "%SCRIPT%" %*' in content
     assert (

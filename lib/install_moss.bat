@@ -3,7 +3,8 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 
 set "ROOT=%~dp0"
-set "PYTHON=%ROOT%moss\.venv\Scripts\python.exe"
+set "PROJECT_ROOT=%ROOT%.."
+set "PYTHON=%PROJECT_ROOT%\.venv\Scripts\python.exe"
 set "ASMR_DIR=%ROOT%moss\asmr-enhancer"
 set "ASMR_COMMIT=ade1a82b4f8b97abf088280d22156448cc0a888f"
 
@@ -26,7 +27,7 @@ if errorlevel 1 (
 )
 
 if not exist "%PYTHON%" (
-    py -3.12 -m venv "%ROOT%moss\.venv"
+    py -3.12 -m venv "%PROJECT_ROOT%\.venv"
     if errorlevel 1 exit /b %ERRORLEVEL%
 )
 

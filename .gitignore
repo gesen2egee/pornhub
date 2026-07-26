@@ -5,8 +5,10 @@
 *.zip
 
 # Python 執行環境、模型與第三方原始碼
+/.venv/
+/.venv-confucius4/
+# 舊版 Muse 執行中時可能暫時無法刪除
 /lib/.venv/
-/lib/moss/.venv/
 /lib/moss/asmr-enhancer/
 /lib/moss/audio-model-cache/
 /lib/moss/model-cache/

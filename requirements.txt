@@ -5,3 +5,4 @@ curl_cffi
 mutagen
 requests
 pytest
+faster-whisper

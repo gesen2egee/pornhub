@@ -5,7 +5,7 @@ title Video 3x3 Grid Collage Generator
 cd /d "%~dp0"
 
 set "ROOT=%~dp0"
-set "PYTHON=%ROOT%lib\.venv\Scripts\python.exe"
+set "PYTHON=%ROOT%\.venv\Scripts\python.exe"
 set "SCRIPT=%ROOT%lib\capture_frames.py"
 
 if not exist "%PYTHON%" (

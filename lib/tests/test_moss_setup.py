@@ -61,5 +61,6 @@ def test_installer_pins_cuda_wheel_and_moss_commit():
     assert "pyloudnorm" in content
     assert "xmlans/asmr-enhancer" in content
     assert "where git" in content
-    assert 'py -3.12 -m venv "%MOSS_ROOT%\\.venv"' in content
+    assert 'py -3.12 -m venv "%ROOT%\\.venv"' in content
+    assert 'set "MOSS_PYTHON=%PYTHON%"' in content
     assert '"%MOSS_PYTHON%" "%LIB%\\moss_setup.py"' in content
