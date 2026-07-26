@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """02_preview_videos 預覽管線。
 
-下載前 3 分鐘低畫質 → Whisper ASR → Grok 4.3 none 翻譯
-→ 有語音段落剪片（淨語音 ≤30s 則保留整段 3 分鐘）
-→ 軟 SRT（不硬字幕、不 enhance）
+每次下載 3 分鐘低畫質 → MOSS ASR；累計對話達 30 秒才剪片，否則繼續取下一段。
+若影片結束仍未達門檻則發布完整影片 → Grok 4.3 none 翻譯 → 自動 enhance → 軟 SRT。
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -29,7 +29,7 @@ def _log(msg: str) -> None:
 def _apply_preview_env() -> None:
     """只補直接呼叫此模組時的預設值，不覆寫控制器傳入設定。"""
     os.environ.setdefault(
-        "ASR_BACKEND", os.getenv("PREVIEW_ASR_BACKEND", "whisper")
+        "ASR_BACKEND", os.getenv("PREVIEW_ASR_BACKEND", "moss")
     )
     os.environ.setdefault(
         "OPENROUTER_MODEL",
@@ -138,24 +138,22 @@ def cut_local_segments(
     return out_path
 
 
-def download_preview_clip(video_url: str, out_path: Path) -> Path:
-    """下載前 PREVIEW_SECONDS 秒、最低畫質。"""
+def download_preview_range(
+    video_url: str,
+    out_path: Path,
+    start: float,
+    end: float,
+) -> Path:
+    """下載指定範圍的最低畫質預覽片段。"""
     import yt_dlp
     import full_video_pipeline as fvp
 
-    if out_path.exists():
-        out_path.unlink()
-    end = float(os.getenv("PREVIEW_SECONDS", str(PREVIEW_SECONDS)))
+    out_path.unlink(missing_ok=True)
+    start = max(0.0, float(start))
+    end = max(start + 0.05, float(end))
 
-    def _ranges(info_dict, ydl):
-        dur = info_dict.get("duration")
-        try:
-            dur_f = float(dur) if dur is not None else end
-        except (TypeError, ValueError):
-            dur_f = end
-        clip_end = min(end, max(1.0, dur_f))
-        ydl.to_screen(f"[info] PREVIEW 取樣：0–{clip_end:.1f}s")
-        yield {"start_time": 0.0, "end_time": clip_end}
+    def _ranges(_info_dict, _ydl):
+        yield {"start_time": start, "end_time": end}
 
     opts = fvp._base_ydl_opts(out_path, "download_low", video_url)
     opts["format"] = (
@@ -165,12 +163,106 @@ def download_preview_clip(video_url: str, out_path: Path) -> Path:
     )
     opts["download_ranges"] = _ranges
     opts["force_keyframes_at_cuts"] = True
-    _log(f"  [1/4] 下載前 {end:.0f}s 低畫質預覽 → {out_path.name}")
+    _log(
+        f"  [1/4] 下載低畫質預覽 {start:.0f}–{end:.0f}s → {out_path.name}"
+    )
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([video_url])
     if not out_path.exists() or fvp.has_video_stream(out_path) is not True:
         raise RuntimeError(f"預覽下載失敗：{out_path}")
     return out_path
+
+
+def download_preview_clip(video_url: str, out_path: Path) -> Path:
+    """相容舊呼叫：下載第一段 PREVIEW_SECONDS 秒低畫質預覽。"""
+    seconds = float(os.getenv("PREVIEW_SECONDS", str(PREVIEW_SECONDS)))
+    return download_preview_range(video_url, out_path, 0.0, seconds)
+
+
+def collect_preview_until_dialogue(
+    video_url: str,
+    work_dir: Path,
+    video_stem: str,
+    dialogue_threshold: float,
+) -> tuple[dict, Path, float, bool, bool]:
+    """每 3 分鐘取樣與 ASR；達對話門檻即停止，否則取到影片結束。"""
+    import full_video_pipeline as fvp
+    from translate_srt_openrouter import format_srt
+
+    try:
+        chunk_seconds = float(os.getenv("PREVIEW_SECONDS", str(PREVIEW_SECONDS)))
+    except ValueError:
+        chunk_seconds = float(PREVIEW_SECONDS)
+    chunk_seconds = max(1.0, chunk_seconds)
+    remote_duration = fvp.remote_duration(video_url)
+    range_count = (
+        max(1, math.ceil(remote_duration / chunk_seconds))
+        if remote_duration is not None
+        else 1
+    )
+    parts: list[Path] = []
+    merged_cues: list[dict] = []
+    languages: list[str] = []
+    threshold_reached = False
+    source_ended = False
+
+    for index in range(range_count):
+        start = index * chunk_seconds
+        end = min(remote_duration, start + chunk_seconds) if remote_duration else start + chunk_seconds
+        part = work_dir / f"{video_stem}.preview{index:03d}.mp4"
+        download_preview_range(video_url, part, start, end)
+        parts.append(part)
+        result = fvp.run_asr_batch([part], work_dir / f"preview-asr-{index:03d}")[0]
+        cues = result.get("cues") or []
+        merged_cues.extend(fvp._offset_asr_cues(cues, start, len(merged_cues) + 1))
+        language = result.get("language")
+        if language and language not in languages:
+            languages.append(str(language))
+        entries = fvp.cues_to_entries(merged_cues)
+        net_dialogue = segment_cutter.calculate_net_dialogue_duration(entries)
+        _log(
+            f"  [Preview ASR] 第 {index + 1} 段完成；累計對話 {net_dialogue:.1f}s"
+            f"（門檻 {dialogue_threshold:.1f}s）"
+        )
+        if net_dialogue >= dialogue_threshold:
+            threshold_reached = True
+            break
+        if remote_duration is not None and end >= remote_duration - 0.01:
+            source_ended = True
+            break
+        actual_duration = fvp.probe_duration(part) or 0.0
+        if actual_duration + 0.5 < chunk_seconds:
+            source_ended = True
+            break
+
+    if not parts:
+        raise RuntimeError("Preview 沒有成功下載任何片段")
+    part_duration_total = sum(fvp.probe_duration(part) or 0.0 for part in parts)
+    clip_path = work_dir / f"{video_stem}.clip.mp4"
+    clip_path.unlink(missing_ok=True)
+    fvp.concat_videos(parts, clip_path)
+    duration = fvp.probe_duration(clip_path) or 0.0
+    for part in parts:
+        if part.exists() and part.resolve() != clip_path.resolve():
+            part.unlink(missing_ok=True)
+    if duration <= 0:
+        duration = part_duration_total
+    return (
+        {
+            "language": ",".join(languages) or "multilingual",
+            "original_srt": format_srt(merged_cues) if merged_cues else "",
+            "translated_srt": "",
+            "outcome": "transcribed" if merged_cues else "empty",
+            "cues": merged_cues,
+            "source_duration": duration,
+            "preview_threshold_reached": threshold_reached,
+            "preview_source_ended": source_ended,
+        },
+        clip_path,
+        duration,
+        threshold_reached,
+        source_ended,
+    )
 
 
 def process_preview_from_grid(
@@ -279,25 +371,40 @@ def process_preview_from_grid(
     _log(f"URL：{video_url}")
     _log("=" * 60)
 
-    # 1) 下載 3 分鐘
-    if clip_path.exists() and fvp.has_video_stream(clip_path) is True:
-        _log(f"  [1/4] 重用既有預覽片段：{clip_path.name}")
-    else:
-        download_preview_clip(video_url, clip_path)
-    duration = fvp.probe_duration(clip_path) or 0.0
-    _log(f"  [OK] 預覽片段時長 {duration:.1f}s")
-
-    # 2) ASR + 翻譯，可依開關重用快取
+    # 1) 每段 3 分鐘下載與 ASR；對話未達門檻就繼續取下一段。
+    cached_asr: dict | None = None
     if reuse_cache and asr_cache.is_file():
-        asr = json.loads(asr_cache.read_text(encoding="utf-8"))
-        _log(f"  [2/4] 重用字幕快取：{asr_cache.name}")
-        if not translation_enabled:
-            asr["translated_srt"] = ""
-            asr["outcome"] = "transcribed"
-        else:
-            asr = fvp.complete_cached_translation(asr, asr_cache)
+        try:
+            candidate = json.loads(asr_cache.read_text(encoding="utf-8"))
+            if (
+                "preview_threshold_reached" in candidate
+                and clip_path.exists()
+                and fvp.has_video_stream(clip_path) is True
+            ):
+                cached_asr = candidate
+        except Exception:
+            cached_asr = None
+
+    if cached_asr is not None:
+        asr = cached_asr
+        duration = fvp.probe_duration(clip_path) or float(
+            asr.get("source_duration") or 0.0
+        )
+        _log(f"  [1/4] 重用已完成 Preview ASR 快取：{asr_cache.name}")
     elif enable_asr:
-        asr = fvp.run_asr_translate(clip_path, work_dir)
+        asr, clip_path, duration, threshold_reached, source_ended = (
+            collect_preview_until_dialogue(
+                video_url,
+                work_dir,
+                video_stem,
+                dialogue_trim_threshold,
+            )
+        )
+        _log(
+            f"  [OK] Preview 取樣時長 {duration:.1f}s；"
+            f"對話門檻={'已達' if threshold_reached else '未達'}；"
+            f"影片結束={'是' if source_ended else '否'}"
+        )
         asr_cache.write_text(
             json.dumps(asr, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -305,15 +412,27 @@ def process_preview_from_grid(
     else:
         if translation_enabled or enable_dialogue_trim:
             raise RuntimeError(
-                "ASR 已關閉且沒有 Preview 字幕快取；翻譯與剪片無資料來源。"
+                "ASR 已關閉且沒有可用 Preview 字幕快取；翻譯與剪片無資料來源。"
             )
+        download_preview_clip(video_url, clip_path)
+        duration = fvp.probe_duration(clip_path) or 0.0
         _log("  [2/4] ASR 已由開關停用")
         asr = {
             "original_srt": "",
             "translated_srt": "",
             "outcome": "disabled",
             "cues": [],
+            "preview_threshold_reached": False,
+            "preview_source_ended": False,
         }
+
+    # 所有需要的 Preview ASR 完成後，才一次送出 OpenRouter 翻譯。
+    if not translation_enabled:
+        asr["translated_srt"] = ""
+        if asr.get("outcome") != "disabled":
+            asr["outcome"] = "transcribed"
+    elif asr.get("original_srt") or asr.get("cues"):
+        asr = fvp.complete_cached_translation(asr, asr_cache)
     original_srt = asr.get("original_srt") or ""
     translated_srt = asr.get("translated_srt") or ""
     outcome = asr.get("outcome") or "empty"
@@ -331,10 +450,10 @@ def process_preview_from_grid(
         f"（門檻 {dialogue_trim_threshold}s）"
     )
 
-    # 3) 剪片：語音 >30s 才剪；否則保留全部 3 分鐘
+    # 3) 只有累計對話達門檻才剪片；影片結束仍不足時保留完整影片。
     publish_src = clip_path
     segments: list[tuple[float, float]] | None = None
-    if enable_dialogue_trim and net_dur > dialogue_trim_threshold and entries:
+    if enable_dialogue_trim and net_dur >= dialogue_trim_threshold and entries:
         segments = segment_cutter.build_continuous_segments(
             entries,
             max_gap=segment_gap,
@@ -359,10 +478,16 @@ def process_preview_from_grid(
                 segment_cutter.retime_subtitles(tr_e, segments)
             )
     else:
-        _log(
-            f"  [3/4] 剪片關閉、語音 ≤ {dialogue_trim_threshold}s 或無字幕"
-            f" → 保留整段預覽（不剪）"
-        )
+        if asr.get("preview_source_ended") and entries:
+            _log(
+                f"  [3/4] 影片已結束且累計對話未達 {dialogue_trim_threshold}s"
+                " → 發布完整影片（不剪）"
+            )
+        else:
+            _log(
+                f"  [3/4] 剪片關閉、語音未達 {dialogue_trim_threshold}s 或無字幕"
+                " → 保留目前完整 Preview（不剪）"
+            )
 
     enhanced = False
     if enable_enhance:

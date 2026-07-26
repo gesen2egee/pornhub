@@ -66,7 +66,7 @@ STAGES = {
         "第一層：Preview Video",
         PREVIEW_VIDEOS_DIR,
         "$ 低預算",
-        "前 3 分鐘低畫質、MOSS、自動 enhance、軟字幕",
+        "每段 3 分鐘低畫質、MOSS、對話不足會續抓、自動 enhance、軟字幕",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
     "video": StageDefinition(

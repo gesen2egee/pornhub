@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-1.5s 無字幕死空檔切除、連貫分段、字幕重對位 (SRT Retiming) 與 Meta 更新模組。
-"""
+"""長停頓切除、前後緩衝、字幕重對位與 Meta 更新模組。"""
 
 import re
 import os
@@ -87,20 +85,24 @@ def calculate_net_dialogue_duration(entries: list[dict]) -> float:
 def build_continuous_segments(
     entries: list[dict],
     max_gap: float = 1.5,
-    max_dur: float = 99999.0
+    max_dur: float = 99999.0,
+    edge_padding: float = 0.75,
 ) -> list[tuple[float, float]]:
     """
     依字幕之間的停頓建立影片保留區段。
 
-    規則是「停頓小於 max_gap 完整保留；停頓大於或等於 max_gap
-    整段移除」，不會再對每個字幕前後自動增加 max_gap / 2 的緩衝。
-    因此 max_gap=1.5 時，1.5 秒停頓會被移除，1.49 秒停頓會保留。
+    停頓小於 max_gap 時完整保留；停頓大於或等於 max_gap 時切段。
+    每個保留段前後各保留 edge_padding 秒（預設 0.75 秒），避免切掉
+    說話前後的呼吸與語尾；因此 max_gap=1.5 時，剛好 1.5 秒的停頓
+    會由兩側緩衝接起來，較長停頓才會留下實際剪除的空白。
     """
     if not entries:
         return []
 
     if max_gap < 0:
         raise ValueError("max_gap 不得小於 0")
+    if edge_padding < 0:
+        raise ValueError("edge_padding 不得小於 0")
 
     intervals = []
     for entry in entries:
@@ -113,16 +115,22 @@ def build_continuous_segments(
         return []
 
     segments: list[tuple[float, float]] = []
-    current_start, current_end = intervals[0]
+    first_start, first_end = intervals[0]
+    current_start = max(0.0, first_start - edge_padding)
+    current_end = min(float(max_dur), first_end + edge_padding)
+    previous_dialogue_end = first_end
     for start, end in intervals[1:]:
-        pause = start - current_end
+        # 是否切段只看原始對白的間距；緩衝僅影響保留範圍。
+        pause = start - previous_dialogue_end
         if pause < max_gap:
-            # 短停頓與對白放在同一個保留區段，完整保留原始時間。
-            current_end = max(current_end, end)
+            # 短停頓與對白放在同一個保留區段，保留尾端緩衝。
+            current_end = max(current_end, min(float(max_dur), end + edge_padding))
         else:
-            # 長停頓整段不加入任何保留區段，串接時會被完全移除。
+            # 長停頓只保留前後 0.75 秒緩衝，其餘在串接時移除。
             segments.append((current_start, current_end))
-            current_start, current_end = start, end
+            current_start = max(0.0, start - edge_padding)
+            current_end = min(float(max_dur), end + edge_padding)
+        previous_dialogue_end = max(previous_dialogue_end, end)
     segments.append((current_start, current_end))
     return segments
 
