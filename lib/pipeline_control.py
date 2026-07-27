@@ -68,7 +68,7 @@ STAGES = {
         "第一層：Preview Video",
         PREVIEW_VIDEOS_DIR,
         "$ 低預算",
-        "每段 3 分鐘低畫質、MOSS、精選翻譯、保留對白>30s 剪片、enhance、軟字幕",
+        "一次下載 BS×3 分鐘低畫質、批次 MOSS、一次精選翻譯、保留對白>30s 剪片",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
     "video": StageDefinition(
@@ -316,7 +316,7 @@ def print_effective_options(stage_name: str, options: FeatureSwitches) -> None:
         f"Reasoning={options.reasoning_effort}｜"
         f"剪片門檻={options.trim_threshold}s｜停頓切段={options.segment_gap}s"
         f"｜延伸={0.75 if options.edge_padding else 0}s"
-        f"｜ASR區段={options.asr_chunk_seconds}s｜ASR批次上限={options.asr_batch_size}"
+        f"｜ASR區段={options.asr_chunk_seconds}s｜ASR固定批次={options.asr_batch_size}"
     )
 
 

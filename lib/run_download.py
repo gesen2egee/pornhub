@@ -231,7 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--asr-batch-size",
         type=int,
         metavar="COUNT",
-        help="MOSS 動態 ASR 佇列的最大 batch 數，預設 3",
+        help="累計多少個片段才送一次批次 ASR，預設 3；尾批不足仍會送出",
     )
     parser.add_argument(
         "--retry-subtitles",

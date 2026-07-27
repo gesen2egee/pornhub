@@ -18,7 +18,7 @@ import sys
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext, redirect_stdout
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Queue
 from threading import Lock, Thread
 from typing import Any, Iterator
 
@@ -1139,7 +1139,7 @@ def run_streamed_asr(
     *,
     moss_worker: MossAsrWorker | None = None,
 ) -> tuple[dict[str, Any], float]:
-    """下載每段 240P 後立刻排入 Demucs+ASR，下載與 ASR 可重疊。"""
+    """每累計滿 BS 個 240P 片段才做批次 ASR；尾批不足 BS 仍會送出。"""
     from translate_srt_openrouter import format_srt
 
     stream_enabled = asr_stream_enabled()
@@ -1158,7 +1158,7 @@ def run_streamed_asr(
     ]
     _log(
         f"  [ASR 串流] 240P 共 {len(ranges)} 段，每段最多 {chunk_seconds / 60:.1f} 分鐘；"
-        "下載與 Demucs+ASR 同步排隊"
+        "累計滿 BS 後批次 ASR，並與下一批下載重疊"
     )
     from asr_backends import asr_batch_size
 
@@ -1174,15 +1174,13 @@ def run_streamed_asr(
                 job_queue.task_done()
                 return
             jobs = [first]
-            # 下載領先時，將已排隊的片段合併到既有 BS 上限；下載落後時自然維持 BS=1。
+            stop_after_batch = False
+            # 固定等待累計到 BS；只有收到結束訊號時才送出不足 BS 的尾批。
             while len(jobs) < batch_limit:
-                try:
-                    next_job = job_queue.get_nowait()
-                except Empty:
-                    break
+                next_job = job_queue.get()
                 if next_job is None:
                     job_queue.task_done()
-                    job_queue.put(None)
+                    stop_after_batch = True
                     break
                 jobs.append(next_job)
             try:
@@ -1208,6 +1206,8 @@ def run_streamed_asr(
             finally:
                 for _job in jobs:
                     job_queue.task_done()
+            if stop_after_batch:
+                return
 
     worker = Thread(
         target=consume_asr_queue,

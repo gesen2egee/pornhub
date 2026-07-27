@@ -149,8 +149,9 @@ def collect_preview_until_dialogue(
     *,
     moss_worker=None,
 ) -> tuple[dict, Path, float, bool, bool]:
-    """每 3 分鐘取樣與 ASR；達對話門檻即停止，否則取到影片結束。"""
+    """一次下載 BS 個預覽片段（預設 3×3 分鐘），再做一次批次 ASR。"""
     import full_video_pipeline as fvp
+    from asr_backends import asr_batch_size
     from translate_srt_openrouter import format_srt
 
     try:
@@ -158,16 +159,19 @@ def collect_preview_until_dialogue(
     except ValueError:
         chunk_seconds = float(PREVIEW_SECONDS)
     chunk_seconds = max(1.0, chunk_seconds)
+    batch_limit = asr_batch_size()
     remote_duration = fvp.remote_duration(video_url)
-    range_count = (
+    available_ranges = (
         max(1, math.ceil(remote_duration / chunk_seconds))
         if remote_duration is not None
-        else 1
+        else batch_limit
     )
+    # Preview 固定只取第一個 BS；預設 BS=3、每段 180s，合計最多 9 分鐘。
+    range_count = min(batch_limit, available_ranges)
     parts: list[Path] = []
+    jobs: list[tuple[int, float, Path]] = []
     merged_cues: list[dict] = []
     languages: list[str] = []
-    threshold_reached = False
     source_ended = False
 
     for index in range(range_count):
@@ -176,26 +180,11 @@ def collect_preview_until_dialogue(
         part = work_dir / f"{video_stem}.preview{index:03d}.mp4"
         download_preview_range(video_url, part, start, end)
         parts.append(part)
-        asr_work = work_dir / f"preview-asr-{index:03d}"
-        result = (
-            fvp.run_asr_batch([part], asr_work)
-            if moss_worker is None
-            else fvp.run_asr_batch([part], asr_work, moss_worker=moss_worker)
-        )[0]
-        cues = result.get("cues") or []
-        merged_cues.extend(fvp._offset_asr_cues(cues, start, len(merged_cues) + 1))
-        language = result.get("language")
-        if language and language not in languages:
-            languages.append(str(language))
-        entries = fvp.cues_to_entries(merged_cues)
-        net_dialogue = segment_cutter.calculate_net_dialogue_duration(entries)
+        jobs.append((index, start, part))
         _log(
-            f"  [Preview ASR] 第 {index + 1} 段完成；累計對話 {net_dialogue:.1f}s"
-            f"（門檻 {dialogue_threshold:.1f}s）"
+            f"  [Preview 下載] {index + 1}/{range_count}；"
+            f"累計 {len(jobs)}/{batch_limit} 段"
         )
-        if net_dialogue >= dialogue_threshold:
-            threshold_reached = True
-            break
         if remote_duration is not None and end >= remote_duration - 0.01:
             source_ended = True
             break
@@ -204,8 +193,39 @@ def collect_preview_until_dialogue(
             source_ended = True
             break
 
-    if not parts:
+    if not jobs:
         raise RuntimeError("Preview 沒有成功下載任何片段")
+    _log(
+        f"  [Preview ASR] 一次送出 BS={len(jobs)}/{batch_limit}"
+        f"（約 {sum((fvp.probe_duration(part) or 0.0) for part in parts) / 60:.1f} 分鐘）"
+    )
+    asr_work = work_dir / "preview-asr-batch"
+    results = (
+        fvp.run_asr_batch([job[2] for job in jobs], asr_work)
+        if moss_worker is None
+        else fvp.run_asr_batch(
+            [job[2] for job in jobs],
+            asr_work,
+            moss_worker=moss_worker,
+        )
+    )
+    if len(results) != len(jobs):
+        raise RuntimeError(
+            f"Preview ASR 回傳 {len(results)} 筆，預期 {len(jobs)} 筆"
+        )
+    for (_index, start, _part), result in zip(jobs, results):
+        cues = result.get("cues") or []
+        merged_cues.extend(fvp._offset_asr_cues(cues, start, len(merged_cues) + 1))
+        language = result.get("language")
+        if language and language not in languages:
+            languages.append(str(language))
+    entries = fvp.cues_to_entries(merged_cues)
+    net_dialogue = segment_cutter.calculate_net_dialogue_duration(entries)
+    threshold_reached = net_dialogue >= dialogue_threshold
+    _log(
+        f"  [Preview ASR] BS={len(jobs)} 完成；累計對話 {net_dialogue:.1f}s"
+        f"（門檻 {dialogue_threshold:.1f}s）"
+    )
     part_duration_total = sum(fvp.probe_duration(part) or 0.0 for part in parts)
     clip_path = work_dir / f"{video_stem}.clip.mp4"
     clip_path.unlink(missing_ok=True)

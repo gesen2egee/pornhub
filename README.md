@@ -35,7 +35,7 @@ output/
 
 | 流程 | 放入 | 畫質 | 字幕 | enhance | 輸出 |
 |------|------|------|------|---------|------|
-| 預覽 | `02_preview_videos` 九宮格或含 URL 影片 | 前 3 分鐘低畫質；語音>30s 剪片否則全留 | Demucs 人聲 → Whisper + Grok 4.3 none 軟 SRT | 否 | 同目錄 |
+| 預覽 | `02_preview_videos` 九宮格或含 URL 影片 | 一次下載 BS 段低畫質（預設 3×3 分鐘）；語音>30s 剪片否則全留 | Demucs 人聲 → 批次 MOSS → 一次 Grok 精選翻譯 | 否 | 同目錄 |
 | 標準全片 | `03_videos` 九宮格或含 URL 影片 | 480P（Whisper 剪片） | Demucs 人聲 → Whisper + **Grok 4.3 none**（便宜） | 否 | `03_videos` |
 | 精選 | `05_chosen` 九宮格或影片 | 1080P | Demucs 人聲 → MOSS + **Grok 4.5 minimal** | 判斷 | `06_good` |
 | 歸檔 | （自動） | — | — | — | 九宮格→`04_downloaded`；chosen 來源影片刪除 |
@@ -122,10 +122,10 @@ yt-dlp DEBUG 與下載百分比訊息。
 
 暫存位於 `output/00_temp/pipeline/`。Video 與 Chosen 預設分成兩個階段：
 
-1. 以 240P 每 180 秒下載一段；每段下載完成立刻排入 `Demucs → ASR`，下載與 ASR 可重疊。必須等全部低畫質區段與 ASR 都完成，才進下一階段。
+1. 以 240P 每 180 秒下載一段；累計滿 BS（預設 3 段）才排入一次 `Demucs → ASR`，並與下一批下載重疊。影片尾端不足 BS 仍會送出，全部完成後才進下一階段。
 2. 同時執行 OpenRouter 翻譯、高畫質切塊下載，以及每個已下載切塊的自動 `enhance`；三條工作都完成後才 retime 字幕、拼接與發布。
 
-Preview 每段預設為 180 秒的 `Demucs → MOSS` 流程；累計對話達 30 秒即停止取樣，否則持續到影片結束。下載與剪片完成後同樣會自動判斷 enhance。
+Preview 每段預設 180 秒，一次先下載 `--asr-batch-size` 段（預設 3 段，共最多 9 分鐘），再用同一批執行 `Demucs → MOSS BS ASR`；合併完整批次字幕後只送一次 OpenRouter 精選翻譯。下載與剪片完成後同樣會自動判斷 enhance。
 
 只盤點、不下載：
 
@@ -168,8 +168,8 @@ Chosen 有 URL 時不會拿既有高畫質成品接續，會重新下載規劃�
 若連 ASR 字幕快取也要重做，請加上 `--no-reuse-cache`。
 每支發布完成的影片 Metadata 都會寫入 `published_stage`（`preview`、`video` 或 `chosen`）。下次掃描同一層資料夾時，標示同層已發布的影片會列為既有成品、不再處理；需要明確重跑時使用 `--force`。
 剪片門檻與區段合併間隔可分別用 `--trim-threshold`、`--segment-gap` 調整；`--preview-seconds` 是 Preview 每次下載與 ASR 的片段長度，不再是總長度。
-`asr-stream` 預設開啟；`--asr-chunk-seconds` 預設為 180。下載速度領先 ASR 時，已就緒片段會進入佇列，並在 `--asr-batch-size`（預設 3）上限內自動提高 MOSS 的實際 batch。關閉 `--asr-stream` 時，會退回完整 240P 代理下載完成後再 ASR，其他功能不會被連帶關閉。
-目前剪片規則是：停頓小於門檻時完整保留；停頓大於或等於門檻時切段，且每個保留段的前後各保留 0.75 秒緩衝。
+`asr-stream` 預設開啟；`--asr-chunk-seconds` 預設為 180。Video／Chosen 會累計滿 `--asr-batch-size`（預設 3）段才執行一次 MOSS BS ASR，同時開始下載下一批；影片尾端不足 BS 的批次仍會送出。關閉 `--asr-stream` 時，會退回完整 240P 代理下載完成後再 ASR，其他功能不會被連帶關閉。
+目前剪片規則是：停頓小於門檻時完整保留；停頓大於或等於門檻時切段，預設前後延伸為 0 秒。
 
 維護模式：
 
