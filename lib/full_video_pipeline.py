@@ -53,14 +53,14 @@ HIGH_CONCURRENT_FRAGMENTS = 8
 DIALOGUE_TRIM_THRESHOLD = 30.0
 # 停頓 ≥ 1.5s 剪掉中間空白
 SEGMENT_GAP = 1.5
-# 前後備援 0.75s（由 ENABLE_EDGE_PADDING 開關控制，關則 0）
+# 可選的前後延伸秒數；所有流程預設關閉，明確開啟才使用 0.75s
 SEGMENT_EDGE_PADDING = 0.75
 
 
 def edge_padding_enabled(environment: dict[str, str] | None = None) -> bool:
-    """對白前後 0.75s 備援；預設 ON。"""
+    """對白前後 0.75s 延伸；所有流程預設 OFF。"""
     environment = os.environ if environment is None else environment
-    value = environment.get("ENABLE_EDGE_PADDING", "1").strip().casefold()
+    value = environment.get("ENABLE_EDGE_PADDING", "0").strip().casefold()
     return value not in {"0", "false", "no", "off"}
 
 
@@ -68,7 +68,7 @@ def resolve_edge_padding_seconds(
     enabled: bool | None = None,
     environment: dict[str, str] | None = None,
 ) -> float:
-    """回傳實際 edge_padding 秒數：開=0.75，關=0。"""
+    """回傳實際 edge_padding 秒數：明確開啟=0.75，預設/關閉=0。"""
     if enabled is None:
         enabled = edge_padding_enabled(environment)
     return float(SEGMENT_EDGE_PADDING) if enabled else 0.0
@@ -1662,7 +1662,7 @@ def process_full_video_from_grid(
     enable_dialogue_trim：是否依停頓門檻移除長停頓並分段下載
     enable_selective_download：精選下載——先劇情+選擇性翻譯，再只下載保留對白
     segment_gap：相鄰對白停頓 ≥ 此秒數則剪開（預設 1.5）
-    enable_edge_padding：對白前後 0.75s 備援開關（關=0）
+    enable_edge_padding：對白前後 0.75s 延伸開關（預設關閉）
     """
     ensure_output_directories()
     jpg_path = Path(jpg_path).resolve()
@@ -1951,7 +1951,7 @@ def process_full_video_from_grid(
             trimmed = sum(e - s for s, e in segments)
             _log(
                 f"  [分段] 停頓≥{segment_gap}s 剪掉；"
-                f"前後備援={edge_pad}s（開關"
+                f"前後延伸={edge_pad}s（開關"
                 f"{'ON' if enable_edge_padding else 'OFF'}）；"
                 f"{duration_source} {net_dur:.1f}s "
                 f"> {dialogue_trim_threshold}s → "

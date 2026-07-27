@@ -85,7 +85,7 @@ def _chosen_segment_plan(
     threshold: float,
     segment_gap: float,
     max_dur: float,
-    edge_padding: float = 0.75,
+    edge_padding: float = 0.0,
 ) -> tuple[list[tuple[float, float]] | None, str, str]:
     """依 Chosen 的 ASR 字幕決定是否需要高畫質分段下載。"""
     import full_video_pipeline as fvp
@@ -112,7 +112,7 @@ def _chosen_segment_plan(
         edge_padding=edge_padding,
     )
     _log(
-        f"  [剪片] 停頓≥{segment_gap}s 剪掉；前後備援={edge_padding}s；"
+        f"  [剪片] 停頓≥{segment_gap}s 剪掉；前後延伸={edge_padding}s；"
         f"對白 > {threshold}s → 只下載 {len(segments)} 個高畫質區段"
     )
     return segments, original, translated
@@ -394,7 +394,7 @@ def process_chosen_video(
             _log(f"  [!] 精選翻譯失敗，回退一般流程：{exc}")
             selective_enabled = False
 
-    # 精選後（或完整）對白淨長判斷 > 門檻再分段；停頓≥1.5s 剪；0.75 備援可關
+    # 精選後（或完整）對白淨長判斷 > 門檻再分段；停頓≥1.5s 剪；預設不延伸
     segments, original, translated = _chosen_segment_plan(
         asr,
         enabled=trim_enabled,

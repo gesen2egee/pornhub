@@ -84,8 +84,8 @@ def calculate_net_dialogue_duration(entries: list[dict]) -> float:
 
 # 剪片預設：對白之間停頓 ≥ 此值就切開（中間空白丟掉）
 DEFAULT_MAX_GAP = 1.5
-# 每段對白前後各延伸的備援秒數（呼吸／語尾），不影響「是否切段」判斷
-DEFAULT_EDGE_PADDING = 0.75
+# 所有流程預設不延伸；呼叫端仍可明確指定正數保留呼吸／語尾
+DEFAULT_EDGE_PADDING = 0.0
 
 
 def build_continuous_segments(
@@ -100,11 +100,11 @@ def build_continuous_segments(
     剪片規則：
     - 相鄰對白停頓 **≥ max_gap**（預設 1.5s）→ 切開，中間長靜音剪掉
     - 停頓 **< max_gap** → 併成同一保留段
-    - 每段對白前後各延伸 **edge_padding**（預設 0.75s）當備援，
+    - 每段對白前後各延伸 **edge_padding**（預設 0s，不延伸），
       只加在保留範圍，不參與「要不要切」的判斷
 
-    例：max_gap=1.5、edge_padding=0.75 時，剛好 1.5s 停頓兩側備援會接上；
-    更長停頓才會真正剪掉中間空白。
+    預設 max_gap=1.5、edge_padding=0 時，停頓 ≥1.5s 就完整剪掉；
+    明確指定 edge_padding 才會在切點兩側留下額外內容。
     """
     if not entries:
         return []
@@ -133,10 +133,10 @@ def build_continuous_segments(
         # 是否切段只看原始對白的間距；緩衝僅影響保留範圍。
         pause = start - previous_dialogue_end
         if pause < max_gap:
-            # 短停頓（< 1.5s）：併段，只延伸尾端備援
+            # 短停頓（< 1.5s）：併段；僅在明確設定時延伸尾端
             current_end = max(current_end, min(float(max_dur), end + edge_padding))
         else:
-            # 停頓 ≥ max_gap：切開；只在兩端各留 edge_padding 備援，中間剪掉
+            # 停頓 ≥ max_gap：切開；僅在明確設定時延伸兩端
             segments.append((current_start, current_end))
             current_start = max(0.0, start - edge_padding)
             current_end = min(float(max_dur), end + edge_padding)

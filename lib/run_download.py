@@ -174,7 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
     _boolean_switch(
         parser,
         "edge-padding",
-        "開啟或關閉對白前後 0.75s 備援（預設開；剪片仍固定停頓≥1.5s 剪掉）",
+        "開啟或關閉對白前後 0.75s 延伸（預設關；停頓≥1.5s 仍會剪掉）",
     )
     _boolean_switch(parser, "enhance", "開啟或關閉音訊增強")
     _boolean_switch(parser, "metadata", "開啟或關閉 MP4/JPG Metadata 寫入")

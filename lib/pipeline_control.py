@@ -43,7 +43,7 @@ class FeatureSwitches:
     translation: bool | None = None
     dialogue_trim: bool | None = None
     selective_download: bool | None = None
-    edge_padding: bool | None = None  # 對白前後 0.75s 備援
+    edge_padding: bool | None = None  # 可選的對白前後 0.75s 延伸
     enhance: bool | None = None
     metadata: bool | None = None
     archive_grid: bool | None = None
@@ -250,8 +250,8 @@ def resolve_stage_options(
         "dialogue_trim": True,
         # 一二三層預設 ON：先精選翻譯，再以保留對白淨長判斷 >30s 剪片
         "selective_download": True,
-        # 停頓 ≥1.5s 剪掉；0.75s 前後備援可關
-        "edge_padding": True,
+        # 停頓 ≥1.5s 剪掉；所有流程預設不做前後延伸
+        "edge_padding": False,
         "enhance": True,
         "metadata": True,
         "archive_grid": stage_name != "preview",
@@ -306,7 +306,7 @@ def print_effective_options(stage_name: str, options: FeatureSwitches) -> None:
         f"SRT={state(options.subtitles)}｜"
         f"翻譯={state(options.translation)}｜剪片={state(options.dialogue_trim)}｜"
         f"精選下載={state(options.selective_download)}｜"
-        f"0.75備援={state(options.edge_padding)}｜"
+        f"0.75延伸={state(options.edge_padding)}｜"
         f"增強={state(options.enhance)}｜Meta={state(options.metadata)}｜"
         f"歸檔={state(options.archive_grid)}｜快取={state(options.reuse_cache)}｜"
         f"強制重跑={state(options.force)}"
@@ -315,7 +315,7 @@ def print_effective_options(stage_name: str, options: FeatureSwitches) -> None:
         f"Backend={options.asr_backend}｜Model={options.translation_model}｜"
         f"Reasoning={options.reasoning_effort}｜"
         f"剪片門檻={options.trim_threshold}s｜停頓切段={options.segment_gap}s"
-        f"｜備援={0.75 if options.edge_padding else 0}s"
+        f"｜延伸={0.75 if options.edge_padding else 0}s"
         f"｜ASR區段={options.asr_chunk_seconds}s｜ASR批次上限={options.asr_batch_size}"
     )
 

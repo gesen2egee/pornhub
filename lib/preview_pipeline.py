@@ -484,7 +484,7 @@ def process_preview_from_grid(
         )
         trimmed = sum(e - s for s, e in segments)
         _log(
-            f"  [3/4] 停頓≥{segment_gap}s 剪掉；前後備援={edge_pad}s；"
+            f"  [3/4] 停頓≥{segment_gap}s 剪掉；前後延伸={edge_pad}s；"
             f"{duration_source} {net_dur:.1f}s "
             f"> {dialogue_trim_threshold}s → 剪成 {len(segments)} 段"
             f"（約 {trimmed:.1f}s）"
