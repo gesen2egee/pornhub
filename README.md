@@ -100,7 +100,7 @@ Muse 會在瀏覽器開啟 `http://127.0.0.1:8765/`，所有操作與偏好都�
 
 ### 1. 產生 5×5 宮格
 
-雙擊 `01_run_capture.bat`，貼上影片、關鍵字或列表網址。每支影片會以 480p 同步抓取 25 張原始畫面；畫面一完成就由常駐 GPU 的 MobileNetV4 ONNX TAGGER 以 **batch size 5** 判斷。固定規則為：最可能 RATING 為 `general` 的畫面少於 5 張，且 `smile` 信心值至少 50% 的畫面不少於 5 張；否則整個 5×5 宮格不會儲存，BAT 不會詢問這些條件。
+雙擊 `01_run_capture.bat`，貼上影片、關鍵字或列表網址。每支影片會以 480p 同步抓取 25 張原始畫面；畫面一完成就由常駐 GPU 的 MobileNetV4 ONNX TAGGER 以 **batch size 5** 判斷。固定規則為：最可能 RATING 為 `general` 的畫面少於 5 張，且 `smile` 信心值至少 25%（與 Trainer 的 GENERAL TAG 門檻相同）的畫面不少於 5 張；否則整個 5×5 宮格不會儲存，BAT 不會詢問這些條件。
 
 ```text
 output/01_preview_images/

@@ -508,7 +508,7 @@ def main():
     parser.add_argument("--grid-size", type=int, default=5, choices=(5,), help="宮格邊長（固定 5，合計 25 張）")
     parser.add_argument("--max-general-count", type=int, default=4, help="最可能 RATING=general 的最多張數（預設 4）")
     parser.add_argument("--min-smile-count", type=int, default=5, help="smile TAG 的最少張數（預設 5）")
-    parser.add_argument("--smile-min-confidence", type=float, default=0.5, help="smile TAG 信心值門檻（0~1，預設 0.5）")
+    parser.add_argument("--smile-min-confidence", type=float, default=0.25, help="smile TAG 信心值門檻（0~1，預設 0.25，與 Trainer GENERAL 門檻相同）")
     parser.add_argument("--tagger-repo", default=DEFAULT_REPO_ID, help="Hugging Face TAGGER repo")
     parser.add_argument("--tagger-batch-size", type=int, default=5, choices=(5,), help="TAGGER GPU 批次大小（固定 5）")
     
