@@ -362,11 +362,14 @@ def create_grid_image(image_data_list, title, duration, video_url, stream_url, d
     return True
 
 def summarize_tag_batch(image_paths, tagger):
-    """以 batch size 5 取得每張畫面最可能的 RATING 與 smile 信心值。"""
+    """以 batch size 5 取得每張畫面最可能 RATING 與 Trainer 門檻 TAG。"""
     results = []
     for image_path, tags in zip(image_paths, tagger.predict_many(image_paths)):
         top_rating = max(tags["rating"].items(), key=lambda item: item[1])[0] if tags["rating"] else ""
-        results.append((image_path, top_rating, score_for(tags["general"], "smile")))
+        general_tags = [name for name, score in tags["general"].items() if score >= 0.25]
+        character_tags = [name for name, score in tags["character"].items() if score >= 0.85]
+        caption_tags = ", ".join([*character_tags, top_rating, *general_tags])
+        results.append((image_path, top_rating, score_for(tags["general"], "smile"), caption_tags))
     return results
 
 
@@ -457,7 +460,10 @@ def process_single_video(video_url, args, tagger, index=1, total=1):
                     tag_errors.extend((timestamp, f"TAGGER 錯誤: {exc}") for timestamp, _ in batch)
                     continue
                 timestamps_by_path = {path: timestamp for timestamp, path in batch}
-                tag_results.extend((timestamps_by_path[path], rating, smile_score) for path, rating, smile_score in results)
+                tag_results.extend(
+                    (timestamps_by_path[path], rating, smile_score, caption_tags)
+                    for path, rating, smile_score, caption_tags in results
+                )
 
     if tag_errors:
         print(f"[SKIP] TAGGER 有 {len(tag_errors)} 張錯誤，整個 {args.grid_size}x{args.grid_size} 宮格不儲存。")
@@ -466,9 +472,18 @@ def process_single_video(video_url, args, tagger, index=1, total=1):
         shutil.rmtree(temp_dir, ignore_errors=True)
         return False
 
-    general_count = sum(rating.strip().lower() == "general" for _, rating, _ in tag_results)
-    smile_count = sum(score >= args.smile_min_confidence for _, _, score in tag_results)
-    print(f"[TAGGER] 最可能 RATING=general：{general_count} 張（需少於 {args.max_general_count + 1} 張）；smile：{smile_count} 張（需介於 {args.min_smile_count}～{args.max_smile_count} 張）。")
+    general_count = sum(rating.strip().lower() == "general" for _, rating, _, _ in tag_results)
+    smile_count = sum(score >= args.smile_min_confidence for _, _, score, _ in tag_results)
+    tagger_summary = (
+        f"[TAGGER] 最可能 RATING=general：{general_count} 張（需少於 {args.max_general_count + 1} 張）；"
+        f"smile：{smile_count} 張（需介於 {args.min_smile_count}～{args.max_smile_count} 張）。\n"
+        + "\n".join(
+            f"  - {format_time(timestamp)}: {caption_tags}"
+            for timestamp, _, _, caption_tags in sorted(tag_results)
+        )
+    )
+    print(tagger_summary)
+    log_event(tagger_summary, output_dir=args.output)
     if general_count > args.max_general_count or not args.min_smile_count <= smile_count <= args.max_smile_count:
         print(f"[SKIP] 宮格統計條件未通過，整個 {args.grid_size}x{args.grid_size} 宮格不儲存。")
         shutil.rmtree(temp_dir, ignore_errors=True)
