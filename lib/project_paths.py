@@ -18,6 +18,7 @@ OUTPUT_ROOT = (
 TEMP_DIR = OUTPUT_ROOT / "00_temp"
 PREVIEW_IMAGES_DIR = OUTPUT_ROOT / "01_preview_images"
 PREVIEW_VIDEOS_DIR = OUTPUT_ROOT / "02_preview_videos"
+SHORTS_DIR = OUTPUT_ROOT / "02_shorts"
 VIDEOS_DIR = OUTPUT_ROOT / "03_videos"
 DOWNLOADED_DIR = OUTPUT_ROOT / "04_downloaded"
 CHOSEN_DIR = OUTPUT_ROOT / "05_chosen"
@@ -38,6 +39,7 @@ def ensure_output_directories() -> None:
         TEMP_DIR,
         PREVIEW_IMAGES_DIR,
         PREVIEW_VIDEOS_DIR,
+        SHORTS_DIR,
         VIDEOS_DIR,
         DOWNLOADED_DIR,
         CHOSEN_DIR,

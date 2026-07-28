@@ -43,6 +43,7 @@ for %%D in (
     "%ROOT%output\00_temp"
     "%ROOT%output\01_preview_images"
     "%ROOT%output\02_preview_videos"
+    "%ROOT%output\02_shorts"
     "%ROOT%output\03_videos"
     "%ROOT%output\04_downloaded"
 ) do if not exist "%%~D" mkdir "%%~D"

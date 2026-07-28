@@ -25,6 +25,7 @@ output/
 ├── 00_temp/             下載、字幕與 FFmpeg 暫存
 ├── 01_preview_images/   01_run_capture.bat 產生的九宮格
 ├── 02_preview_videos/   前 3 分鐘低畫質 → Whisper 語音剪片 + 軟 SRT，不硬字幕/不 enhance
+├── 02_shorts/           內嵌翻譯時間軸直抓高畫質片段；僅 URL 先分析前 9 分鐘 240P
 ├── 03_videos/           480P（對白>30s 剪片）+ 軟字幕，不 enhance
 ├── 04_downloaded/       已完成九宮格歸檔
 ├── 05_chosen/           精選輸入（可丟九宮格或含 URL 的影片）
@@ -36,6 +37,7 @@ output/
 | 流程 | 放入 | 畫質 | 字幕 | enhance | 輸出 |
 |------|------|------|------|---------|------|
 | 預覽 | `02_preview_videos` 九宮格或含 URL 影片 | 一次下載 BS 段低畫質（預設 3×3 分鐘）；語音>30s 剪片否則全留 | Demucs 人聲 → 批次 MOSS → 一次 Grok 精選翻譯 | 否 | 同目錄 |
+| Shorts | `02_shorts` 九宮格或含 URL 影片 | 有內嵌翻譯直接依時間軸抓 1080P；否則先抓前 9 分鐘 240P，再抓對應高畫質片段 | 重用內嵌翻譯，或 MOSS → Grok 精選翻譯 | 判斷 | 同目錄 |
 | 標準全片 | `03_videos` 九宮格或含 URL 影片 | 480P（Whisper 剪片） | Demucs 人聲 → Whisper + **Grok 4.3 none**（便宜） | 否 | `03_videos` |
 | 精選 | `05_chosen` 九宮格或影片 | 1080P | Demucs 人聲 → MOSS + **Grok 4.5 minimal** | 判斷 | `06_good` |
 | 歸檔 | （自動） | — | — | — | 九宮格→`04_downloaded`；chosen 來源影片刪除 |
@@ -115,8 +117,8 @@ output/01_preview_images/
 ### 3. 下載與字幕
 
 雙擊 `02_run_download.bat`。程式會依序掃描 `02_preview_videos`、
-`03_videos`、`05_chosen`；每層只要找到符合該層條件的九宮格圖片或影片就直接執行，
-找不到則印出 `[SKIP]` 後繼續下一層，沒有逐層確認。三層分別對應低、中、高預算，
+`02_shorts`、`03_videos`、`05_chosen`；每層只要找到符合該層條件的九宮格圖片或影片就直接執行，
+找不到則印出 `[SKIP]` 後繼續下一層，沒有逐層確認。四層依序為 Preview、Shorts、Video、Chosen，
 不會因為只跑其中一層而先啟動其他昂貴流程。下載時只顯示本程式的階段進度，不顯示
 yt-dlp DEBUG 與下載百分比訊息。
 
@@ -137,6 +139,7 @@ Preview 每段預設 180 秒，一次先下載 `--asr-batch-size` 段（預設 3
 
 ```bat
 02_run_download.bat --stages preview
+02_run_download.bat --stages shorts
 02_run_download.bat --stages preview video
 02_run_download.bat --stages chosen
 ```
@@ -166,7 +169,7 @@ Preview 每段預設 180 秒，一次先下載 `--asr-batch-size` 段（預設 3
 若要讓新設定重新套用到既有成品，請明確加上 `--force`；預設會保護既有成品。
 Chosen 有 URL 時不會拿既有高畫質成品接續，會重新下載規劃出的高畫質片段；
 若連 ASR 字幕快取也要重做，請加上 `--no-reuse-cache`。
-每支發布完成的影片 Metadata 都會寫入 `published_stage`（`preview`、`video` 或 `chosen`）。下次掃描同一層資料夾時，標示同層已發布的影片會列為既有成品、不再處理；需要明確重跑時使用 `--force`。
+每支發布完成的影片 Metadata 都會寫入 `published_stage`（`preview`、`shorts`、`video` 或 `chosen`）。下次掃描同一層資料夾時，標示同層已發布的影片會列為既有成品、不再處理；需要明確重跑時使用 `--force`。
 剪片門檻與區段合併間隔可分別用 `--trim-threshold`、`--segment-gap` 調整；`--preview-seconds` 是 Preview 每次下載與 ASR 的片段長度，不再是總長度。
 `asr-stream` 預設開啟；`--asr-chunk-seconds` 預設為 180。Video／Chosen 會累計滿 `--asr-batch-size`（預設 3）段才執行一次 MOSS BS ASR，同時開始下載下一批；影片尾端不足 BS 的批次仍會送出。關閉 `--asr-stream` 時，會退回完整 240P 代理下載完成後再 ASR，其他功能不會被連帶關閉。
 目前剪片規則是：停頓小於門檻時完整保留；停頓大於或等於門檻時切段，預設前後延伸為 0 秒。

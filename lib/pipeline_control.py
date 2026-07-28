@@ -1,4 +1,4 @@
-"""三層下載流程的盤點、預算設定與執行控制。"""
+"""四層下載流程的盤點、預算設定與執行控制。"""
 
 from __future__ import annotations
 
@@ -13,11 +13,12 @@ from project_paths import (
     DOWNLOADED_DIR,
     GOOD_DIR,
     PREVIEW_VIDEOS_DIR,
+    SHORTS_DIR,
     VIDEOS_DIR,
     ensure_output_directories,
 )
 
-STAGE_ORDER = ("preview", "video", "chosen")
+STAGE_ORDER = ("preview", "shorts", "video", "chosen")
 GRID_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm", ".m4v"}
 
@@ -53,6 +54,7 @@ class FeatureSwitches:
     preview_seconds: int | None = None
     video_height: int | None = None
     chosen_height: int | None = None
+    shorts_height: int | None = None
     asr_backend: str | None = None
     translation_model: str | None = None
     reasoning_effort: str | None = None
@@ -73,15 +75,23 @@ STAGES = {
     ),
     "video": StageDefinition(
         "video",
-        "第二層：Video",
+        "第三層：Video",
         VIDEOS_DIR,
         "$$ 中預算",
         "480P、MOSS、精選翻譯、保留對白>30s 分段下載、Grok、enhance",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
+    "shorts": StageDefinition(
+        "shorts",
+        "第二層：Shorts",
+        SHORTS_DIR,
+        "$$ 精準預算",
+        "內嵌翻譯直接抓最高畫質片段；僅 URL 則先分析前 9 分鐘 240P",
+        frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
+    ),
     "chosen": StageDefinition(
         "chosen",
-        "第三層：Chosen",
+        "第四層：Chosen",
         CHOSEN_DIR,
         "$$$ 高預算",
         "1080P、MOSS、精選翻譯、保留對白>30s 分段、Grok 4.5、enhance",
@@ -248,7 +258,7 @@ def resolve_stage_options(
         "subtitles": True,
         "translation": True,
         "dialogue_trim": True,
-        # 一二三層預設 ON：先精選翻譯，再以保留對白淨長判斷 >30s 剪片
+        # 所有層預設 ON：先精選翻譯，再依字幕時間軸規劃下載
         "selective_download": True,
         # 停頓 ≥1.5s 剪掉；所有流程預設不做前後延伸
         "edge_padding": False,
@@ -261,6 +271,7 @@ def resolve_stage_options(
         "preview_seconds": 180,
         "video_height": 480,
         "chosen_height": 1080,
+        "shorts_height": 1080,
         "asr_backend": "moss",
         "translation_model": (
             "x-ai/grok-4.5" if stage_name == "chosen" else "x-ai/grok-4.3"
@@ -490,6 +501,44 @@ def _execute_stage(
                 failures += 1
         return failures
 
+    if stage_name == "shorts":
+        import full_video_pipeline
+
+        failures = 0
+        for index, source in enumerate(sources, 1):
+            print(f"\n[shorts {index}/{len(sources)}] {source.name}")
+            try:
+                full_video_pipeline.process_full_video_from_grid(
+                    source,
+                    final_dir=SHORTS_DIR,
+                    archive_dir=DOWNLOADED_DIR,
+                    keep_proxy=bool(options.keep_work),
+                    max_height=options.shorts_height or 1080,
+                    enable_enhance=options.enhance,
+                    enable_asr=options.asr,
+                    export_subtitles=options.subtitles,
+                    enable_dialogue_trim=True,
+                    enable_translation=options.translation,
+                    enable_selective_download=options.selective_download,
+                    enable_edge_padding=options.edge_padding,
+                    enable_metadata=options.metadata,
+                    dialogue_trim_threshold=options.trim_threshold,
+                    segment_gap=options.segment_gap,
+                    force=options.force,
+                    work_bucket="02_shorts",
+                    archive_grid_on_done=options.archive_grid,
+                    moss_worker=moss_worker,
+                    audio_worker=audio_worker,
+                    analysis_limit_seconds=540.0,
+                    reuse_embedded_translation=True,
+                    always_download_subtitle_ranges=True,
+                    require_subtitle_ranges=True,
+                )
+            except Exception as exc:
+                print(f"  [FAIL] {exc}")
+                failures += 1
+        return failures
+
     import chosen_pipeline
 
     successes, failures = chosen_pipeline.process_chosen_items(
@@ -582,7 +631,7 @@ def run_interactive(
     options: FeatureSwitches,
     stage_names: Iterable[str] = STAGE_ORDER,
 ) -> int:
-    """依 Preview → Video → Chosen 顯示內容，再讓使用者逐層決定預算。"""
+    """依 Preview → Shorts → Video → Chosen 顯示並逐層詢問。"""
     failures = 0
     for stage_name in stage_names:
         pending = print_stage_inventory(stage_name)

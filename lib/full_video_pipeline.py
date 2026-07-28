@@ -218,6 +218,38 @@ def get_video_url_from_source(source_path: str | Path) -> str | None:
     return None
 
 
+def load_embedded_translation(
+    source_path: str | Path,
+    video_url: str,
+) -> dict[str, Any] | None:
+    """讀取影片內嵌翻譯字幕；空白紀錄不視為可重用時間軸。"""
+    path = Path(source_path).resolve()
+    if path.suffix.casefold() not in {
+        ".mp4", ".mkv", ".mov", ".webm", ".m4v",
+    }:
+        return None
+    import video_meta
+
+    source_meta = video_meta.read_mp4_meta(path)
+    translated = source_meta.get("translated_srt") or ""
+    if not translated.strip():
+        return None
+    original = source_meta.get("original_srt") or ""
+    web_meta = source_meta.get("web_meta") or {}
+    duration = float(web_meta.get("duration") or 0.0)
+    if duration <= 0:
+        duration = remote_duration(video_url) or 0.0
+    return {
+        "language": None,
+        "original_srt": original,
+        "translated_srt": translated,
+        "outcome": "translated",
+        "cues": [],
+        "source_duration": duration,
+        "embedded_translation_reused": True,
+    }
+
+
 def probe_duration(path: Path) -> float | None:
     try:
         result = subprocess.run(
@@ -1138,13 +1170,17 @@ def run_streamed_asr(
     video_stem: str,
     *,
     moss_worker: MossAsrWorker | None = None,
+    max_duration: float | None = None,
 ) -> tuple[dict[str, Any], float]:
-    """每累計滿 BS 個 240P 片段才做批次 ASR；尾批不足 BS 仍會送出。"""
+    """分段下載 240P 並批次 ASR；可限制只分析影片開頭一段時間。"""
     from translate_srt_openrouter import format_srt
 
     stream_enabled = asr_stream_enabled()
     duration = remote_duration(video_url) if stream_enabled else None
-    if not stream_enabled or duration is None:
+    if max_duration is not None:
+        max_duration = max(0.05, float(max_duration))
+        duration = min(duration, max_duration) if duration is not None else max_duration
+    if max_duration is None and (not stream_enabled or duration is None):
         proxy_path = work_dir / f"{video_stem}.proxy.mp4"
         _log("  [ASR 串流] 無法取得時長或已關閉，改用完整 240P 代理")
         download_proxy_low(video_url, proxy_path)
@@ -1560,8 +1596,12 @@ def run_parallel_delivery_phase(
             translated_srt = translated_asr.get("translated_srt") or ""
             asr.update(translated_asr)
         else:
-            asr["translated_srt"] = ""
-            asr["outcome"] = "transcribed" if original_srt else "empty"
+            # 已完成精選翻譯或重用內嵌翻譯時，不可把現成譯文清空。
+            asr["translated_srt"] = translated_srt
+            if translated_srt.strip():
+                asr["outcome"] = asr.get("outcome") or "translated"
+            else:
+                asr["outcome"] = "transcribed" if original_srt else "empty"
             asr_cache.write_text(
                 json.dumps(asr, ensure_ascii=False, indent=2), encoding="utf-8"
             )
@@ -1652,6 +1692,10 @@ def process_full_video_from_grid(
     archive_grid_on_done: bool = True,
     moss_worker: MossAsrWorker | None = None,
     audio_worker=None,
+    analysis_limit_seconds: float | None = None,
+    reuse_embedded_translation: bool = False,
+    always_download_subtitle_ranges: bool = False,
+    require_subtitle_ranges: bool = False,
 ) -> Path:
     """
     單支來源循序流程：從九宮格或影片取得 URL，低畫質代理 → ASR/翻譯 →
@@ -1668,7 +1712,10 @@ def process_full_video_from_grid(
     jpg_path = Path(jpg_path).resolve()
     source_suffix = jpg_path.suffix.casefold()
     source_is_grid = source_suffix in {".jpg", ".jpeg", ".png"}
-    pipeline_stage = "chosen" if work_bucket == "05_chosen" else "video"
+    pipeline_stage = {
+        "02_shorts": "shorts",
+        "05_chosen": "chosen",
+    }.get(work_bucket, "video")
     final_dir = Path(final_dir or VIDEOS_DIR).resolve()
     archive_dir = Path(archive_dir or DOWNLOADED_DIR).resolve()
     final_dir.mkdir(parents=True, exist_ok=True)
@@ -1775,6 +1822,12 @@ def process_full_video_from_grid(
     reuse_asr = os.getenv("REUSE_ASR_RESULT", "1").strip().lower() not in {
         "0", "false", "no", "off",
     }
+    embedded_asr: dict[str, Any] | None = None
+    if reuse_embedded_translation and not source_is_grid:
+        try:
+            embedded_asr = load_embedded_translation(jpg_path, video_url)
+        except Exception as exc:
+            _log(f"  [Shorts] 讀取內嵌翻譯失敗，改走 240P 分析：{exc}")
     # 清理舊分段／成品暫存，但保留可用的 proxy 以利續跑
     for stale in work_dir.glob(f"{video_stem}.seg*.mp4"):
         stale.unlink(missing_ok=True)
@@ -1791,7 +1844,15 @@ def process_full_video_from_grid(
     # 第一階段：每下載完 3 分鐘 240P 區段，就立即排入 Demucs + ASR。
     # OpenRouter 會留到所有 ASR 就緒後的第二階段，避免阻塞下載佇列。
     with _stage("01_stream_proxy_and_asr"):
-        if reuse_asr and asr_cache.is_file():
+        if embedded_asr is not None:
+            asr = embedded_asr
+            duration = float(asr.get("source_duration") or 0.0)
+            asr_cache.write_text(
+                json.dumps(asr, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            _log("  [Shorts] 已有內嵌翻譯字幕，直接重用時間軸")
+        elif reuse_asr and asr_cache.is_file():
             try:
                 asr = json.loads(asr_cache.read_text(encoding="utf-8"))
                 if not enable_translation:
@@ -1812,7 +1873,11 @@ def process_full_video_from_grid(
                     ) from exc
                 _log(f"  [!] 讀取字幕快取失敗，改重新 ASR：{exc}")
                 asr, duration = run_streamed_asr(
-                    video_url, work_dir, video_stem, moss_worker=moss_worker
+                    video_url,
+                    work_dir,
+                    video_stem,
+                    moss_worker=moss_worker,
+                    max_duration=analysis_limit_seconds,
                 )
         elif not enable_asr:
             if enable_translation or enable_dialogue_trim:
@@ -1831,7 +1896,11 @@ def process_full_video_from_grid(
             duration = remote_duration(video_url) or 0.0
         else:
             asr, duration = run_streamed_asr(
-                video_url, work_dir, video_stem, moss_worker=moss_worker
+                video_url,
+                work_dir,
+                video_stem,
+                moss_worker=moss_worker,
+                max_duration=analysis_limit_seconds,
             )
             asr["source_duration"] = duration
             try:
@@ -1859,8 +1928,12 @@ def process_full_video_from_grid(
 
     # 精選下載：必須先完成選擇性翻譯，才能依保留 id 規劃高畫質下載區段
     # （不能與下載平行）。歌詞由 LLM 改完整翻譯時 is_full=True。
-    selective_done = False
-    if enable_selective_download and enable_translation:
+    selective_done = embedded_asr is not None
+    if (
+        enable_selective_download
+        and enable_translation
+        and embedded_asr is None
+    ):
         with _stage("02a_selective_translate"):
             if (asr.get("translated_srt") or "").strip() and asr.get(
                 "selective_kept_ids"
@@ -1886,7 +1959,7 @@ def process_full_video_from_grid(
         original_srt = asr.get("original_srt") or original_srt
         translated_srt = asr.get("translated_srt") or translated_srt
         outcome = asr.get("outcome") or outcome
-        if selective_done:
+        if selective_done and embedded_asr is None:
             is_full = bool(asr.get("selective_is_full"))
             kept_n = len(asr.get("selective_kept_ids") or [])
             drop_n = len(asr.get("selective_dropped_ids") or [])
@@ -1936,10 +2009,17 @@ def process_full_video_from_grid(
 
         any_enhanced = False
         segments: list[tuple[float, float]] | None = None
+        if require_subtitle_ranges and not entries:
+            raise RuntimeError(
+                "Shorts 沒有可用的翻譯字幕時間軸，為避免誤抓完整高畫質影片已停止。"
+            )
         # 一律用「精選後（或完整）對白淨長」判斷是否 > 門檻再剪片／分段下載
         if (
             enable_dialogue_trim
-            and net_dur > dialogue_trim_threshold
+            and (
+                always_download_subtitle_ranges
+                or net_dur > dialogue_trim_threshold
+            )
             and entries
         ):
             segments = segment_cutter.build_continuous_segments(

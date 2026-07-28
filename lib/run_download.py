@@ -1,4 +1,4 @@
-"""下載入口：只負責 CLI、三層預算控制與維護模式分流。"""
+"""下載入口：只負責 CLI、四層下載控制與維護模式分流。"""
 
 from __future__ import annotations
 
@@ -117,14 +117,14 @@ def run_download_process(
     stage_names: list[str] | None = None,
     options: FeatureSwitches | None = None,
 ) -> int:
-    """程式化入口；維護模式與三層流程明確分流。"""
+    """程式化入口；維護模式與四層流程明確分流。"""
     if retry_subtitles or repair_over_1080:
         return maintenance.run_download_process(
             retry_subtitles=retry_subtitles,
             repair_over_1080=repair_over_1080,
         )
     failures = run_stages(
-        stage_names or ["preview", "video", "chosen"],
+        stage_names or ["preview", "shorts", "video", "chosen"],
         options or FeatureSwitches(),
     )
     return 3 if failures else 0
@@ -141,7 +141,7 @@ def _boolean_switch(parser: argparse.ArgumentParser, name: str, help_text: str) 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Preview → Video → Chosen 三層預算下載控制器"
+        description="Preview → Shorts → Video → Chosen 下載控制器"
     )
     parser.add_argument(
         "--interactive",
@@ -157,7 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--stages",
         nargs="+",
         metavar="STAGE",
-        help="指定 preview、video、chosen；可用空白或逗號分隔",
+        help="指定 preview、shorts、video、chosen；可用空白或逗號分隔",
     )
     _boolean_switch(parser, "translation", "開啟或關閉 OpenRouter 翻譯")
     _boolean_switch(parser, "asr", "開啟或關閉語音辨識")
@@ -168,7 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
     _boolean_switch(
         parser,
         "selective-download",
-        "開啟或關閉精選翻譯／下載（預設開；一二三層皆用；"
+        "開啟或關閉精選翻譯／下載（預設開；所有層皆用；"
         "以保留對白淨長判斷 >30s 剪片；歌詞則完整翻譯）",
     )
     _boolean_switch(
@@ -193,6 +193,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--chosen-height", type=int, metavar="P", help="Chosen 解析度高度，預設 1080"
+    )
+    parser.add_argument(
+        "--shorts-height", type=int, metavar="P", help="Shorts 解析度高度，預設 1080"
     )
     parser.add_argument(
         "--asr-backend",
@@ -339,6 +342,7 @@ def main(argv: list[str] | None = None) -> int:
         "preview_seconds",
         "video_height",
         "chosen_height",
+        "shorts_height",
         "trim_threshold",
         "asr_chunk_seconds",
         "asr_batch_size",
@@ -376,6 +380,7 @@ def main(argv: list[str] | None = None) -> int:
             "preview_seconds",
             "video_height",
             "chosen_height",
+            "shorts_height",
             "asr_backend",
             "translation_model",
             "reasoning_effort",
@@ -411,6 +416,7 @@ def main(argv: list[str] | None = None) -> int:
                 "preview_seconds",
                 "video_height",
                 "chosen_height",
+                "shorts_height",
                 "asr_backend",
                 "translation_model",
                 "reasoning_effort",
@@ -421,7 +427,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
     ):
-        parser.error("維護模式不能混用三層流程或功能開關")
+        parser.error("維護模式不能混用四層流程或功能開關")
     maintenance_exit = run_maintenance(args)
     if maintenance_exit is not None:
         return maintenance_exit
@@ -437,6 +443,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--video-height 只能用於 video 層")
     if args.chosen_height is not None and "chosen" not in stages:
         parser.error("--chosen-height 只能用於 chosen 層")
+    if args.shorts_height is not None and "shorts" not in stages:
+        parser.error("--shorts-height 只能用於 shorts 層")
     options = FeatureSwitches(
         asr=args.asr,
         demucs_asr=args.demucs_asr,
@@ -455,6 +463,7 @@ def main(argv: list[str] | None = None) -> int:
         preview_seconds=args.preview_seconds,
         video_height=args.video_height,
         chosen_height=args.chosen_height,
+        shorts_height=args.shorts_height,
         asr_backend=args.asr_backend,
         translation_model=args.translation_model,
         reasoning_effort=args.reasoning_effort,
