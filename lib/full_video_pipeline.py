@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext, redirect_stdout
 from pathlib import Path
@@ -103,15 +104,22 @@ DOWNLOAD_SOCKET_TIMEOUT = 30
 DOWNLOAD_RETRIES = 3
 SEGMENT_DOWNLOAD_ATTEMPTS = 2
 SEGMENT_RECOVERY_ATTEMPTS = 1
-# 高畫質切塊的請求槽數。完成一段就立刻由佇列補入下一段，避免網路啟動延遲
-# 造成空槽；上限固定為三條，降低來源站點限流的機率。
-SEGMENT_DOWNLOAD_WORKERS = 3
+# 高畫質切塊採五條分開請求；每條相隔一秒啟動，避免同時衝擊來源站點。
+SEGMENT_DOWNLOAD_WORKERS = 5
+SEGMENT_DOWNLOAD_START_INTERVAL_SECONDS = 1.0
+# 先多抓來源關鍵影格之前的內容，再在本機精確重編碼。這讓成品每段的第一格
+# 都是新關鍵影格，而不依賴遠端 Range 恰好落在來源的 I-frame。
+HIGH_RANGE_KEYFRAME_PREROLL_SECONDS = 5.0
+HIGH_RANGE_KEYFRAME_POSTROLL_SECONDS = 1.0
+HIGH_RANGE_CONCURRENT_FRAGMENTS = 1
 ASR_STREAM_CHUNK_SECONDS = 180.0
 
-# 多支來源管線可同時進入高畫質階段；此鎖使三條限制套用到整個程序，
-# 而非每支影片各自三條而意外放大成六條以上。
+# 多支來源管線可同時進入高畫質階段；此鎖使五條限制套用到整個程序，
+# 而非每支影片各自五條而意外放大。
 _SEGMENT_DOWNLOAD_SEMAPHORES: dict[int, BoundedSemaphore] = {}
 _SEGMENT_DOWNLOAD_SEMAPHORE_LOCK = Lock()
+_SEGMENT_DOWNLOAD_START_LOCK = Lock()
+_NEXT_SEGMENT_DOWNLOAD_START = 0.0
 
 # 由外部 benchmark 注入 PipelineMetrics；未注入則不計時
 _ACTIVE_METRICS: Any | None = None
@@ -209,7 +217,7 @@ def _positive_int_env(name: str, default: int) -> int:
 def segment_download_workers(
     environment: dict[str, str] | None = None,
 ) -> int:
-    """回傳高畫質切塊的同時下載請求數（預設三條、最多三條）。"""
+    """回傳高畫質切塊的同時下載請求數（預設五條、最多五條）。"""
     environment = os.environ if environment is None else environment
     try:
         requested = int(
@@ -223,15 +231,42 @@ def segment_download_workers(
     return min(SEGMENT_DOWNLOAD_WORKERS, max(1, requested))
 
 
+def segment_download_start_interval_seconds(
+    environment: dict[str, str] | None = None,
+) -> float:
+    """回傳相鄰高畫質請求的最小啟動間隔（預設一秒）。"""
+    environment = os.environ if environment is None else environment
+    try:
+        seconds = float(
+            environment.get(
+                "HIGH_SEGMENT_DOWNLOAD_START_INTERVAL_SECONDS",
+                str(SEGMENT_DOWNLOAD_START_INTERVAL_SECONDS),
+            )
+        )
+    except (TypeError, ValueError):
+        seconds = SEGMENT_DOWNLOAD_START_INTERVAL_SECONDS
+    return max(0.0, seconds)
+
+
 @contextmanager
 def segment_download_slot(workers: int) -> Iterator[None]:
-    """取得全管線共用的高畫質切塊下載槽位。"""
+    """取得全管線共用的高畫質切塊下載槽位，並錯開請求啟動時間。"""
+    global _NEXT_SEGMENT_DOWNLOAD_START
     with _SEGMENT_DOWNLOAD_SEMAPHORE_LOCK:
         semaphore = _SEGMENT_DOWNLOAD_SEMAPHORES.setdefault(
             workers,
             BoundedSemaphore(workers),
         )
     with semaphore:
+        with _SEGMENT_DOWNLOAD_START_LOCK:
+            now = time.monotonic()
+            scheduled = max(now, _NEXT_SEGMENT_DOWNLOAD_START)
+            _NEXT_SEGMENT_DOWNLOAD_START = (
+                scheduled + segment_download_start_interval_seconds()
+            )
+        delay = scheduled - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
         yield
 
 
@@ -613,37 +648,130 @@ def download_high_full(video_url: str, out_path: Path) -> Path:
     return out_path
 
 
+def _decodes_cleanly(path: Path) -> bool:
+    """完整解碼影音流，抓出 ffprobe 看不出的中間壞格。"""
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-v", "error",
+                "-xerror",
+                "-i", str(path),
+                "-map", "0:v?", "-map", "0:a?",
+                "-f", "null", "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=7200,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _reencode_keyframe_safe_range(
+    source_path: Path,
+    out_path: Path,
+    *,
+    local_start: float,
+    duration: float,
+) -> Path:
+    """從前置緩衝素材精確切出片段，輸出第一影格固定為新的關鍵影格。"""
+    out_path.unlink(missing_ok=True)
+    command = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(source_path),
+        # -ss 放在輸入後，會完整解碼到切點，避免快速 seek 落在中間影格。
+        "-ss", f"{local_start:.3f}", "-t", f"{duration:.3f}",
+        "-map", "0:v:0", "-map", "0:a?",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-force_key_frames", "0", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-movflags", "+faststart",
+        str(out_path),
+    ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=7200,
+    )
+    if (
+        result.returncode != 0
+        or has_video_stream(out_path) is not True
+        or not _decodes_cleanly(out_path)
+    ):
+        out_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"高畫質片段重編碼／完整解碼驗證失敗：{(result.stderr or '')[-800:]}"
+        )
+    return out_path
+
+
 def download_high_range(
     video_url: str,
     out_path: Path,
     start: float,
     end: float,
 ) -> Path:
-    """下載單一時間區間的高畫質片段。"""
+    """下載帶前置緩衝的高畫質範圍，再本機精確重編碼成關鍵影格安全片段。"""
     import yt_dlp
 
-    if out_path.exists():
-        out_path.unlink()
     start = max(0.0, float(start))
     end = max(start + 0.05, float(end))
+    source_start = max(0.0, start - HIGH_RANGE_KEYFRAME_PREROLL_SECONDS)
+    source_end = end + HIGH_RANGE_KEYFRAME_POSTROLL_SECONDS
+    source_path = out_path.with_name(f"{out_path.stem}.source{out_path.suffix}")
+    out_path.unlink(missing_ok=True)
+    source_path.unlink(missing_ok=True)
 
     def _ranges(info_dict, ydl):
-        yield {"start_time": start, "end_time": end}
+        yield {"start_time": source_start, "end_time": source_end}
 
     fmt, fsort, concurrent = _high_format_opts()
-    opts = _base_ydl_opts(out_path, "download_full", video_url)
+    # 五條範圍請求已提供網路平行度，避免每條再開多個 fragment 造成限流。
+    concurrent = _positive_int_env(
+        "HIGH_RANGE_CONCURRENT_FRAGMENTS",
+        HIGH_RANGE_CONCURRENT_FRAGMENTS,
+    )
+    opts = _base_ydl_opts(source_path, "download_full", video_url)
     opts["format"] = fmt
     opts["format_sort"] = fsort
     opts["concurrent_fragment_downloads"] = concurrent
     opts["download_ranges"] = _ranges
     opts["force_keyframes_at_cuts"] = True
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([video_url])
-    if not out_path.exists() or has_video_stream(out_path) is not True:
-        raise RuntimeError(
-            f"高畫質分段下載失敗：{out_path.name} ({start:.2f}-{end:.2f}s)"
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([video_url])
+        if (
+            not source_path.exists()
+            or has_video_stream(source_path) is not True
+            or not _decodes_cleanly(source_path)
+        ):
+            raise RuntimeError(
+                f"高畫質前置緩衝下載失敗：{out_path.name} "
+                f"({source_start:.2f}-{source_end:.2f}s)"
+            )
+        source_duration = probe_duration(source_path)
+        local_start = start - source_start
+        requested_duration = end - start
+        if source_duration is not None:
+            requested_duration = min(
+                requested_duration,
+                source_duration - local_start,
+            )
+        if requested_duration < 0.05:
+            raise RuntimeError(
+                f"高畫質前置緩衝長度不足：{out_path.name} "
+                f"({start:.2f}-{end:.2f}s)"
+            )
+        return _reencode_keyframe_safe_range(
+            source_path,
+            out_path,
+            local_start=local_start,
+            duration=requested_duration,
         )
-    return out_path
+    finally:
+        source_path.unlink(missing_ok=True)
 
 
 def concat_videos(parts: list[Path], out_path: Path) -> Path:
@@ -1677,7 +1805,9 @@ def run_parallel_delivery_phase(
             download_workers = segment_download_workers()
             _log(
                 f"  [第二階段] 下載 {len(segments)} 個高畫質切塊"
-                f"（並行請求={download_workers}；完成即補下一段）"
+                f"（並行請求={download_workers}；"
+                f"每 {segment_download_start_interval_seconds():.1f}s 啟動；"
+                "完成即補下一段）"
             )
             progress = _SegmentProgress(
                 len(segments),

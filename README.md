@@ -127,11 +127,11 @@ yt-dlp DEBUG 與下載百分比訊息。
 
 1. 以 240P 每 180 秒下載一段；每段一就緒就立刻排入 `Demucs → MOSS`，不等待湊滿 BS。全部 240P 與 MOSS 完成後，才把完整時間軸交給 GROK。
 2. Video／Chosen 預設啟用 30 秒三段：`N=ceil(30 秒／平均語音句長)`，固定選出情節 `N-1`、中段 `2N`、高潮 `3N` 句（總數 `<6N`）。每段內縮 0.1 秒後，才按原片時間下載高畫質切塊。
-3. 高畫質切塊在全管線固定維持最多 3 個並行下載請求；任一切塊完成就立刻補送下一段。個別切塊失敗時會改為單線補下載，並在下載後同步進行音訊判斷／`enhance`，最後以 0.08 秒同步影音 crossfade 合併並 retime 字幕。
+3. 高畫質切塊在全管線固定維持最多 5 個並行下載請求，新請求每秒錯開啟動；任一切塊完成就立刻補送下一段。每段會先多抓 5 秒前置緩衝，再由本機精確重編碼，讓成品從新的關鍵影格開始，並完整解碼驗證；個別切塊失敗時會改為單線補下載，最後同步進行音訊判斷／`enhance` 與 0.08 秒影音 crossfade、retime 字幕。
 
 Video／Chosen 預設可同時跑 2 支來源管線：前一支進入高畫質下載時，下一支會開始 240P、MOSS 與 GROK；MOSS 與音訊 GPU 仍安全序列化。可用環境變數 `PIPELINE_SOURCE_WORKERS=1` 改回單支，最多可設為 4。
 
-高畫質切塊並行數預設為 3，可用 `HIGH_SEGMENT_DOWNLOAD_WORKERS=1` 暫時改回單線；為避免來源站點限流，最高仍固定為 3。
+高畫質切塊並行數預設為 5，可用 `HIGH_SEGMENT_DOWNLOAD_WORKERS=1` 暫時改回單線；為避免來源站點限流，最高仍固定為 5。新請求預設每 1 秒啟動，可用 `HIGH_SEGMENT_DOWNLOAD_START_INTERVAL_SECONDS=0` 取消錯開。範圍下載每條預設只有 1 個 yt-dlp fragment；若來源穩定才可用 `HIGH_RANGE_CONCURRENT_FRAGMENTS` 增加。
 
 Preview 每段預設 180 秒，一次先下載 `--asr-batch-size` 段（預設 3 段，共最多 9 分鐘），再用同一批執行 `Demucs → MOSS BS ASR`；合併完整批次字幕後只送一次 OpenRouter 精選翻譯。下載與剪片完成後同樣會自動判斷 enhance。
 
