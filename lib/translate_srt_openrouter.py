@@ -800,9 +800,11 @@ def select_cues_three_phase(
         "情節篇、中段床戲篇、高潮床戲篇。所有說明、人物姓名、動名詞與專有稱呼"
         "都必須嚴格使用繁體中文，禁止任何英文、日文、韓文、簡體或其他外語殘留。\n\n"
         f"本片 N={budget['n']}（30 秒／平均句長 {budget['average_seconds']:.3f} 秒，無條件進位）。"
-        f"嚴格句數：情節篇 {budget['plot']} 句（<1N）；"
-        f"情節＋中段共 {budget['plot'] + budget['middle']} 句（<3N）；"
-        f"全部共 {budget['total']} 句（<6N）。"
+        f"優先目標句數：情節篇 {budget['plot']} 句；中段篇 {budget['middle']} 句；"
+        f"高潮篇 {budget['climax']} 句。嚴格上限：情節篇不得超過 {budget['plot']} 句（<1N）；"
+        f"情節＋中段不得超過 {budget['plot'] + budget['middle']} 句（<3N）；"
+        f"全部不得超過 {budget['total']} 句（<6N）。若前段不足，優先以後段可承接內容補足，"
+        "但絕不可超過上限。"
         "每個 id 只能選一次，三段合併後 id 必須嚴格遞增。\n\n"
         "情節篇只保留人物、關係、衝突與動機的最小必要鋪陳；"
         "中段篇以調情、身體互動、性指令與床戲推進為主，少放劇情；"
@@ -812,9 +814,9 @@ def select_cues_three_phase(
         "===PLOT===\n"
         "以繁體中文寫三段設計稿，依序為【情節篇設計】、【中段床戲篇設計】、【高潮床戲篇設計】，每段 80–150 字。\n"
         "===SELECTION===\n"
-        f"PLOT|{budget['plot']} 個逗號分隔 id\n"
-        f"MIDDLE|{budget['middle']} 個逗號分隔 id\n"
-        f"CLIMAX|{budget['climax']} 個逗號分隔 id"
+        f"PLOT|最多 {budget['plot']} 個逗號分隔 id\n"
+        f"MIDDLE|最多 {budget['middle']} 個逗號分隔 id\n"
+        f"CLIMAX|最多 {budget['climax']} 個逗號分隔 id"
     )
     effort = os.getenv("TRANSLATE_REASONING_EFFORT", "minimal").strip() or "minimal"
     if effort == "none" and "grok-4.5" in model.casefold():
@@ -845,8 +847,16 @@ def select_cues_three_phase(
     expected = {name: int(budget[name]) for name in phases}
     actual = {name: len(ids) for name, ids in phases.items()}
     ids = [item for name in ("plot", "middle", "climax") for item in phases[name]]
-    if actual != expected:
-        raise RuntimeError(f"三段精選句數不符：預期 {expected}，實際 {actual}")
+    cumulative_middle = actual["plot"] + actual["middle"]
+    if (
+        not all(actual.values())
+        or actual["plot"] > expected["plot"]
+        or cumulative_middle > expected["plot"] + expected["middle"]
+        or len(ids) > int(budget["total"])
+    ):
+        raise RuntimeError(
+            f"三段精選超出預算或有空篇：上限 {expected}，實際 {actual}"
+        )
     if ids != sorted(ids) or len(ids) != len(set(ids)) or any(item not in by_id for item in ids):
         raise RuntimeError("三段精選 id 不合法、重複或非嚴格遞增")
     usage = _usage_from_response(data)
