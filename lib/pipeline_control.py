@@ -44,6 +44,7 @@ class FeatureSwitches:
     translation: bool | None = None
     dialogue_trim: bool | None = None
     selective_download: bool | None = None
+    three_phase_selection: bool | None = None
     edge_padding: bool | None = None  # 可選的對白前後 0.75s 延伸
     enhance: bool | None = None
     metadata: bool | None = None
@@ -77,7 +78,7 @@ STAGES = {
         "第三層：Video",
         VIDEOS_DIR,
         "$$ 中預算",
-        "480P、MOSS、精選翻譯、保留對白>30s 分段下載、Grok、enhance",
+        "240P/MOSS 串流→Grok 30秒三段→內縮高畫質切塊、音訊判斷 enhance＋crossfade",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
     "shorts": StageDefinition(
@@ -93,7 +94,7 @@ STAGES = {
         "第四層：Chosen",
         CHOSEN_DIR,
         "$$$ 高預算",
-        "1080P、MOSS、精選翻譯、保留對白>30s 分段、Grok 4.5、enhance",
+        "240P/MOSS 串流→Grok 30秒三段→內縮 1080P 切塊、音訊判斷 enhance＋crossfade",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
 }
@@ -224,6 +225,7 @@ def apply_feature_switches(options: FeatureSwitches) -> None:
     _set_bool_env("ENABLE_TRANSLATION", options.translation)
     _set_bool_env("ENABLE_DIALOGUE_TRIM", options.dialogue_trim)
     _set_bool_env("ENABLE_SELECTIVE_DOWNLOAD", options.selective_download)
+    _set_bool_env("ENABLE_THREE_PHASE_SELECTION", options.three_phase_selection)
     _set_bool_env("ENABLE_EDGE_PADDING", options.edge_padding)
     _set_bool_env("AUDIO_AUTO_ENHANCE", options.enhance)
     _set_bool_env("ENABLE_METADATA", options.metadata)
@@ -259,6 +261,7 @@ def resolve_stage_options(
         "dialogue_trim": True,
         # 所有層預設 ON：先精選翻譯，再依字幕時間軸規劃下載
         "selective_download": True,
+        "three_phase_selection": stage_name in {"video", "chosen"},
         # 停頓 ≥1.5s 剪掉；所有流程預設不做前後延伸
         "edge_padding": False,
         "enhance": True,
@@ -272,9 +275,9 @@ def resolve_stage_options(
         "chosen_height": 1080,
         "asr_backend": "moss",
         "translation_model": (
-            "x-ai/grok-4.5" if stage_name == "chosen" else "x-ai/grok-4.3"
+            "x-ai/grok-4.5" if stage_name in {"video", "chosen"} else "x-ai/grok-4.3"
         ),
-        "reasoning_effort": "minimal" if stage_name == "chosen" else "none",
+        "reasoning_effort": "minimal" if stage_name in {"video", "chosen"} else "none",
         "trim_threshold": 30.0,
         "segment_gap": 1.5,
         "asr_chunk_seconds": 180,
@@ -286,6 +289,8 @@ def resolve_stage_options(
         else default
         for name, default in defaults.items()
     }
+    if stage_name not in {"video", "chosen"}:
+        values["three_phase_selection"] = False
     return replace(options, **values)
 
 
@@ -315,6 +320,7 @@ def print_effective_options(stage_name: str, options: FeatureSwitches) -> None:
         f"SRT={state(options.subtitles)}｜"
         f"翻譯={state(options.translation)}｜剪片={state(options.dialogue_trim)}｜"
         f"精選下載={state(options.selective_download)}｜"
+        f"30秒三段={state(options.three_phase_selection)}｜"
         f"0.75延伸={state(options.edge_padding)}｜"
         f"增強={state(options.enhance)}｜Meta={state(options.metadata)}｜"
         f"歸檔={state(options.archive_grid)}｜快取={state(options.reuse_cache)}｜"
@@ -340,6 +346,7 @@ def feature_environment(options: FeatureSwitches):
         "ENABLE_TRANSLATION",
         "ENABLE_DIALOGUE_TRIM",
         "ENABLE_SELECTIVE_DOWNLOAD",
+        "ENABLE_THREE_PHASE_SELECTION",
         "ENABLE_EDGE_PADDING",
         "AUDIO_AUTO_ENHANCE",
         "ENABLE_METADATA",
@@ -486,6 +493,7 @@ def _execute_stage(
                     enable_dialogue_trim=options.dialogue_trim,
                     enable_translation=options.translation,
                     enable_selective_download=options.selective_download,
+                    enable_three_phase_selection=options.three_phase_selection,
                     enable_edge_padding=options.edge_padding,
                     enable_metadata=options.metadata,
                     dialogue_trim_threshold=options.trim_threshold,
@@ -552,6 +560,7 @@ def _execute_stage(
         enable_translation=options.translation,
         enable_dialogue_trim=options.dialogue_trim,
         enable_selective_download=options.selective_download,
+        enable_three_phase_selection=options.three_phase_selection,
         enable_edge_padding=options.edge_padding,
         enable_enhance=options.enhance,
         enable_metadata=options.metadata,

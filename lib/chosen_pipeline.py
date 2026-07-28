@@ -196,6 +196,7 @@ def process_chosen_grid(
     enable_translation: bool | None = None,
     enable_dialogue_trim: bool | None = None,
     enable_selective_download: bool | None = None,
+    enable_three_phase_selection: bool | None = None,
     enable_edge_padding: bool | None = None,
     enable_enhance: bool | None = None,
     enable_metadata: bool | None = None,
@@ -227,6 +228,7 @@ def process_chosen_grid(
         enable_dialogue_trim=enable_dialogue_trim,
         enable_translation=enable_translation,
         enable_selective_download=enable_selective_download,
+        enable_three_phase_selection=enable_three_phase_selection,
         enable_edge_padding=enable_edge_padding,
         enable_metadata=enable_metadata,
         dialogue_trim_threshold=dialogue_trim_threshold,
@@ -249,6 +251,7 @@ def process_chosen_video(
     enable_translation: bool | None = None,
     enable_dialogue_trim: bool | None = None,
     enable_selective_download: bool | None = None,
+    enable_three_phase_selection: bool | None = None,
     enable_edge_padding: bool | None = None,
     enable_enhance: bool | None = None,
     enable_metadata: bool | None = None,
@@ -310,9 +313,18 @@ def process_chosen_video(
         if enable_selective_download is None
         else bool(enable_selective_download)
     )
+    three_phase_enabled = (
+        full_video_pipeline.three_phase_selection_enabled()
+        if enable_three_phase_selection is None
+        else bool(enable_three_phase_selection)
+    )
+    if three_phase_enabled:
+        selective_enabled = True
+        trim_enabled = True
     if selective_enabled and not translation_enabled:
         _log("  [精選下載] 翻譯已關閉，精選下載自動改為 OFF")
         selective_enabled = False
+        three_phase_enabled = False
     edge_pad_on = (
         full_video_pipeline.edge_padding_enabled()
         if enable_edge_padding is None
@@ -380,8 +392,12 @@ def process_chosen_video(
     if selective_enabled and translation_enabled:
         _log("  [精選下載] 先劇情整理 + 選擇性翻譯（歌詞則完整翻譯）…")
         try:
-            asr = full_video_pipeline.complete_cached_translation(
-                asr, cache, selective=True
+            asr = (
+                full_video_pipeline.complete_three_phase_translation(asr, cache)
+                if three_phase_enabled
+                else full_video_pipeline.complete_cached_translation(
+                    asr, cache, selective=True
+                )
             )
             selective_done = True
             is_full = bool(asr.get("selective_is_full"))
@@ -398,11 +414,14 @@ def process_chosen_video(
     segments, original, translated = _chosen_segment_plan(
         asr,
         enabled=trim_enabled,
-        threshold=dialogue_trim_threshold,
+        threshold=0.0 if three_phase_enabled else dialogue_trim_threshold,
         segment_gap=segment_gap,
         max_dur=source_duration if source_duration > 0 else 99999.0,
         edge_padding=edge_pad,
     )
+    if three_phase_enabled and segments is not None:
+        segments = full_video_pipeline.inset_segments(segments)
+        _log("  [三段精選] 每段內縮 0.1 秒；影音 crossfade 0.08 秒")
     high, original, translated, enhanced = full_video_pipeline.run_parallel_delivery_phase(
         url,
         work,
@@ -413,6 +432,7 @@ def process_chosen_video(
         enable_enhance=enhance_enabled,
         asr_cache=cache,
         audio_worker=audio_worker,
+        crossfade_seconds=(0.08 if three_phase_enabled and segments is not None else 0.0),
     )
     if final_video.exists():
         final_video.unlink()

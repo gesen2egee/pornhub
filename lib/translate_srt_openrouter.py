@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import time
@@ -28,7 +29,8 @@ LAST_TRANSLATE_STATS: dict[str, Any] = {}
 SYSTEM_PROMPT = (
     "你是字幕校正與翻譯專家。每行格式為 id|原文（ASR 聽寫）。"
     "先校正錯字/漏字/誤聽，再翻成自然口語的繁體中文。"
-    "輸出的 text 只能是繁體中文：禁止英文、日文、韓文、簡體或其他外語殘留。"
+    "輸出的 text 必須嚴格全為繁體中文：人名、動名詞與所有專有稱呼也必須翻成繁體中文，"
+    "禁止英文、日文、韓文、簡體或其他外語殘留。"
     "只輸出譯文；保留原意、語氣與成人內容，不要摘要或加說明。"
     "輸出格式必須與輸入相同：每行一條 id|譯文，id 不可改、不可漏、不可合併。"
     "不要 Markdown、不要 JSON、不要前後文說明。"
@@ -59,13 +61,46 @@ SELECTIVE_SYSTEM_PROMPT = (
     "沒有它會聽不懂的句子。\n"
     "5. id 必須是輸入原編號，不可改號、不可合併多 id 成一行。\n"
     "6. 允許跳號（1|… 下一行直接 6|…）。\n"
-    "7. 譯文：自然口語繁體中文；禁止英文/日文/簡體殘留；保留成人語氣。\n"
+    "7. 譯文：自然口語繁體中文；人名、動名詞與所有專有稱呼也必須翻成繁體中文；"
+    "禁止英文/日文/簡體殘留；保留成人語氣。\n"
     "8. 不要輸出未出現在輸入的 id。\n"
     "\n"
     "【重要備註】若你判斷這些字幕主要是歌詞（歌曲/MV/卡拉 OK 唱詞、"
     "反覆副歌等），不啟用精選省略：請在 ===TRANSLATIONS=== "
     "對輸入的每一條 id 都輸出完整譯文，不要跳號刪句。"
 )
+
+
+def _cue_duration_seconds(cue: dict[str, Any]) -> float:
+    """讀取 SRT cue 時長；格式無效時安全略過。"""
+    try:
+        start, end = str(cue["time"]).split("-->", 1)
+        def parse(value: str) -> float:
+            hms, ms = value.strip().replace(".", ",").split(",", 1)
+            hour, minute, second = (int(part) for part in hms.split(":"))
+            return hour * 3600 + minute * 60 + second + int(ms) / 1000
+        return max(0.0, parse(end) - parse(start))
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+
+
+def three_phase_budget(cues: list[dict[str, Any]]) -> dict[str, int | float]:
+    """以 30 秒／平均句長計算 N，並回傳嚴格小於三層上限的固定句數。"""
+    if not cues:
+        raise ValueError("三段精選需要至少一條字幕")
+    total = sum(_cue_duration_seconds(cue) for cue in cues)
+    average = total / len(cues) if total > 0 else 0.0
+    if average <= 0:
+        raise ValueError("無法由字幕時間軸計算平均語音長度")
+    n = max(2, math.ceil(30.0 / average))
+    return {
+        "n": n,
+        "average_seconds": average,
+        "plot": n - 1,
+        "middle": 2 * n,
+        "climax": 3 * n,
+        "total": 6 * n - 1,
+    }
 
 
 def strip_speaker_labels(
@@ -726,6 +761,106 @@ def translate_cues_selective(
         "raw": raw,
         "usage": usage,
     }
+
+
+def _parse_three_phase_selection(raw: str) -> tuple[str, dict[str, list[int]]]:
+    """解析 GROK 的三段設計稿與固定數量選句。"""
+    plot_match = re.search(
+        r"===PLOT===\s*(.*?)(?====SELECTION===|\Z)",
+        raw or "",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    selection_match = re.search(
+        r"===SELECTION===\s*(.*)\Z",
+        raw or "",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    phases = {"plot": [], "middle": [], "climax": []}
+    for line in (selection_match.group(1) if selection_match else "").splitlines():
+        name, separator, values = line.partition("|")
+        key = name.strip().casefold()
+        if separator and key in phases:
+            phases[key] = [int(item) for item in re.findall(r"\d+", values)]
+    return (plot_match.group(1).strip() if plot_match else ""), phases
+
+
+def select_cues_three_phase(
+    cues: list[dict[str, Any]],
+    api_key: str,
+    model: str = DEFAULT_MODEL,
+) -> dict[str, Any]:
+    """先由 GROK 寫三段設計，再依 30 秒 N 預算選出連續可承接字幕。"""
+    global LAST_TRANSLATE_STATS
+    budget = three_phase_budget(cues)
+    prepared = strip_speaker_labels(cues)
+    by_id = {int(cue["id"]): cue for cue in prepared}
+    flat = _format_flat_lines(prepared)
+    system = (
+        "你是成人影片精選剪輯師。完整閱讀 ASR 後，先規劃再選出可承接的三段："
+        "情節篇、中段床戲篇、高潮床戲篇。所有說明、人物姓名、動名詞與專有稱呼"
+        "都必須嚴格使用繁體中文，禁止任何英文、日文、韓文、簡體或其他外語殘留。\n\n"
+        f"本片 N={budget['n']}（30 秒／平均句長 {budget['average_seconds']:.3f} 秒，無條件進位）。"
+        f"嚴格句數：情節篇 {budget['plot']} 句（<1N）；"
+        f"情節＋中段共 {budget['plot'] + budget['middle']} 句（<3N）；"
+        f"全部共 {budget['total']} 句（<6N）。"
+        "每個 id 只能選一次，三段合併後 id 必須嚴格遞增。\n\n"
+        "情節篇只保留人物、關係、衝突與動機的最小必要鋪陳；"
+        "中段篇以調情、身體互動、性指令與床戲推進為主，少放劇情；"
+        "高潮篇以最強烈床戲、高潮、射精/中出、事後掌控與結尾為主。"
+        "選句必須能承接前後，不可用冗長劇情取代中段或高潮床戲。\n\n"
+        "輸出格式完全固定，不要 Markdown、JSON 或額外說明：\n"
+        "===PLOT===\n"
+        "以繁體中文寫三段設計稿，依序為【情節篇設計】、【中段床戲篇設計】、【高潮床戲篇設計】，每段 80–150 字。\n"
+        "===SELECTION===\n"
+        f"PLOT|{budget['plot']} 個逗號分隔 id\n"
+        f"MIDDLE|{budget['middle']} 個逗號分隔 id\n"
+        f"CLIMAX|{budget['climax']} 個逗號分隔 id"
+    )
+    effort = os.getenv("TRANSLATE_REASONING_EFFORT", "minimal").strip() or "minimal"
+    if effort == "none" and "grok-4.5" in model.casefold():
+        effort = "minimal"
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"以下是完整影片共 {len(prepared)} 條 ASR 字幕：\n\n{flat}"},
+        ],
+        "reasoning": {"effort": effort, "exclude": True},
+        "max_tokens": int(os.getenv("TRANSLATE_MAX_TOKENS", "32000")),
+        "stream": False,
+        "usage": {"include": True},
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    started = time.perf_counter()
+    response = requests.post(
+        OPENROUTER_URL,
+        headers=headers,
+        json=body,
+        timeout=(20, int(os.getenv("TRANSLATE_TIMEOUT_SECONDS", "1200"))),
+    )
+    response.raise_for_status()
+    data = response.json()
+    raw = _content_to_text(data["choices"][0]["message"]["content"])
+    plot, phases = _parse_three_phase_selection(raw)
+    expected = {name: int(budget[name]) for name in phases}
+    actual = {name: len(ids) for name, ids in phases.items()}
+    ids = [item for name in ("plot", "middle", "climax") for item in phases[name]]
+    if actual != expected:
+        raise RuntimeError(f"三段精選句數不符：預期 {expected}，實際 {actual}")
+    if ids != sorted(ids) or len(ids) != len(set(ids)) or any(item not in by_id for item in ids):
+        raise RuntimeError("三段精選 id 不合法、重複或非嚴格遞增")
+    usage = _usage_from_response(data)
+    usage["wall_sec"] = round(time.perf_counter() - started, 3)
+    LAST_TRANSLATE_STATS = {
+        "model": data.get("model") or model,
+        "mode": "three_phase_30s",
+        "n": budget["n"],
+        "phase_counts": actual,
+        "kept": len(ids),
+        "api_calls": 1,
+        "usage": usage,
+    }
+    return {"plot": plot, "phases": phases, "kept_cues": [by_id[item] for item in ids], "raw": raw, "budget": budget, "usage": usage}
 
 
 def main() -> None:

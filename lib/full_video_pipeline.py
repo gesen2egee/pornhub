@@ -55,6 +55,8 @@ DIALOGUE_TRIM_THRESHOLD = 30.0
 SEGMENT_GAP = 1.5
 # 可選的前後延伸秒數；所有流程預設關閉，明確開啟才使用 0.75s
 SEGMENT_EDGE_PADDING = 0.75
+THREE_PHASE_INNER_TRIM = 0.1
+THREE_PHASE_CROSSFADE = 0.08
 
 
 def edge_padding_enabled(environment: dict[str, str] | None = None) -> bool:
@@ -72,6 +74,31 @@ def resolve_edge_padding_seconds(
     if enabled is None:
         enabled = edge_padding_enabled(environment)
     return float(SEGMENT_EDGE_PADDING) if enabled else 0.0
+
+
+def three_phase_selection_enabled(
+    environment: dict[str, str] | None = None,
+) -> bool:
+    """30 秒三段 GROK 精選開關；Video／Chosen 由控制器預設開啟。"""
+    environment = os.environ if environment is None else environment
+    value = environment.get("ENABLE_THREE_PHASE_SELECTION", "1").strip().casefold()
+    return value not in {"0", "false", "no", "off"}
+
+
+def inset_segments(
+    segments: list[tuple[float, float]],
+    seconds: float = THREE_PHASE_INNER_TRIM,
+) -> list[tuple[float, float]]:
+    """每個保留段前後內縮，過短段保留最小安全長度避免丟失字幕。"""
+    result: list[tuple[float, float]] = []
+    for start, end in segments:
+        inner_start, inner_end = start + seconds, end - seconds
+        if inner_end - inner_start <= THREE_PHASE_CROSSFADE:
+            _log(f"  [內縮] 區段過短，保留原始範圍：{start:.2f}–{end:.2f}s")
+            result.append((start, end))
+        else:
+            result.append((inner_start, inner_end))
+    return result
 DOWNLOAD_SOCKET_TIMEOUT = 30
 DOWNLOAD_RETRIES = 3
 SEGMENT_DOWNLOAD_ATTEMPTS = 2
@@ -661,6 +688,52 @@ def concat_videos(parts: list[Path], out_path: Path) -> Path:
     return out_path
 
 
+def concat_videos_crossfade(
+    parts: list[Path],
+    out_path: Path,
+    fade_seconds: float = THREE_PHASE_CROSSFADE,
+) -> Path:
+    """以同步畫面 xfade 與音訊 acrossfade 串接高畫質切塊。"""
+    if len(parts) <= 1:
+        return concat_videos(parts, out_path)
+    durations = [probe_duration(part) or 0.0 for part in parts]
+    if any(duration <= fade_seconds * 2 for duration in durations):
+        _log("  [Crossfade] 有過短片段，改用一般串接以保留內容")
+        return concat_videos(parts, out_path)
+    filters: list[str] = []
+    for index in range(len(parts)):
+        filters.extend([
+            f"[{index}:v]setpts=PTS-STARTPTS[v{index}]",
+            f"[{index}:a]asetpts=PTS-STARTPTS[a{index}]",
+        ])
+    video_label, audio_label, total = "v0", "a0", durations[0]
+    for index in range(1, len(parts)):
+        next_video, next_audio = f"vx{index}", f"ax{index}"
+        filters.append(
+            f"[{video_label}][v{index}]xfade=transition=fade:"
+            f"duration={fade_seconds:.3f}:offset={total - fade_seconds:.3f}[{next_video}]"
+        )
+        filters.append(
+            f"[{audio_label}][a{index}]acrossfade=d={fade_seconds:.3f}[{next_audio}]"
+        )
+        video_label, audio_label = next_video, next_audio
+        total += durations[index] - fade_seconds
+    command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
+    for part in parts:
+        command.extend(["-i", str(part)])
+    command.extend([
+        "-filter_complex", ";".join(filters),
+        "-map", f"[{video_label}]", "-map", f"[{audio_label}]",
+        "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+        "-c:a", "aac", "-movflags", "+faststart", str(out_path),
+    ])
+    result = subprocess.run(command, capture_output=True, text=True, timeout=7200)
+    if result.returncode != 0 or not out_path.exists() or has_video_stream(out_path) is not True:
+        raise RuntimeError(f"Crossfade 串接失敗：{(result.stderr or '')[-800:]}")
+    _log(f"  [Crossfade] 影音同步淡化 {fade_seconds:.2f}s，{len(parts)} 段")
+    return out_path
+
+
 def cues_to_entries(cues: list[dict[str, Any]]) -> list[dict]:
     entries = []
     for cue in cues:
@@ -794,6 +867,53 @@ def complete_cached_translation(
             json.dumps(asr, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+    return asr
+
+
+def complete_three_phase_translation(
+    asr: dict[str, Any],
+    cache_path: Path | None = None,
+) -> dict[str, Any]:
+    """GROK 30 秒三段規劃、嚴格選句後，再將保留句翻成繁中。"""
+    if (
+        (asr.get("translated_srt") or "").strip()
+        and asr.get("selection_mode") == "three_phase_30s"
+    ):
+        return asr
+    api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY")
+    if not api_key:
+        raise RuntimeError("三段精選已開啟，但找不到 OPENROUTER_API_KEY")
+    from translate_srt_openrouter import (
+        DEFAULT_MODEL,
+        format_srt,
+        select_cues_three_phase,
+        translate_cues,
+    )
+
+    cues = _cues_for_translation(asr)
+    if not cues:
+        raise RuntimeError("三段精選需要帶時間軸的 ASR cues")
+    model_name = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
+    selected = select_cues_three_phase(cues, api_key, model_name)
+    kept = selected["kept_cues"]
+    translated = translate_cues(kept, api_key, model_name)
+    asr = dict(asr)
+    asr["cues"] = kept
+    asr["original_srt"] = format_srt(kept)
+    asr["translated_srt"] = format_srt(translated)
+    asr["plot_summary"] = selected["plot"]
+    asr["three_phase_design"] = selected["plot"]
+    asr["three_phase_selection"] = selected["phases"]
+    asr["three_phase_budget"] = selected["budget"]
+    asr["selective_kept_ids"] = [int(cue["id"]) for cue in kept]
+    asr["selective_dropped_ids"] = sorted(
+        int(cue["id"]) for cue in cues if int(cue["id"]) not in set(asr["selective_kept_ids"])
+    )
+    asr["selective_is_full"] = False
+    asr["selection_mode"] = "three_phase_30s"
+    asr["outcome"] = "translated"
+    if cache_path is not None:
+        cache_path.write_text(json.dumps(asr, ensure_ascii=False, indent=2), encoding="utf-8")
     return asr
 
 
@@ -1476,6 +1596,7 @@ def run_parallel_delivery_phase(
     enable_enhance: bool,
     asr_cache: Path,
     audio_worker=None,
+    crossfade_seconds: float = 0.0,
 ) -> tuple[Path, str, str, bool]:
     """平行執行 OpenRouter、切塊下載與切塊後 enhance，全部完成才回傳。"""
     high_path = work_dir / f"{video_stem}.high.mp4"
@@ -1637,7 +1758,10 @@ def run_parallel_delivery_phase(
                     f"{len(still_failed)} 個高畫質區段多次重試仍失敗："
                     f"{failed_text}；已完成區段會保留供下次續跑。"
                 ) from still_failed[0][4]
-            concat_videos(parts, high_path)
+            if crossfade_seconds > 0:
+                concat_videos_crossfade(parts, high_path, crossfade_seconds)
+            else:
+                concat_videos(parts, high_path)
 
         if translation_future is not None:
             translated_asr = translation_future.result()
@@ -1658,13 +1782,17 @@ def run_parallel_delivery_phase(
         if original_srt.strip():
             original_srt = _entries_to_srt(
                 segment_cutter.retime_subtitles(
-                    srt_text_to_entries(original_srt), segments
+                    srt_text_to_entries(original_srt),
+                    segments,
+                    crossfade_seconds=crossfade_seconds,
                 )
             )
         if translated_srt.strip():
             translated_srt = _entries_to_srt(
                 segment_cutter.retime_subtitles(
-                    srt_text_to_entries(translated_srt), segments
+                    srt_text_to_entries(translated_srt),
+                    segments,
+                    crossfade_seconds=crossfade_seconds,
                 )
             )
         _log("  [第二階段] 翻譯、切塊下載與 Enhance 已全部完成；字幕已 retime")
@@ -1731,6 +1859,7 @@ def process_full_video_from_grid(
     enable_dialogue_trim: bool | None = None,
     enable_translation: bool | None = None,
     enable_selective_download: bool | None = None,
+    enable_three_phase_selection: bool | None = None,
     enable_metadata: bool | None = None,
     dialogue_trim_threshold: float = DIALOGUE_TRIM_THRESHOLD,
     segment_gap: float = SEGMENT_GAP,
@@ -1754,6 +1883,7 @@ def process_full_video_from_grid(
     enable_enhance：是否允許音訊增強（預設讀 AUDIO_AUTO_ENHANCE）
     enable_dialogue_trim：是否依停頓門檻移除長停頓並分段下載
     enable_selective_download：精選下載——先劇情+選擇性翻譯，再只下載保留對白
+    enable_three_phase_selection：30 秒 N 三段精選；Video／Chosen 預設開啟
     segment_gap：相鄰對白停頓 ≥ 此秒數則剪開（預設 1.5）
     enable_edge_padding：對白前後 0.75s 延伸開關（預設關閉）
     """
@@ -1797,6 +1927,14 @@ def process_full_video_from_grid(
         ).strip().lower() not in {"0", "false", "no", "off"}
     if enable_selective_download is None:
         enable_selective_download = selective_download_enabled()
+    if enable_three_phase_selection is None:
+        enable_three_phase_selection = (
+            pipeline_stage in {"video", "chosen"}
+            and three_phase_selection_enabled()
+        )
+    if enable_three_phase_selection:
+        enable_selective_download = True
+        enable_dialogue_trim = True
     if enable_metadata is None:
         enable_metadata = os.getenv(
             "ENABLE_METADATA", "1"
@@ -1805,6 +1943,9 @@ def process_full_video_from_grid(
     if enable_selective_download and not enable_translation:
         _log("  [精選下載] 翻譯已關閉，精選下載自動改為 OFF")
         enable_selective_download = False
+    if enable_three_phase_selection and not enable_translation:
+        _log("  [三段精選] 翻譯已關閉，三段精選自動改為 OFF")
+        enable_three_phase_selection = False
     if enable_edge_padding is None:
         enable_edge_padding = edge_padding_enabled()
     edge_pad = resolve_edge_padding_seconds(enable_edge_padding)
@@ -1814,6 +1955,9 @@ def process_full_video_from_grid(
     os.environ["ENABLE_TRANSLATION"] = "1" if enable_translation else "0"
     os.environ["ENABLE_SELECTIVE_DOWNLOAD"] = (
         "1" if enable_selective_download else "0"
+    )
+    os.environ["ENABLE_THREE_PHASE_SELECTION"] = (
+        "1" if enable_three_phase_selection else "0"
     )
     os.environ["ENABLE_EDGE_PADDING"] = "1" if enable_edge_padding else "0"
     os.environ["AUDIO_AUTO_ENHANCE"] = "1" if enable_enhance else "0"
@@ -1989,22 +2133,30 @@ def process_full_video_from_grid(
         with _stage("02a_selective_translate"):
             if (asr.get("translated_srt") or "").strip() and asr.get(
                 "selective_kept_ids"
-            ) is not None:
+            ) is not None and (
+                not enable_three_phase_selection
+                or asr.get("selection_mode") == "three_phase_30s"
+            ):
                 _log("  [精選下載] 重用快取內已有精選翻譯結果")
                 selective_done = True
             else:
                 _log(
-                    "  [精選下載] 先劇情整理 + 選擇性翻譯"
-                    "（歌詞則完整翻譯）…"
+                    "  [三段精選] 等完整 240P/MOSS 後送 GROK："
+                    "30 秒 N 三段、內縮 0.1 秒…"
+                    if enable_three_phase_selection
+                    else "  [精選下載] 先劇情整理 + 選擇性翻譯（歌詞則完整翻譯）…"
                 )
                 try:
-                    asr = complete_cached_translation(
-                        asr, asr_cache, selective=True
+                    asr = (
+                        complete_three_phase_translation(asr, asr_cache)
+                        if enable_three_phase_selection
+                        else complete_cached_translation(asr, asr_cache, selective=True)
                     )
                     selective_done = True
                 except Exception as exc:
                     _log(f"  [!] 精選翻譯失敗，回退一般翻譯：{exc}")
                     enable_selective_download = False
+                    enable_three_phase_selection = False
                     asr.pop("selective_kept_ids", None)
                     asr.pop("selective_is_full", None)
                     asr.pop("plot_summary", None)
@@ -2080,6 +2232,8 @@ def process_full_video_from_grid(
                 max_dur=duration if duration > 0 else 99999.0,
                 edge_padding=edge_pad,
             )
+            if enable_three_phase_selection:
+                segments = inset_segments(segments)
             trimmed = sum(e - s for s, e in segments)
             _log(
                 f"  [分段] 停頓≥{segment_gap}s 剪掉；"
@@ -2089,6 +2243,11 @@ def process_full_video_from_grid(
                 f"> {dialogue_trim_threshold}s → "
                 f"{len(segments)} 段（約 {trimmed:.1f}s）"
             )
+            if enable_three_phase_selection:
+                _log(
+                    f"  [三段精選] 每段內縮 {THREE_PHASE_INNER_TRIM:.1f}s；"
+                    f"影音 crossfade {THREE_PHASE_CROSSFADE:.2f}s"
+                )
             for i, (s, e) in enumerate(segments, 1):
                 _log(f"    段 {i:02d}: {s:.2f} → {e:.2f} ({e - s:.2f}s)")
 
@@ -2117,6 +2276,11 @@ def process_full_video_from_grid(
                 enable_enhance=enable_enhance,
                 asr_cache=asr_cache,
                 audio_worker=audio_worker,
+                crossfade_seconds=(
+                    THREE_PHASE_CROSSFADE
+                    if enable_three_phase_selection and segments is not None
+                    else 0.0
+                ),
             )
         )
     outcome = asr.get("outcome") or outcome

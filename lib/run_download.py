@@ -173,6 +173,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _boolean_switch(
         parser,
+        "three-phase-selection",
+        "開啟或關閉 30 秒 N 三段 GROK 精選（Video、Chosen 預設開）",
+    )
+    _boolean_switch(
+        parser,
         "edge-padding",
         "開啟或關閉對白前後 0.75s 延伸（預設關；停頓≥1.5s 仍會剪掉）",
     )
@@ -268,6 +273,7 @@ def run_maintenance(args: argparse.Namespace) -> int | None:
                 translation=args.translation,
                 dialogue_trim=args.dialogue_trim,
                 selective_download=args.selective_download,
+                three_phase_selection=args.three_phase_selection,
                 edge_padding=args.edge_padding,
                 enhance=args.enhance,
                 metadata=args.metadata,
@@ -311,6 +317,7 @@ def run_maintenance(args: argparse.Namespace) -> int | None:
                         enable_dialogue_trim=options.dialogue_trim,
                         enable_translation=options.translation,
                         enable_selective_download=options.selective_download,
+                        enable_three_phase_selection=options.three_phase_selection,
                         enable_edge_padding=options.edge_padding,
                         enable_metadata=options.metadata,
                         archive_grid_on_done=options.archive_grid,
@@ -366,6 +373,7 @@ def main(argv: list[str] | None = None) -> int:
             "translation",
             "dialogue_trim",
             "selective_download",
+            "three_phase_selection",
             "edge_padding",
             "enhance",
             "metadata",
@@ -401,6 +409,7 @@ def main(argv: list[str] | None = None) -> int:
                 "translation",
                 "dialogue_trim",
                 "selective_download",
+                "three_phase_selection",
                 "edge_padding",
                 "enhance",
                 "metadata",
@@ -445,6 +454,7 @@ def main(argv: list[str] | None = None) -> int:
         translation=args.translation,
         dialogue_trim=args.dialogue_trim,
         selective_download=args.selective_download,
+        three_phase_selection=args.three_phase_selection,
         edge_padding=args.edge_padding,
         enhance=args.enhance,
         metadata=args.metadata,

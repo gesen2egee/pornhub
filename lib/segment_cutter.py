@@ -145,13 +145,17 @@ def build_continuous_segments(
     return segments
 
 
-def retime_subtitles(entries: list[dict], video_segments: list[tuple[float, float]]) -> list[dict]:
-    """根據剪輯後的影片保留區段 (video_segments)，對字幕進行時間戳重新對位 (Retiming)"""
+def retime_subtitles(
+    entries: list[dict],
+    video_segments: list[tuple[float, float]],
+    crossfade_seconds: float = 0.0,
+) -> list[dict]:
+    """依保留區段重排字幕；crossfade 會讓後段時間軸提前重疊秒數。"""
     new_entries = []
 
     seg_timeline = []
     current_new_time = 0.0
-    for src_s, src_e in video_segments:
+    for index, (src_s, src_e) in enumerate(video_segments):
         dur = src_e - src_s
         seg_timeline.append({
             'src_start': src_s,
@@ -159,7 +163,9 @@ def retime_subtitles(entries: list[dict], video_segments: list[tuple[float, floa
             'new_start': current_new_time,
             'new_end': current_new_time + dur
         })
-        current_new_time += dur
+        current_new_time += dur - (
+            crossfade_seconds if index < len(video_segments) - 1 else 0.0
+        )
 
     for entry in entries:
         cap_s = entry['start']

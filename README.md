@@ -26,10 +26,10 @@ output/
 ├── 01_preview_images/   01_run_capture.bat 產生的 5×5 宮格
 ├── 02_preview_videos/   前 3 分鐘低畫質 → Whisper 語音剪片 + 軟 SRT，不硬字幕/不 enhance
 ├── 02_shorts/           內嵌翻譯時間軸直抓最高畫質片段；僅 URL 先分析前 9 分鐘 240P
-├── 03_videos/           480P（對白>30s 剪片）+ 軟字幕，不 enhance
+├── 03_videos/           30 秒三段精選後的 480P + 軟字幕 + 判斷 enhance／crossfade
 ├── 04_downloaded/       已完成九宮格歸檔
 ├── 05_chosen/           精選輸入（可丟九宮格或含 URL 的影片）
-└── 06_good/             精選成品：1080P + MOSS + Grok 4.5 minimal + 判斷 enhance
+└── 06_good/             精選成品：三段精選後的 1080P + 判斷 enhance／crossfade
 ```
 
 ### 四條流程
@@ -38,8 +38,8 @@ output/
 |------|------|------|------|---------|------|
 | 預覽 | `02_preview_videos` 九宮格或含 URL 影片 | 一次下載 BS 段低畫質（預設 3×3 分鐘）；語音>30s 剪片否則全留 | Demucs 人聲 → 批次 MOSS → 一次 Grok 精選翻譯 | 否 | 同目錄 |
 | Shorts | `02_shorts` 九宮格或含 URL 影片 | 有內嵌翻譯直接依時間軸抓來源最高畫質；否則先抓前 9 分鐘 240P，再抓對應最高畫質片段 | 重用內嵌翻譯，或 MOSS → Grok 精選翻譯 | 判斷 | 同目錄 |
-| 標準全片 | `03_videos` 九宮格或含 URL 影片 | 480P（Whisper 剪片） | Demucs 人聲 → Whisper + **Grok 4.3 none**（便宜） | 否 | `03_videos` |
-| 精選 | `05_chosen` 九宮格或影片 | 1080P | Demucs 人聲 → MOSS + **Grok 4.5 minimal** | 判斷 | `06_good` |
+| 標準全片 | `03_videos` 九宮格或含 URL 影片 | 240P 分析後依選段抓 480P | 240P/MOSS → **Grok 4.5 30 秒三段** → enhance＋crossfade | 判斷 | `03_videos` |
+| 精選 | `05_chosen` 九宮格或影片 | 240P 分析後依選段抓 1080P | 240P/MOSS → **Grok 4.5 30 秒三段** → enhance＋crossfade | 判斷 | `06_good` |
 | 歸檔 | （自動） | — | — | — | 九宮格→`04_downloaded`；chosen 來源影片刪除 |
 
 可用 `PORN_OUTPUT_DIR` 環境變數整體改寫 `output/` 位置，程式內的子目錄名稱由 `lib/project_paths.py` 統一管理。
@@ -125,8 +125,9 @@ yt-dlp DEBUG 與下載百分比訊息。
 
 暫存位於 `output/00_temp/pipeline/`。Video 與 Chosen 預設分成兩個階段：
 
-1. 以 240P 每 180 秒下載一段；累計滿 BS（預設 3 段）才排入一次 `Demucs → ASR`，並與下一批下載重疊。影片尾端不足 BS 仍會送出，全部完成後才進下一階段。
-2. 同時執行 OpenRouter 翻譯、高畫質切塊下載，以及每個已下載切塊的自動 `enhance`；三條工作都完成後才 retime 字幕、拼接與發布。
+1. 以 240P 每 180 秒下載一段；累計滿 BS（預設 3 段）才排入一次 `Demucs → MOSS`，並與下一批下載重疊。全部 240P 與 MOSS 完成後，才把完整時間軸交給 GROK。
+2. Video／Chosen 預設啟用 30 秒三段：`N=ceil(30 秒／平均語音句長)`，固定選出情節 `N-1`、中段 `2N`、高潮 `3N` 句（總數 `<6N`）。每段內縮 0.1 秒後，才按原片時間下載高畫質切塊。
+3. 高畫質切塊下載後會同步進行音訊判斷／`enhance`，最後以 0.08 秒同步影音 crossfade 合併並 retime 字幕。
 
 Preview 每段預設 180 秒，一次先下載 `--asr-batch-size` 段（預設 3 段，共最多 9 分鐘），再用同一批執行 `Demucs → MOSS BS ASR`；合併完整批次字幕後只送一次 OpenRouter 精選翻譯。下載與剪片完成後同樣會自動判斷 enhance。
 
@@ -157,7 +158,7 @@ Preview 每段預設 180 秒，一次先下載 `--asr-batch-size` 段（預設 3
 02_run_download.bat --stages chosen --chosen-height 1080 --translation-model x-ai/grok-4.5 --reasoning-effort minimal
 ```
 
-可控制項目包含：`asr`、`demucs-asr`、`asr-stream`、`subtitles`、`translation`、`dialogue-trim`、`enhance`、
+可控制項目包含：`asr`、`demucs-asr`、`asr-stream`、`subtitles`、`translation`、`dialogue-trim`、`three-phase-selection`、`enhance`、
 `metadata`、`archive`、`keep-work`、`reuse-cache`、`force`。每個布林項目都可使用
 `--功能` 或 `--no-功能`；完整說明請執行 `02_run_download.bat --help`。
 
@@ -174,6 +175,7 @@ Chosen 有 URL 時不會拿既有高畫質成品接續，會重新下載規劃�
 剪片門檻與區段合併間隔可分別用 `--trim-threshold`、`--segment-gap` 調整；`--preview-seconds` 是 Preview 每次下載與 ASR 的片段長度，不再是總長度。
 `asr-stream` 預設開啟；`--asr-chunk-seconds` 預設為 180。Video／Chosen 會累計滿 `--asr-batch-size`（預設 3）段才執行一次 MOSS BS ASR，同時開始下載下一批；影片尾端不足 BS 的批次仍會送出。關閉 `--asr-stream` 時，會退回完整 240P 代理下載完成後再 ASR，其他功能不會被連帶關閉。
 目前剪片規則是：停頓小於門檻時完整保留；停頓大於或等於門檻時切段，預設前後延伸為 0 秒。
+若需回到一般精選翻譯，對 Video 或 Chosen 加上 `--no-three-phase-selection`。
 
 維護模式：
 
