@@ -56,7 +56,7 @@ DIALOGUE_TRIM_THRESHOLD = 30.0
 SEGMENT_GAP = 1.5
 # 可選的前後延伸秒數；所有流程預設關閉，明確開啟才使用 0.75s
 SEGMENT_EDGE_PADDING = 0.75
-THREE_PHASE_CROSSFADE = 0.08
+THREE_PHASE_AUDIO_CROSSFADE = 0.08
 
 
 def edge_padding_enabled(environment: dict[str, str] | None = None) -> bool:
@@ -838,12 +838,12 @@ def concat_videos(parts: list[Path], out_path: Path) -> Path:
     return out_path
 
 
-def concat_videos_crossfade(
+def concat_videos_audio_crossfade(
     parts: list[Path],
     out_path: Path,
-    fade_seconds: float = THREE_PHASE_CROSSFADE,
+    fade_seconds: float = THREE_PHASE_AUDIO_CROSSFADE,
 ) -> Path:
-    """以同步畫面 xfade 與音訊 acrossfade 串接高畫質切塊。"""
+    """畫面直接切換，僅以 acrossfade 讓相鄰切塊音訊自然銜接。"""
     if len(parts) <= 1:
         return concat_videos(parts, out_path)
     durations = [probe_duration(part) or 0.0 for part in parts]
@@ -856,31 +856,33 @@ def concat_videos_crossfade(
             f"[{index}:v]setpts=PTS-STARTPTS[v{index}]",
             f"[{index}:a]asetpts=PTS-STARTPTS[a{index}]",
         ])
-    video_label, audio_label, total = "v0", "a0", durations[0]
+    # concat 保留每段完整畫面時長；不使用 xfade，避免任何畫面混合或時間軸重疊。
+    video_inputs = "".join(f"[v{index}]" for index in range(len(parts)))
+    filters.append(f"{video_inputs}concat=n={len(parts)}:v=1:a=0[vout]")
+    audio_label = "a0"
     for index in range(1, len(parts)):
-        next_video, next_audio = f"vx{index}", f"ax{index}"
-        filters.append(
-            f"[{video_label}][v{index}]xfade=transition=fade:"
-            f"duration={fade_seconds:.3f}:offset={total - fade_seconds:.3f}[{next_video}]"
-        )
+        next_audio = f"ax{index}"
         filters.append(
             f"[{audio_label}][a{index}]acrossfade=d={fade_seconds:.3f}[{next_audio}]"
         )
-        video_label, audio_label = next_video, next_audio
-        total += durations[index] - fade_seconds
+        audio_label = next_audio
+    # acrossfade 讓音訊時間軸縮短；在尾端補靜音，使其與硬切畫面等長。
+    filters.append(
+        f"[{audio_label}]apad=pad_dur={fade_seconds * (len(parts) - 1):.3f}[aout]"
+    )
     command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
     for part in parts:
         command.extend(["-i", str(part)])
     command.extend([
         "-filter_complex", ";".join(filters),
-        "-map", f"[{video_label}]", "-map", f"[{audio_label}]",
+        "-map", "[vout]", "-map", "[aout]",
         "-c:v", "libx264", "-crf", "18", "-preset", "fast",
         "-c:a", "aac", "-movflags", "+faststart", str(out_path),
     ])
     result = subprocess.run(command, capture_output=True, text=True, timeout=7200)
     if result.returncode != 0 or not out_path.exists() or has_video_stream(out_path) is not True:
-        raise RuntimeError(f"Crossfade 串接失敗：{(result.stderr or '')[-800:]}")
-    _log(f"  [Crossfade] 影音同步淡化 {fade_seconds:.2f}s，{len(parts)} 段")
+        raise RuntimeError(f"音訊 crossfade 串接失敗：{(result.stderr or '')[-800:]}")
+    _log(f"  [Audio crossfade] 畫面硬切；音訊淡化 {fade_seconds:.2f}s，{len(parts)} 段")
     return out_path
 
 
@@ -1751,7 +1753,7 @@ def run_parallel_delivery_phase(
     enable_enhance: bool,
     asr_cache: Path,
     audio_worker=None,
-    crossfade_seconds: float = 0.0,
+    audio_crossfade_seconds: float = 0.0,
 ) -> tuple[Path, str, str, bool]:
     """平行執行 OpenRouter、切塊下載與切塊後 enhance，全部完成才回傳。"""
     high_path = work_dir / f"{video_stem}.high.mp4"
@@ -1957,8 +1959,12 @@ def run_parallel_delivery_phase(
                     f"{len(still_failed)} 個高畫質區段多次重試仍失敗："
                     f"{failed_text}；已完成區段會保留供下次續跑。"
                 ) from still_failed[0][4]
-            if crossfade_seconds > 0:
-                concat_videos_crossfade(parts, high_path, crossfade_seconds)
+            if audio_crossfade_seconds > 0:
+                concat_videos_audio_crossfade(
+                    parts,
+                    high_path,
+                    audio_crossfade_seconds,
+                )
             else:
                 concat_videos(parts, high_path)
 
@@ -1983,7 +1989,7 @@ def run_parallel_delivery_phase(
                 segment_cutter.retime_subtitles(
                     srt_text_to_entries(original_srt),
                     segments,
-                    crossfade_seconds=crossfade_seconds,
+                    crossfade_seconds=0.0,
                 )
             )
         if translated_srt.strip():
@@ -1991,7 +1997,7 @@ def run_parallel_delivery_phase(
                 segment_cutter.retime_subtitles(
                     srt_text_to_entries(translated_srt),
                     segments,
-                    crossfade_seconds=crossfade_seconds,
+                    crossfade_seconds=0.0,
                 )
             )
         _log("  [第二階段] 翻譯、切塊下載與 Enhance 已全部完成；字幕已 retime")
@@ -2443,7 +2449,7 @@ def process_full_video_from_grid(
             if enable_three_phase_selection:
                 _log(
                     "  [三段精選] 保留選段完整起訖；"
-                    f"影音 crossfade {THREE_PHASE_CROSSFADE:.2f}s"
+                    f"僅音訊 crossfade {THREE_PHASE_AUDIO_CROSSFADE:.2f}s"
                 )
             for i, (s, e) in enumerate(segments, 1):
                 _log(f"    段 {i:02d}: {s:.2f} → {e:.2f} ({e - s:.2f}s)")
@@ -2473,8 +2479,8 @@ def process_full_video_from_grid(
                 enable_enhance=enable_enhance,
                 asr_cache=asr_cache,
                 audio_worker=audio_worker,
-                crossfade_seconds=(
-                    THREE_PHASE_CROSSFADE
+                audio_crossfade_seconds=(
+                    THREE_PHASE_AUDIO_CROSSFADE
                     if enable_three_phase_selection and segments is not None
                     else 0.0
                 ),

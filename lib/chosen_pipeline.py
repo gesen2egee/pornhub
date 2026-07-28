@@ -421,7 +421,7 @@ def process_chosen_video(
         edge_padding=edge_pad,
     )
     if three_phase_enabled and segments is not None:
-        _log("  [三段精選] 保留選段完整起訖；影音 crossfade 0.08 秒")
+        _log("  [三段精選] 保留選段完整起訖；僅音訊 crossfade 0.08 秒")
     high, original, translated, enhanced = full_video_pipeline.run_parallel_delivery_phase(
         url,
         work,
@@ -432,7 +432,7 @@ def process_chosen_video(
         enable_enhance=enhance_enabled,
         asr_cache=cache,
         audio_worker=audio_worker,
-        crossfade_seconds=(0.08 if three_phase_enabled and segments is not None else 0.0),
+        audio_crossfade_seconds=(0.08 if three_phase_enabled and segments is not None else 0.0),
     )
     if final_video.exists():
         final_video.unlink()
