@@ -15,7 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext, redirect_stdout
 from pathlib import Path
 from queue import Empty, Queue
@@ -103,6 +103,9 @@ DOWNLOAD_SOCKET_TIMEOUT = 30
 DOWNLOAD_RETRIES = 3
 SEGMENT_DOWNLOAD_ATTEMPTS = 2
 SEGMENT_RECOVERY_ATTEMPTS = 1
+# 高畫質切塊的請求槽數。完成一段就立刻由佇列補入下一段，避免網路啟動延遲
+# 造成空槽；上限固定為三條，降低來源站點限流的機率。
+SEGMENT_DOWNLOAD_WORKERS = 3
 ASR_STREAM_CHUNK_SECONDS = 180.0
 
 # 由外部 benchmark 注入 PipelineMetrics；未注入則不計時
@@ -196,6 +199,23 @@ def _positive_int_env(name: str, default: int) -> int:
         return max(1, int(os.getenv(name, str(default))))
     except ValueError:
         return default
+
+
+def segment_download_workers(
+    environment: dict[str, str] | None = None,
+) -> int:
+    """回傳高畫質切塊的同時下載請求數（預設三條、最多三條）。"""
+    environment = os.environ if environment is None else environment
+    try:
+        requested = int(
+            environment.get(
+                "HIGH_SEGMENT_DOWNLOAD_WORKERS",
+                str(SEGMENT_DOWNLOAD_WORKERS),
+            )
+        )
+    except (TypeError, ValueError):
+        requested = SEGMENT_DOWNLOAD_WORKERS
+    return min(SEGMENT_DOWNLOAD_WORKERS, max(1, requested))
 
 
 def get_video_url_from_image(jpg_path: str | Path) -> str | None:
@@ -1637,7 +1657,11 @@ def run_parallel_delivery_phase(
             if enhance_future is not None:
                 high_path, enhanced = enhance_future.result()
         else:
-            _log(f"  [第二階段] 下載 {len(segments)} 個高畫質切塊")
+            download_workers = segment_download_workers()
+            _log(
+                f"  [第二階段] 下載 {len(segments)} 個高畫質切塊"
+                f"（並行請求={download_workers}；完成即補下一段）"
+            )
             progress = _SegmentProgress(
                 len(segments),
                 enhance_enabled=enable_enhance,
@@ -1698,23 +1722,41 @@ def run_parallel_delivery_phase(
                 "SEGMENT_DOWNLOAD_ATTEMPTS",
                 SEGMENT_DOWNLOAD_ATTEMPTS,
             )
-            for index, (start, end) in enumerate(segments):
-                part = work_dir / f"{video_stem}.seg{index:03d}.mp4"
-                if part.exists() and has_video_stream(part) is True:
-                    queue_enhance(index, part)
-                    continue
-                error = try_download(
-                    index,
-                    part,
-                    start,
-                    end,
-                    normal_attempts,
-                )
-                if error is None:
-                    queue_enhance(index, part)
-                else:
-                    failed_downloads.append((index, part, start, end, error))
-                    progress.update(pending_failures=1)
+            queued_downloads: dict[
+                Future[Exception | None], tuple[int, Path, float, float]
+            ] = {}
+            # ThreadPoolExecutor 會固定保留 download_workers 個進行中請求；任何
+            # 一段完成時會自動取出下一段，無須猜測連線／啟動延遲再人工等待。
+            with ThreadPoolExecutor(
+                max_workers=download_workers,
+                thread_name_prefix="high-range",
+            ) as downloader:
+                for index, (start, end) in enumerate(segments):
+                    part = work_dir / f"{video_stem}.seg{index:03d}.mp4"
+                    if part.exists() and has_video_stream(part) is True:
+                        queue_enhance(index, part)
+                        continue
+                    future = downloader.submit(
+                        try_download,
+                        index,
+                        part,
+                        start,
+                        end,
+                        normal_attempts,
+                    )
+                    queued_downloads[future] = (index, part, start, end)
+
+                for future in as_completed(queued_downloads):
+                    index, part, start, end = queued_downloads[future]
+                    try:
+                        error = future.result()
+                    except Exception as exc:  # 防禦：工作執行緒不可中斷整批下載。
+                        error = exc
+                    if error is None:
+                        queue_enhance(index, part)
+                    else:
+                        failed_downloads.append((index, part, start, end, error))
+                        progress.update(pending_failures=1)
 
             recovery_attempts = _positive_int_env(
                 "SEGMENT_RECOVERY_ATTEMPTS",
@@ -1723,6 +1765,11 @@ def run_parallel_delivery_phase(
             still_failed: list[
                 tuple[int, Path, float, float, Exception]
             ] = []
+            if failed_downloads:
+                _log(
+                    f"\n  [第二階段] {len(failed_downloads)} 段並行下載失敗，"
+                    "改為單線補下載"
+                )
             for index, part, start, end, previous_error in failed_downloads:
                 progress.update(retries=1)
                 error = try_download(
