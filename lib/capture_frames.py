@@ -468,8 +468,8 @@ def process_single_video(video_url, args, tagger, index=1, total=1):
 
     general_count = sum(rating.strip().lower() == "general" for _, rating, _ in tag_results)
     smile_count = sum(score >= args.smile_min_confidence for _, _, score in tag_results)
-    print(f"[TAGGER] 最可能 RATING=general：{general_count} 張（需少於 {args.max_general_count + 1} 張）；smile：{smile_count} 張（需至少 {args.min_smile_count} 張）。")
-    if general_count > args.max_general_count or smile_count < args.min_smile_count:
+    print(f"[TAGGER] 最可能 RATING=general：{general_count} 張（需少於 {args.max_general_count + 1} 張）；smile：{smile_count} 張（需介於 {args.min_smile_count}～{args.max_smile_count} 張）。")
+    if general_count > args.max_general_count or not args.min_smile_count <= smile_count <= args.max_smile_count:
         print(f"[SKIP] 宮格統計條件未通過，整個 {args.grid_size}x{args.grid_size} 宮格不儲存。")
         shutil.rmtree(temp_dir, ignore_errors=True)
         return False
@@ -507,7 +507,8 @@ def main():
     parser.add_argument("-m", "--max-videos", type=int, default=0, help="最多處理的影片數量 (預設: 0 代表無限制，全數處理)")
     parser.add_argument("--grid-size", type=int, default=5, choices=(5,), help="宮格邊長（固定 5，合計 25 張）")
     parser.add_argument("--max-general-count", type=int, default=4, help="最可能 RATING=general 的最多張數（預設 4）")
-    parser.add_argument("--min-smile-count", type=int, default=5, help="smile TAG 的最少張數（預設 5）")
+    parser.add_argument("--min-smile-count", type=int, default=2, help="smile TAG 的最少張數（預設 2）")
+    parser.add_argument("--max-smile-count", type=int, default=8, help="smile TAG 的最多張數（預設 8）")
     parser.add_argument("--smile-min-confidence", type=float, default=0.25, help="smile TAG 信心值門檻（0~1，預設 0.25，與 Trainer GENERAL 門檻相同）")
     parser.add_argument("--tagger-repo", default=DEFAULT_REPO_ID, help="Hugging Face TAGGER repo")
     parser.add_argument("--tagger-batch-size", type=int, default=5, choices=(5,), help="TAGGER GPU 批次大小（固定 5）")
