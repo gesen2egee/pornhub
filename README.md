@@ -111,6 +111,7 @@ output/01_preview_images/
 將素材放入對應目錄：
 
 - `output/02_preview_videos/`：九宮格**或含 URL 的影片** → 每次下載 **3 分鐘低畫質**並以 **MOSS** 辨識；累計對話未達 30 秒就續抓下一段，影片結束仍不足則保留完整影片。達門檻後依字幕剪片、自動判斷 **enhance**，輸出軟 SRT。
+- `output/02_shorts/`：若影片已有內嵌翻譯字幕，會依 `preview_trimmed_segments`／`trimmed_segments` 將剪輯後字幕反向映射回原片時間，再下載來源最高畫質片段；只有 URL 時則先分析前 9 分鐘 240P。
 - `output/03_videos/`：九宮格**或含 URL 的影片** → **480P**，**MOSS** 字幕並據此剪片（對白淨長 >30s），高畫質切塊下載完成就排入自動 **enhance**，輸出同名軟 SRT。
 - `output/05_chosen/`：九宮格**或含 URL 的影片**（影片只作 URL 載體）→ **1080P + MOSS + Grok 4.5（minimal）**，**判斷 enhance**；先用低畫質分析，再只下載需要的高畫質區段，完成進 `06_good`；九宮格歸檔 `04_downloaded`，來源影片刪除。
 

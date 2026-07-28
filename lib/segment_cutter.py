@@ -187,6 +187,49 @@ def retime_subtitles(entries: list[dict], video_segments: list[tuple[float, floa
     return new_entries
 
 
+def restore_subtitles_to_source_timeline(
+    entries: list[dict],
+    video_segments: list[tuple[float, float]],
+) -> list[dict]:
+    """把剪輯後的相對字幕時間反向映射回來源影片的絕對時間。"""
+    restored = []
+    current_new_time = 0.0
+    timeline = []
+    for src_start, src_end in video_segments:
+        duration = float(src_end) - float(src_start)
+        if duration <= 0:
+            continue
+        timeline.append(
+            {
+                "src_start": float(src_start),
+                "new_start": current_new_time,
+                "new_end": current_new_time + duration,
+            }
+        )
+        current_new_time += duration
+
+    for entry in entries:
+        cap_start = float(entry["start"])
+        cap_end = float(entry["end"])
+        for segment in timeline:
+            overlap_start = max(cap_start, segment["new_start"])
+            overlap_end = min(cap_end, segment["new_end"])
+            if overlap_end <= overlap_start:
+                continue
+            restored.append(
+                {
+                    "start": segment["src_start"]
+                    + overlap_start
+                    - segment["new_start"],
+                    "end": segment["src_start"]
+                    + overlap_end
+                    - segment["new_start"],
+                    "text": entry["text"],
+                }
+            )
+    return restored
+
+
 def write_srt_file(entries: list[dict], out_srt_path: str | Path) -> None:
     out_srt_path = Path(out_srt_path)
     out_srt_path.parent.mkdir(parents=True, exist_ok=True)

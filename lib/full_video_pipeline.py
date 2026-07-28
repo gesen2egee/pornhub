@@ -236,6 +236,48 @@ def load_embedded_translation(
         return None
     original = source_meta.get("original_srt") or ""
     web_meta = source_meta.get("web_meta") or {}
+    raw_segments = (
+        web_meta.get("preview_trimmed_segments")
+        or web_meta.get("trimmed_segments")
+        or []
+    )
+    source_segments: list[tuple[float, float]] = []
+    try:
+        source_segments = [
+            (float(item[0]), float(item[1]))
+            for item in raw_segments
+            if isinstance(item, (list, tuple))
+            and len(item) == 2
+            and float(item[1]) > float(item[0])
+        ]
+    except (TypeError, ValueError):
+        source_segments = []
+
+    timeline_restored = False
+    if source_segments:
+        translated_entries = srt_text_to_entries(translated)
+        trimmed_duration = sum(end - start for start, end in source_segments)
+        latest_subtitle_end = max(
+            (entry["end"] for entry in translated_entries),
+            default=0.0,
+        )
+        # 只有字幕仍落在剪輯後總長內，才視為相對時間並反向映射。
+        if translated_entries and latest_subtitle_end <= trimmed_duration + 1.0:
+            translated = _entries_to_srt(
+                segment_cutter.restore_subtitles_to_source_timeline(
+                    translated_entries,
+                    source_segments,
+                )
+            )
+            if original.strip():
+                original = _entries_to_srt(
+                    segment_cutter.restore_subtitles_to_source_timeline(
+                        srt_text_to_entries(original),
+                        source_segments,
+                    )
+                )
+            timeline_restored = True
+
     duration = float(web_meta.get("duration") or 0.0)
     if duration <= 0:
         duration = remote_duration(video_url) or 0.0
@@ -247,6 +289,7 @@ def load_embedded_translation(
         "cues": [],
         "source_duration": duration,
         "embedded_translation_reused": True,
+        "embedded_timeline_restored": timeline_restored,
     }
 
 
@@ -1859,6 +1902,8 @@ def process_full_video_from_grid(
                 encoding="utf-8",
             )
             _log("  [Shorts] 已有內嵌翻譯字幕，直接重用時間軸")
+            if asr.get("embedded_timeline_restored"):
+                _log("  [Shorts] 已將剪輯後字幕反向映射回原片絕對時間")
         elif reuse_asr and asr_cache.is_file():
             try:
                 asr = json.loads(asr_cache.read_text(encoding="utf-8"))
