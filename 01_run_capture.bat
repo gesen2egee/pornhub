@@ -29,23 +29,7 @@ set "PAGES=1"
 set /p "PAGES=Enter number of pages (Enter for 1): "
 if "!PAGES!"=="" set "PAGES=1"
 
-set "RATING=general"
-set /p "RATING=Required RATING (Enter for general): "
-if "!RATING!"=="" set "RATING=general"
-
-set "RATING_CONF=50"
-set /p "RATING_CONF=Minimum RATING confidence %% (Enter for 50): "
-if "!RATING_CONF!"=="" set "RATING_CONF=50"
-
-set "REQUIRED_TAG=smile"
-set /p "REQUIRED_TAG=Required TAG (Enter for smile): "
-if "!REQUIRED_TAG!"=="" set "REQUIRED_TAG=smile"
-
-set "TAG_CONF=50"
-set /p "TAG_CONF=Minimum TAG confidence %% (Enter for 50): "
-if "!TAG_CONF!"=="" set "TAG_CONF=50"
-
-"%PYTHON%" "%SCRIPT%" "!URL!" -p !PAGES! -q 480p --rating "!RATING!" --rating-min-confidence !RATING_CONF!e-2 --required-tag "!REQUIRED_TAG!" --tag-min-confidence !TAG_CONF!e-2
+"%PYTHON%" "%SCRIPT%" "!URL!" -p !PAGES! -q 480p
 if errorlevel 1 (
     set "CAPTURE_EXIT=!ERRORLEVEL!"
     echo [ERROR] Capture failed with exit code !CAPTURE_EXIT!.

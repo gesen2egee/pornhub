@@ -361,18 +361,12 @@ def create_grid_image(image_data_list, title, duration, video_url, stream_url, d
     log_event(succ_log_text, output_dir=output_root)
     return True
 
-def frames_match_filters(image_paths, tagger, args):
-    """以 batch size 5 在同一個 GPU ONNX Session 判斷完成的畫面。"""
+def summarize_tag_batch(image_paths, tagger):
+    """以 batch size 5 取得每張畫面最可能的 RATING 與 smile 信心值。"""
     results = []
     for image_path, tags in zip(image_paths, tagger.predict_many(image_paths)):
-        rating_score = score_for(tags["rating"], args.rating)
-        tag_score = score_for(tags["general"], args.required_tag)
-        results.append((
-            image_path,
-            rating_score >= args.rating_min_confidence and tag_score >= args.tag_min_confidence,
-            rating_score,
-            tag_score,
-        ))
+        top_rating = max(tags["rating"].items(), key=lambda item: item[1])[0] if tags["rating"] else ""
+        results.append((image_path, top_rating, score_for(tags["general"], "smile")))
     return results
 
 
@@ -442,7 +436,7 @@ def process_single_video(video_url, args, tagger, index=1, total=1):
                         batch = pending_tag_images
                         pending_tag_images = []
                         tag_futures.append((batch, tag_executor.submit(
-                            frames_match_filters, [path for _, path in batch], tagger, args
+                            summarize_tag_batch, [path for _, path in batch], tagger
                         )))
                         print(f"  [OK] 已累積 5 張，送入 GPU TAGGER 批次判斷。")
                     else:
@@ -452,24 +446,31 @@ def process_single_video(video_url, args, tagger, index=1, total=1):
 
             if pending_tag_images:
                 tag_futures.append((pending_tag_images, tag_executor.submit(
-                    frames_match_filters, [path for _, path in pending_tag_images], tagger, args
+                    summarize_tag_batch, [path for _, path in pending_tag_images], tagger
                 )))
-            rejected = []
+            tag_results = []
+            tag_errors = []
             for batch, future in tag_futures:
                 try:
                     results = future.result()
                 except Exception as exc:
-                    rejected.extend((timestamp, f"TAGGER 錯誤: {exc}") for timestamp, _ in batch)
+                    tag_errors.extend((timestamp, f"TAGGER 錯誤: {exc}") for timestamp, _ in batch)
                     continue
                 timestamps_by_path = {path: timestamp for timestamp, path in batch}
-                for path, passed, rating_score, tag_score in results:
-                    if not passed:
-                        rejected.append((timestamps_by_path[path], f"rating {args.rating}={rating_score:.3f}, tag {args.required_tag}={tag_score:.3f}"))
+                tag_results.extend((timestamps_by_path[path], rating, smile_score) for path, rating, smile_score in results)
 
-    if rejected:
-        print(f"[SKIP] 25 張中有 {len(rejected)} 張未通過 TAGGER，整個 {args.grid_size}x{args.grid_size} 宮格不儲存。")
-        for timestamp, reason in rejected:
+    if tag_errors:
+        print(f"[SKIP] TAGGER 有 {len(tag_errors)} 張錯誤，整個 {args.grid_size}x{args.grid_size} 宮格不儲存。")
+        for timestamp, reason in tag_errors:
             print(f"  [FILTER] {format_time(timestamp)}：{reason}")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return False
+
+    general_count = sum(rating.strip().lower() == "general" for _, rating, _ in tag_results)
+    smile_count = sum(score >= args.smile_min_confidence for _, _, score in tag_results)
+    print(f"[TAGGER] 最可能 RATING=general：{general_count} 張（需少於 {args.max_general_count + 1} 張）；smile：{smile_count} 張（需至少 {args.min_smile_count} 張）。")
+    if general_count > args.max_general_count or smile_count < args.min_smile_count:
+        print(f"[SKIP] 宮格統計條件未通過，整個 {args.grid_size}x{args.grid_size} 宮格不儲存。")
         shutil.rmtree(temp_dir, ignore_errors=True)
         return False
 
@@ -505,10 +506,9 @@ def main():
     parser.add_argument("-w", "--workers", type=int, default=25, help="每部影片並行截圖線程數（預設 25）")
     parser.add_argument("-m", "--max-videos", type=int, default=0, help="最多處理的影片數量 (預設: 0 代表無限制，全數處理)")
     parser.add_argument("--grid-size", type=int, default=5, choices=(5,), help="宮格邊長（固定 5，合計 25 張）")
-    parser.add_argument("--rating", default="general", help="必須符合的 RATING（預設 general）")
-    parser.add_argument("--rating-min-confidence", type=float, default=0.5, help="RATING 最低信心值（0~1，預設 0.5）")
-    parser.add_argument("--required-tag", default="smile", help="必須包含的 GENERAL TAG（預設 smile）")
-    parser.add_argument("--tag-min-confidence", type=float, default=0.5, help="TAG 最低信心值（0~1，預設 0.5）")
+    parser.add_argument("--max-general-count", type=int, default=4, help="最可能 RATING=general 的最多張數（預設 4）")
+    parser.add_argument("--min-smile-count", type=int, default=5, help="smile TAG 的最少張數（預設 5）")
+    parser.add_argument("--smile-min-confidence", type=float, default=0.5, help="smile TAG 信心值門檻（0~1，預設 0.5）")
     parser.add_argument("--tagger-repo", default=DEFAULT_REPO_ID, help="Hugging Face TAGGER repo")
     parser.add_argument("--tagger-batch-size", type=int, default=5, choices=(5,), help="TAGGER GPU 批次大小（固定 5）")
     
