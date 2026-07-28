@@ -19,7 +19,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext, redirect_stdout
 from pathlib import Path
 from queue import Empty, Queue
-from threading import Lock, Thread
+from threading import BoundedSemaphore, Lock, Thread
 from typing import Any, Iterator
 
 import segment_cutter
@@ -107,6 +107,11 @@ SEGMENT_RECOVERY_ATTEMPTS = 1
 # 造成空槽；上限固定為三條，降低來源站點限流的機率。
 SEGMENT_DOWNLOAD_WORKERS = 3
 ASR_STREAM_CHUNK_SECONDS = 180.0
+
+# 多支來源管線可同時進入高畫質階段；此鎖使三條限制套用到整個程序，
+# 而非每支影片各自三條而意外放大成六條以上。
+_SEGMENT_DOWNLOAD_SEMAPHORES: dict[int, BoundedSemaphore] = {}
+_SEGMENT_DOWNLOAD_SEMAPHORE_LOCK = Lock()
 
 # 由外部 benchmark 注入 PipelineMetrics；未注入則不計時
 _ACTIVE_METRICS: Any | None = None
@@ -216,6 +221,18 @@ def segment_download_workers(
     except (TypeError, ValueError):
         requested = SEGMENT_DOWNLOAD_WORKERS
     return min(SEGMENT_DOWNLOAD_WORKERS, max(1, requested))
+
+
+@contextmanager
+def segment_download_slot(workers: int) -> Iterator[None]:
+    """取得全管線共用的高畫質切塊下載槽位。"""
+    with _SEGMENT_DOWNLOAD_SEMAPHORE_LOCK:
+        semaphore = _SEGMENT_DOWNLOAD_SEMAPHORES.setdefault(
+            workers,
+            BoundedSemaphore(workers),
+        )
+    with semaphore:
+        yield
 
 
 def get_video_url_from_image(jpg_path: str | Path) -> str | None:
@@ -1722,6 +1739,22 @@ def run_parallel_delivery_phase(
                 "SEGMENT_DOWNLOAD_ATTEMPTS",
                 SEGMENT_DOWNLOAD_ATTEMPTS,
             )
+
+            def download_in_slot(
+                index: int,
+                part: Path,
+                start: float,
+                end: float,
+            ) -> Exception | None:
+                with segment_download_slot(download_workers):
+                    return try_download(
+                        index,
+                        part,
+                        start,
+                        end,
+                        normal_attempts,
+                    )
+
             queued_downloads: dict[
                 Future[Exception | None], tuple[int, Path, float, float]
             ] = {}
@@ -1737,12 +1770,11 @@ def run_parallel_delivery_phase(
                         queue_enhance(index, part)
                         continue
                     future = downloader.submit(
-                        try_download,
+                        download_in_slot,
                         index,
                         part,
                         start,
                         end,
-                        normal_attempts,
                     )
                     queued_downloads[future] = (index, part, start, end)
 
