@@ -89,7 +89,7 @@ STAGES = {
         "第三層：Video",
         VIDEOS_DIR,
         "$$ 中預算",
-        "240P/MOSS 串流→Grok 30秒三段→內縮高畫質切塊、音訊判斷 enhance＋crossfade",
+        "240P/MOSS 串流→Grok 30秒三段→關鍵格安全高畫質切塊、音訊判斷 enhance＋crossfade",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
     "shorts": StageDefinition(
@@ -105,7 +105,7 @@ STAGES = {
         "第四層：Chosen",
         CHOSEN_DIR,
         "$$$ 高預算",
-        "240P/MOSS 串流→Grok 30秒三段→內縮 1080P 切塊、音訊判斷 enhance＋crossfade",
+        "240P/MOSS 串流→Grok 30秒三段→關鍵格安全 1080P 切塊、音訊判斷 enhance＋crossfade",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
 }

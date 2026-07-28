@@ -56,7 +56,6 @@ DIALOGUE_TRIM_THRESHOLD = 30.0
 SEGMENT_GAP = 1.5
 # 可選的前後延伸秒數；所有流程預設關閉，明確開啟才使用 0.75s
 SEGMENT_EDGE_PADDING = 0.75
-THREE_PHASE_INNER_TRIM = 0.1
 THREE_PHASE_CROSSFADE = 0.08
 
 
@@ -86,26 +85,12 @@ def three_phase_selection_enabled(
     return value not in {"0", "false", "no", "off"}
 
 
-def inset_segments(
-    segments: list[tuple[float, float]],
-    seconds: float = THREE_PHASE_INNER_TRIM,
-) -> list[tuple[float, float]]:
-    """每個保留段前後內縮，過短段保留最小安全長度避免丟失字幕。"""
-    result: list[tuple[float, float]] = []
-    for start, end in segments:
-        inner_start, inner_end = start + seconds, end - seconds
-        if inner_end - inner_start <= THREE_PHASE_CROSSFADE:
-            _log(f"  [內縮] 區段過短，保留原始範圍：{start:.2f}–{end:.2f}s")
-            result.append((start, end))
-        else:
-            result.append((inner_start, inner_end))
-    return result
 DOWNLOAD_SOCKET_TIMEOUT = 30
 DOWNLOAD_RETRIES = 3
 SEGMENT_DOWNLOAD_ATTEMPTS = 2
 SEGMENT_RECOVERY_ATTEMPTS = 1
-# 高畫質切塊採五條分開請求；每條相隔一秒啟動，避免同時衝擊來源站點。
-SEGMENT_DOWNLOAD_WORKERS = 5
+# 高畫質切塊採八條分開請求；每條相隔一秒啟動，避免同時衝擊來源站點。
+SEGMENT_DOWNLOAD_WORKERS = 8
 SEGMENT_DOWNLOAD_START_INTERVAL_SECONDS = 1.0
 # 先多抓來源關鍵影格之前的內容，再在本機精確重編碼。這讓成品每段的第一格
 # 都是新關鍵影格，而不依賴遠端 Range 恰好落在來源的 I-frame。
@@ -114,8 +99,8 @@ HIGH_RANGE_KEYFRAME_POSTROLL_SECONDS = 1.0
 HIGH_RANGE_CONCURRENT_FRAGMENTS = 1
 ASR_STREAM_CHUNK_SECONDS = 180.0
 
-# 多支來源管線可同時進入高畫質階段；此鎖使五條限制套用到整個程序，
-# 而非每支影片各自五條而意外放大。
+# 多支來源管線可同時進入高畫質階段；此鎖使八條限制套用到整個程序，
+# 而非每支影片各自八條而意外放大。
 _SEGMENT_DOWNLOAD_SEMAPHORES: dict[int, BoundedSemaphore] = {}
 _SEGMENT_DOWNLOAD_SEMAPHORE_LOCK = Lock()
 _SEGMENT_DOWNLOAD_START_LOCK = Lock()
@@ -217,7 +202,7 @@ def _positive_int_env(name: str, default: int) -> int:
 def segment_download_workers(
     environment: dict[str, str] | None = None,
 ) -> int:
-    """回傳高畫質切塊的同時下載請求數（預設五條、最多五條）。"""
+    """回傳高畫質切塊的同時下載請求數（預設八條、最多八條）。"""
     environment = os.environ if environment is None else environment
     try:
         requested = int(
@@ -728,7 +713,7 @@ def download_high_range(
         yield {"start_time": source_start, "end_time": source_end}
 
     fmt, fsort, concurrent = _high_format_opts()
-    # 五條範圍請求已提供網路平行度，避免每條再開多個 fragment 造成限流。
+    # 八條範圍請求已提供網路平行度，避免每條再開多個 fragment 造成限流。
     concurrent = _positive_int_env(
         "HIGH_RANGE_CONCURRENT_FRAGMENTS",
         HIGH_RANGE_CONCURRENT_FRAGMENTS,
@@ -2356,7 +2341,7 @@ def process_full_video_from_grid(
             else:
                 _log(
                     "  [三段精選] 等完整 240P/MOSS 後送 GROK："
-                    "30 秒 N 三段、內縮 0.1 秒…"
+                    "30 秒 N 三段、保留完整選段…"
                     if enable_three_phase_selection
                     else "  [精選下載] 先劇情整理 + 選擇性翻譯（歌詞則完整翻譯）…"
                 )
@@ -2446,8 +2431,6 @@ def process_full_video_from_grid(
                 max_dur=duration if duration > 0 else 99999.0,
                 edge_padding=edge_pad,
             )
-            if enable_three_phase_selection:
-                segments = inset_segments(segments)
             trimmed = sum(e - s for s, e in segments)
             _log(
                 f"  [分段] 停頓≥{segment_gap}s 剪掉；"
@@ -2459,7 +2442,7 @@ def process_full_video_from_grid(
             )
             if enable_three_phase_selection:
                 _log(
-                    f"  [三段精選] 每段內縮 {THREE_PHASE_INNER_TRIM:.1f}s；"
+                    "  [三段精選] 保留選段完整起訖；"
                     f"影音 crossfade {THREE_PHASE_CROSSFADE:.2f}s"
                 )
             for i, (s, e) in enumerate(segments, 1):
