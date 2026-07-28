@@ -11,6 +11,7 @@ import shutil
 import datetime
 import video_meta
 import sites
+from multilabel_tagger import DEFAULT_REPO_ID, MobileNetV4Tagger, score_for
 from project_paths import PREVIEW_IMAGES_DIR, TEMP_DIR
 from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageStat
 
@@ -69,8 +70,8 @@ def format_time(seconds):
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
 
-def calculate_9_timestamps(duration):
-    """避開開頭前導 (8%/15s) 與片尾 (5%)，全片中後段均勻等分選取 9 個時間點"""
+def calculate_grid_timestamps(duration, grid_size):
+    """避開片頭與片尾，在影片中後段均勻選取指定宮格的時間點。"""
     duration = float(duration)
     if duration <= 30:
         start = max(1.0, duration * 0.1)
@@ -79,8 +80,9 @@ def calculate_9_timestamps(duration):
         start = max(15.0, duration * 0.08)
         end = duration * 0.95
         
-    step = (end - start) / 8.0
-    timestamps = [start + i * step for i in range(9)]
+    count = grid_size * grid_size
+    step = (end - start) / max(1, count - 1)
+    timestamps = [start + i * step for i in range(count)]
     return [int(ts) for ts in timestamps]
 
 def build_page_url(url, page_num):
@@ -235,13 +237,14 @@ def check_images_has_duplicates(pil_images, threshold=2.5):
                 
     return False, -1, -1, 0, 0, 0.0
 
-def create_3x3_grid_image(image_data_list, title, duration, video_url, stream_url, diag_info, output_file, output_root=DEFAULT_PREVIEW_OUTPUT, web_meta=None):
+def create_grid_image(image_data_list, title, duration, video_url, stream_url, diag_info, output_file, grid_size, output_root=DEFAULT_PREVIEW_OUTPUT, web_meta=None):
     """
-    將 9 張截圖圖片合成為 3x3 九宮格圖片，並標註時間標籤（超大綠色標籤 + 3px 黑色邊框、右上角）
+    將指定數量截圖合成宮格圖片，並標註時間標籤。
     """
     valid_images = [(ts, p) for ts, p in image_data_list if os.path.exists(p)]
-    if len(valid_images) < 9:
-        msg = f"[FAIL] 圖片擷取不足 9 張 (成功: {len(valid_images)} 張) - 影片: {title} ({video_url})"
+    expected_count = grid_size * grid_size
+    if len(valid_images) < expected_count:
+        msg = f"[FAIL] 圖片擷取不足 {expected_count} 張 (成功: {len(valid_images)} 張) - 影片: {title} ({video_url})"
         print(f"\n[!] {msg}")
         log_event(msg, output_dir=output_root)
         return False
@@ -284,8 +287,8 @@ def create_3x3_grid_image(image_data_list, title, duration, video_url, stream_ur
     header_h = 70
     bg_color = (20, 20, 20)
 
-    canvas_w = 3 * w + 4 * padding
-    canvas_h = 3 * h + 4 * padding + header_h
+    canvas_w = grid_size * w + (grid_size + 1) * padding
+    canvas_h = grid_size * h + (grid_size + 1) * padding + header_h
 
     grid_img = Image.new("RGB", (canvas_w, canvas_h), color=bg_color)
     draw = ImageDraw.Draw(grid_img)
@@ -302,7 +305,7 @@ def create_3x3_grid_image(image_data_list, title, duration, video_url, stream_ur
     display_title = title if len(title) <= 60 else title[:57] + "..."
     dur_str = format_time(duration)
     header_text = f"Title: {display_title}"
-    info_text = f"Duration: {dur_str} | 3x3 Preview Sheet"
+    info_text = f"Duration: {dur_str} | {grid_size}x{grid_size} Preview Sheet"
 
     draw.text((padding + 5, 12), header_text, fill=(255, 204, 0), font=title_font)
     draw.text((padding + 5, 42), info_text, fill=(180, 180, 180), font=sub_font)
@@ -312,9 +315,9 @@ def create_3x3_grid_image(image_data_list, title, duration, video_url, stream_ur
     stroke_color = (0, 0, 0)
     stroke_width = 3
 
-    for idx, (ts, img) in enumerate(pil_images[:9]):
-        row = idx // 3
-        col = idx % 3
+    for idx, (ts, img) in enumerate(pil_images[:expected_count]):
+        row = idx // grid_size
+        col = idx % grid_size
         x = padding + col * (w + padding)
         y = header_h + padding + row * (h + padding)
 
@@ -347,19 +350,32 @@ def create_3x3_grid_image(image_data_list, title, duration, video_url, stream_ur
         video_meta.write_grid_jpg_web_meta(output_file, web_meta, url=video_url)
 
     succ_log_text = (
-        f"[SUCCESS] 3x3 九宮格圖片生成成功\n"
+        f"[SUCCESS] {grid_size}x{grid_size} 宮格圖片生成成功\n"
         f"  - 影片標題: {title}\n"
         f"  - 影片長度: {dur_str}\n"
         f"  - 影片網址: {video_url}\n"
         f"  - 串流診斷: Format ID: [{diag_info.get('format_id')}] | Protocol: [{diag_info.get('protocol')}] | Res: [{diag_info.get('resolution')}]\n"
         f"  - 輸出檔案: {output_file}\n"
-        f"  - 9張時間點: {', '.join([format_time(ts) for ts, _ in pil_images[:9]])}"
+        f"  - {expected_count}張時間點: {', '.join([format_time(ts) for ts, _ in pil_images[:expected_count]])}"
     )
     log_event(succ_log_text, output_dir=output_root)
     return True
 
-def process_single_video(video_url, args, index=1, total=1):
-    """處理單一影片的中間 9 張九宮格截圖作業 (檔名帶 4 位數順序編號 0001-)"""
+def frame_matches_filters(image_path, tagger, args):
+    """在同一個 GPU ONNX Session 內判斷單張畫面是否符合篩選條件。"""
+    tags = tagger.predict(image_path)
+    rating_score = score_for(tags["rating"], args.rating)
+    tag_score = score_for(tags["general"], args.required_tag)
+    return (
+        rating_score >= args.rating_min_confidence
+        and tag_score >= args.tag_min_confidence,
+        rating_score,
+        tag_score,
+    )
+
+
+def process_single_video(video_url, args, tagger, index=1, total=1):
+    """下載 25 張畫面，同時 TAGGER 篩選；全部通過才輸出 5x5 宮格。"""
     print(f"\n==================================================")
     print(f"[{index}/{total}] 開始處理影片: {video_url}")
     print(f"==================================================")
@@ -393,44 +409,65 @@ def process_single_video(video_url, args, index=1, total=1):
     temp_dir = os.path.join(str(TEMP_DIR), f".temp_{safe_title}")
     os.makedirs(temp_dir, exist_ok=True)
 
-    timestamps = calculate_9_timestamps(duration)
+    timestamps = calculate_grid_timestamps(duration, args.grid_size)
+    expected_count = args.grid_size * args.grid_size
     
     print(f"[+] 影片標題: {title}")
     print(f"[+] 影片長度: {duration} 秒 ({format_time(duration)})")
     print(f"[+] 串流格式: Format ID: [{diag_info['format_id']}] | Protocol: [{diag_info['protocol']}] | Res: [{diag_info['resolution']}]")
-    print(f"[+] 避開片頭全片平均選取 9 個時間點: {[format_time(t) for t in timestamps]}")
-    print(f"[+] 開始 9 線程極速同步擷取畫面 (線程數: {args.workers}) ...")
+    print(f"[+] 避開片頭全片平均選取 {expected_count} 個時間點: {[format_time(t) for t in timestamps]}")
+    print(f"[+] 開始 {args.workers} 線程同步擷取；TAGGER 會在每張完成後立即以 GPU 判斷 ...")
 
     captured_image_data = []
+    tag_futures = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {}
-        for idx, ts in enumerate(timestamps):
-            temp_file_name = f"frame_{idx+1:02d}_{ts}s.jpg"
-            temp_file_path = os.path.join(temp_dir, temp_file_name)
-            future = executor.submit(capture_single_frame, ts, stream_url, http_headers, temp_file_path)
-            futures[future] = (ts, temp_file_path)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as tag_executor:
+            for idx, ts in enumerate(timestamps):
+                temp_file_name = f"frame_{idx+1:02d}_{ts}s.jpg"
+                temp_file_path = os.path.join(temp_dir, temp_file_name)
+                future = executor.submit(capture_single_frame, ts, stream_url, http_headers, temp_file_path)
+                futures[future] = (ts, temp_file_path)
 
-        for future in concurrent.futures.as_completed(futures):
-            ts, file_path = futures[future]
-            success, timestamp, res = future.result()
-            if success:
-                captured_image_data.append((timestamp, file_path))
-                print(f"  [OK] 畫面擷取成功: {format_time(timestamp)}")
-            else:
-                print(f"  [FAIL] 畫面擷取失敗: {format_time(timestamp)} - 錯誤: {res.strip()}")
+            for future in concurrent.futures.as_completed(futures):
+                ts, file_path = futures[future]
+                success, timestamp, res = future.result()
+                if success:
+                    captured_image_data.append((timestamp, file_path))
+                    tag_futures.append((timestamp, tag_executor.submit(frame_matches_filters, file_path, tagger, args)))
+                    print(f"  [OK] 畫面擷取成功，已送入 GPU TAGGER: {format_time(timestamp)}")
+                else:
+                    print(f"  [FAIL] 畫面擷取失敗: {format_time(timestamp)} - 錯誤: {res.strip()}")
+
+            rejected = []
+            for timestamp, future in tag_futures:
+                try:
+                    passed, rating_score, tag_score = future.result()
+                except Exception as exc:
+                    rejected.append((timestamp, f"TAGGER 錯誤: {exc}"))
+                    continue
+                if not passed:
+                    rejected.append((timestamp, f"rating {args.rating}={rating_score:.3f}, tag {args.required_tag}={tag_score:.3f}"))
+
+    if rejected:
+        print(f"[SKIP] 25 張中有 {len(rejected)} 張未通過 TAGGER，整個 {args.grid_size}x{args.grid_size} 宮格不儲存。")
+        for timestamp, reason in rejected:
+            print(f"  [FILTER] {format_time(timestamp)}：{reason}")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return False
 
     captured_image_data.sort(key=lambda x: x[0])
 
-    print(f"\n[*] 正在進行重複圖片檢測與 3x3 九宮格合成 ...")
-    success = create_3x3_grid_image(
+    print(f"\n[*] 全部 {expected_count} 張通過，正在進行重複圖片檢測與 {args.grid_size}x{args.grid_size} 宮格合成 ...")
+    success = create_grid_image(
         captured_image_data, title, duration, video_url, stream_url, diag_info,
-        final_output_file, output_root=args.output, web_meta=info.get('web_meta')
+        final_output_file, args.grid_size, output_root=args.output, web_meta=info.get('web_meta')
     )
 
     shutil.rmtree(temp_dir, ignore_errors=True)
 
     if success:
-        print(f"[DONE] 成功產出 3x3 九宮格圖片！")
+        print(f"[DONE] 成功產出 {args.grid_size}x{args.grid_size} 宮格圖片！")
         print(f"[+] 檔案儲存路徑: {os.path.abspath(final_output_file)}")
         return True
     else:
@@ -438,7 +475,7 @@ def process_single_video(video_url, args, index=1, total=1):
         return False
 
 def main():
-    parser = argparse.ArgumentParser(description="影片 3x3 九宮格定時截圖工具 (9線程極速並行 & 多頁連續擷取)")
+    parser = argparse.ArgumentParser(description="影片 5x5 宮格定時截圖工具（下載時同步 GPU TAGGER 篩選）")
     parser.add_argument("target", nargs="?", default=EPORNER_DEFAULT_URL, help="影片網址、網站列表/分類/搜尋 URL、Eporner 關鍵字或包含網址的 txt 檔案路徑")
     parser.add_argument("-p", "--pages", type=int, default=1, help="連續擷取的頁數 (預設: 1 頁)")
     parser.add_argument("-q", "--quality", default="720p", help="畫質選擇 (預設: 720p, 可選 best, 1080p, 480p 等)")
@@ -448,8 +485,14 @@ def main():
         default=DEFAULT_PREVIEW_OUTPUT,
         help="輸出根目錄（預設：output/01_preview_images）",
     )
-    parser.add_argument("-w", "--workers", type=int, default=9, help="每部影片並行截圖線程數 (預設: 9 線程同步發起)")
+    parser.add_argument("-w", "--workers", type=int, default=25, help="每部影片並行截圖線程數（預設 25）")
     parser.add_argument("-m", "--max-videos", type=int, default=0, help="最多處理的影片數量 (預設: 0 代表無限制，全數處理)")
+    parser.add_argument("--grid-size", type=int, default=5, choices=(5,), help="宮格邊長（固定 5，合計 25 張）")
+    parser.add_argument("--rating", default="general", help="必須符合的 RATING（預設 general）")
+    parser.add_argument("--rating-min-confidence", type=float, default=0.5, help="RATING 最低信心值（0~1，預設 0.5）")
+    parser.add_argument("--required-tag", default="smile", help="必須包含的 GENERAL TAG（預設 smile）")
+    parser.add_argument("--tag-min-confidence", type=float, default=0.5, help="TAG 最低信心值（0~1，預設 0.5）")
+    parser.add_argument("--tagger-repo", default=DEFAULT_REPO_ID, help="Hugging Face TAGGER repo")
     
     args = parser.parse_args()
     
@@ -458,7 +501,7 @@ def main():
     # 自動產生時間 + 關鍵字/網址標籤 + 頁碼區間的子資料夾
     sub_output_dir = generate_output_folder_name(target_url, pages=args.pages, base_output_dir=args.output)
     args.output = sub_output_dir
-    print(f"[*] 九宮格截圖將儲存至專屬子目錄: {args.output}")
+    print(f"[*] 5x5 截圖將儲存至專屬子目錄: {args.output}")
     
     video_urls = extract_urls_from_target(target_url, pages=args.pages)
     
@@ -471,13 +514,15 @@ def main():
         video_urls = video_urls[:args.max_videos]
         
     total_videos = len(video_urls)
-    print(f"\n[START] 開始執行 3x3 九宮格批次作業 (9線程極速同時發起 | 連續 {args.pages} 頁)，共計 {total_videos} 部影片...")
+    print(f"\n[START] 載入 MobileNetV4 TAGGER 至 GPU，並執行 5x5（25 張）批次作業，共計 {total_videos} 部影片...")
+    tagger = MobileNetV4Tagger(args.tagger_repo)
+    tagger.preload()
     log_event(f"[BATCH START] 啟動批次作業，目標網址: {args.target}，頁數: {args.pages}，預計處理影片數: {total_videos}，輸出目錄: {args.output}", output_dir=args.output)
     
     completed_videos = 0
     skipped_videos = 0
     for idx, url in enumerate(video_urls, 1):
-        if process_single_video(url, args, index=idx, total=total_videos):
+        if process_single_video(url, args, tagger, index=idx, total=total_videos):
             completed_videos += 1
         else:
             skipped_videos += 1

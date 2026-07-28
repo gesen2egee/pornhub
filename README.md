@@ -8,7 +8,7 @@
 
 ```text
 00_setup_or_update.bat  建立／更新完整執行環境
-01_run_capture.bat      產生九宮格預覽圖
+01_run_capture.bat      產生 5×5 預覽圖並以 GPU TAGGER 篩選
 02_run_download.bat     下載影片並同步處理字幕
 03_open_muse.bat        開啟 Muse 圖形介面
 .gitignore
@@ -23,7 +23,7 @@ requirements.txt
 ```text
 output/
 ├── 00_temp/             下載、字幕與 FFmpeg 暫存
-├── 01_preview_images/   01_run_capture.bat 產生的九宮格
+├── 01_preview_images/   01_run_capture.bat 產生的 5×5 宮格
 ├── 02_preview_videos/   前 3 分鐘低畫質 → Whisper 語音剪片 + 軟 SRT，不硬字幕/不 enhance
 ├── 02_shorts/           內嵌翻譯時間軸直抓最高畫質片段；僅 URL 先分析前 9 分鐘 240P
 ├── 03_videos/           480P（對白>30s 剪片）+ 軟字幕，不 enhance
@@ -98,9 +98,9 @@ Muse 會在瀏覽器開啟 `http://127.0.0.1:8765/`，所有操作與偏好都�
 
 右上角可切換日／夜間與繁中／英文。縮圖模糊、隱私畫面（快捷鍵 `P`）和播放進度都只存在目前電腦。關閉 `03_open_muse.bat` 的命令視窗即可停止本機介面。
 
-### 1. 產生九宮格
+### 1. 產生 5×5 宮格
 
-雙擊 `01_run_capture.bat`，貼上影片、關鍵字或列表網址。輸出會放在：
+雙擊 `01_run_capture.bat`，貼上影片、關鍵字或列表網址。每支影片會同步抓取 25 張畫面；畫面一完成就由常駐 GPU 的 MobileNetV4 ONNX TAGGER 判斷。預設所有畫面都必須為 `RATING=general` 且含有 `TAG=smile`（信心值各至少 50%），否則整個 5×5 宮格不會儲存。批次檔可在執行時改寫這些條件。
 
 ```text
 output/01_preview_images/

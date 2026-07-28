@@ -97,7 +97,7 @@ if not exist "%PYTHON%" (
     echo [ERROR] Application environment is missing. Run 00_setup_or_update.bat first.
     exit /b 2
 )
-"%PYTHON%" -c "import yt_dlp, PIL, numpy, curl_cffi, mutagen, requests"
+"%PYTHON%" -c "import yt_dlp, PIL, numpy, curl_cffi, mutagen, requests, huggingface_hub, onnxruntime"
 if errorlevel 1 exit /b %ERRORLEVEL%
 "%MOSS_PYTHON%" -c "import demucs, mutagen, PIL, requests"
 if errorlevel 1 exit /b %ERRORLEVEL%

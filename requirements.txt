@@ -6,3 +6,5 @@ mutagen
 requests
 pytest
 faster-whisper
+huggingface-hub>=0.34
+onnxruntime-gpu==1.23.2
