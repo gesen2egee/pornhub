@@ -164,7 +164,7 @@ def extract_video_info(video_url, quality="720p"):
     }
 
 def capture_single_frame(timestamp, stream_url, http_headers, output_file):
-    """執行 ffmpeg 雙重 Seek 截取指定秒數的單張畫面"""
+    """執行 ffmpeg 雙重 Seek 截取指定秒數的單張畫面。"""
     os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
     
     is_local_file = os.path.exists(stream_url) or not (stream_url.startswith("http://") or stream_url.startswith("https://"))
@@ -361,17 +361,19 @@ def create_grid_image(image_data_list, title, duration, video_url, stream_url, d
     log_event(succ_log_text, output_dir=output_root)
     return True
 
-def frame_matches_filters(image_path, tagger, args):
-    """在同一個 GPU ONNX Session 內判斷單張畫面是否符合篩選條件。"""
-    tags = tagger.predict(image_path)
-    rating_score = score_for(tags["rating"], args.rating)
-    tag_score = score_for(tags["general"], args.required_tag)
-    return (
-        rating_score >= args.rating_min_confidence
-        and tag_score >= args.tag_min_confidence,
-        rating_score,
-        tag_score,
-    )
+def frames_match_filters(image_paths, tagger, args):
+    """以 batch size 5 在同一個 GPU ONNX Session 判斷完成的畫面。"""
+    results = []
+    for image_path, tags in zip(image_paths, tagger.predict_many(image_paths)):
+        rating_score = score_for(tags["rating"], args.rating)
+        tag_score = score_for(tags["general"], args.required_tag)
+        results.append((
+            image_path,
+            rating_score >= args.rating_min_confidence and tag_score >= args.tag_min_confidence,
+            rating_score,
+            tag_score,
+        ))
+    return results
 
 
 def process_single_video(video_url, args, tagger, index=1, total=1):
@@ -416,10 +418,11 @@ def process_single_video(video_url, args, tagger, index=1, total=1):
     print(f"[+] 影片長度: {duration} 秒 ({format_time(duration)})")
     print(f"[+] 串流格式: Format ID: [{diag_info['format_id']}] | Protocol: [{diag_info['protocol']}] | Res: [{diag_info['resolution']}]")
     print(f"[+] 避開片頭全片平均選取 {expected_count} 個時間點: {[format_time(t) for t in timestamps]}")
-    print(f"[+] 開始 {args.workers} 線程同步擷取；TAGGER 會在每張完成後立即以 GPU 判斷 ...")
+    print(f"[+] 開始 {args.workers} 線程同步擷取；TAGGER 每批 5 張立即以 GPU 判斷 ...")
 
     captured_image_data = []
     tag_futures = []
+    pending_tag_images = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as tag_executor:
@@ -434,20 +437,34 @@ def process_single_video(video_url, args, tagger, index=1, total=1):
                 success, timestamp, res = future.result()
                 if success:
                     captured_image_data.append((timestamp, file_path))
-                    tag_futures.append((timestamp, tag_executor.submit(frame_matches_filters, file_path, tagger, args)))
-                    print(f"  [OK] 畫面擷取成功，已送入 GPU TAGGER: {format_time(timestamp)}")
+                    pending_tag_images.append((timestamp, file_path))
+                    if len(pending_tag_images) == args.tagger_batch_size:
+                        batch = pending_tag_images
+                        pending_tag_images = []
+                        tag_futures.append((batch, tag_executor.submit(
+                            frames_match_filters, [path for _, path in batch], tagger, args
+                        )))
+                        print(f"  [OK] 已累積 5 張，送入 GPU TAGGER 批次判斷。")
+                    else:
+                        print(f"  [OK] 畫面擷取成功，等待湊滿 5 張 TAGGER 批次: {format_time(timestamp)}")
                 else:
                     print(f"  [FAIL] 畫面擷取失敗: {format_time(timestamp)} - 錯誤: {res.strip()}")
 
+            if pending_tag_images:
+                tag_futures.append((pending_tag_images, tag_executor.submit(
+                    frames_match_filters, [path for _, path in pending_tag_images], tagger, args
+                )))
             rejected = []
-            for timestamp, future in tag_futures:
+            for batch, future in tag_futures:
                 try:
-                    passed, rating_score, tag_score = future.result()
+                    results = future.result()
                 except Exception as exc:
-                    rejected.append((timestamp, f"TAGGER 錯誤: {exc}"))
+                    rejected.extend((timestamp, f"TAGGER 錯誤: {exc}") for timestamp, _ in batch)
                     continue
-                if not passed:
-                    rejected.append((timestamp, f"rating {args.rating}={rating_score:.3f}, tag {args.required_tag}={tag_score:.3f}"))
+                timestamps_by_path = {path: timestamp for timestamp, path in batch}
+                for path, passed, rating_score, tag_score in results:
+                    if not passed:
+                        rejected.append((timestamps_by_path[path], f"rating {args.rating}={rating_score:.3f}, tag {args.required_tag}={tag_score:.3f}"))
 
     if rejected:
         print(f"[SKIP] 25 張中有 {len(rejected)} 張未通過 TAGGER，整個 {args.grid_size}x{args.grid_size} 宮格不儲存。")
@@ -478,7 +495,7 @@ def main():
     parser = argparse.ArgumentParser(description="影片 5x5 宮格定時截圖工具（下載時同步 GPU TAGGER 篩選）")
     parser.add_argument("target", nargs="?", default=EPORNER_DEFAULT_URL, help="影片網址、網站列表/分類/搜尋 URL、Eporner 關鍵字或包含網址的 txt 檔案路徑")
     parser.add_argument("-p", "--pages", type=int, default=1, help="連續擷取的頁數 (預設: 1 頁)")
-    parser.add_argument("-q", "--quality", default="720p", help="畫質選擇 (預設: 720p, 可選 best, 1080p, 480p 等)")
+    parser.add_argument("-q", "--quality", default="480p", help="畫質選擇（預設 480p，可選 best、1080p、720p 等）")
     parser.add_argument(
         "-o",
         "--output",
@@ -493,6 +510,7 @@ def main():
     parser.add_argument("--required-tag", default="smile", help="必須包含的 GENERAL TAG（預設 smile）")
     parser.add_argument("--tag-min-confidence", type=float, default=0.5, help="TAG 最低信心值（0~1，預設 0.5）")
     parser.add_argument("--tagger-repo", default=DEFAULT_REPO_ID, help="Hugging Face TAGGER repo")
+    parser.add_argument("--tagger-batch-size", type=int, default=5, choices=(5,), help="TAGGER GPU 批次大小（固定 5）")
     
     args = parser.parse_args()
     

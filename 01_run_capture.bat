@@ -45,7 +45,7 @@ set "TAG_CONF=50"
 set /p "TAG_CONF=Minimum TAG confidence %% (Enter for 50): "
 if "!TAG_CONF!"=="" set "TAG_CONF=50"
 
-"%PYTHON%" "%SCRIPT%" "!URL!" -p !PAGES! -q 720p --rating "!RATING!" --rating-min-confidence !RATING_CONF!e-2 --required-tag "!REQUIRED_TAG!" --tag-min-confidence !TAG_CONF!e-2
+"%PYTHON%" "%SCRIPT%" "!URL!" -p !PAGES! -q 480p --rating "!RATING!" --rating-min-confidence !RATING_CONF!e-2 --required-tag "!REQUIRED_TAG!" --tag-min-confidence !TAG_CONF!e-2
 if errorlevel 1 (
     set "CAPTURE_EXIT=!ERRORLEVEL!"
     echo [ERROR] Capture failed with exit code !CAPTURE_EXIT!.

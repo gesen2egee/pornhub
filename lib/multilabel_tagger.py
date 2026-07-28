@@ -72,17 +72,27 @@ class MobileNetV4Tagger:
         std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
         return ((array - mean) / std)[None, ...]
 
-    def predict(self, image_path: Path) -> dict[str, dict[str, float]]:
-        self.preload()
-        input_name = self.session.get_inputs()[0].name
-        output_names = [output.name for output in self.session.get_outputs()]
-        output_values = self.session.run(output_names, {input_name: self._prepare(image_path)})
-        prediction = dict(zip(output_names, output_values))["prediction"][0]
+    def _to_tags(self, prediction: np.ndarray) -> dict[str, dict[str, float]]:
         result = {"rating": {}, "general": {}, "character": {}}
         for index, row in enumerate(self.tags):
             category = self.categories[str(row["category"])]
             result[category][row["name"]] = float(prediction[index])
         return result
+
+    def predict_many(self, image_paths: list[Path]) -> list[dict[str, dict[str, float]]]:
+        """Run one CUDA inference for up to five completed capture frames."""
+        if not image_paths:
+            return []
+        self.preload()
+        input_name = self.session.get_inputs()[0].name
+        output_names = [output.name for output in self.session.get_outputs()]
+        batch = np.concatenate([self._prepare(image_path) for image_path in image_paths], axis=0)
+        output_values = self.session.run(output_names, {input_name: batch})
+        predictions = dict(zip(output_names, output_values))["prediction"]
+        return [self._to_tags(prediction) for prediction in predictions]
+
+    def predict(self, image_path: Path) -> dict[str, dict[str, float]]:
+        return self.predict_many([image_path])[0]
 
 
 def score_for(tags: dict[str, float], wanted: str) -> float:
