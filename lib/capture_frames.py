@@ -9,11 +9,12 @@ import urllib.request
 import urllib.parse
 import shutil
 import datetime
+from pathlib import Path
 import video_meta
 import sites
 from multilabel_tagger import DEFAULT_REPO_ID, MobileNetV4Tagger, score_for
 from project_paths import PREVIEW_IMAGES_DIR, TEMP_DIR
-from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageStat
+from PIL import Image, ImageDraw, ImageFont
 
 EPORNER_DEFAULT_URL = sites.EPORNER_DEFAULT_URL
 DEFAULT_PREVIEW_OUTPUT = str(PREVIEW_IMAGES_DIR)
@@ -212,32 +213,7 @@ def capture_single_frame(timestamp, stream_url, http_headers, output_file):
     except subprocess.CalledProcessError as e:
         return False, timestamp, e.stderr
 
-def check_images_has_duplicates(pil_images, threshold=2.5):
-    """
-    檢查傳入的 PIL Image 列表中是否有重複或高度相似的圖片
-    threshold: 像素平均絕對差值閾值，低於此值認定為重複圖片
-    """
-    num_imgs = len(pil_images)
-    for i in range(num_imgs):
-        for j in range(i + 1, num_imgs):
-            ts1, img1 = pil_images[i]
-            ts2, img2 = pil_images[j]
-            
-            if img1.size != img2.size:
-                img2_resized = img2.resize(img1.size)
-            else:
-                img2_resized = img2
-                
-            diff = ImageChops.difference(img1, img2_resized)
-            stat = ImageStat.Stat(diff)
-            diff_score = sum(stat.mean) / len(stat.mean)
-            
-            if diff_score < threshold:
-                return True, i, j, ts1, ts2, diff_score
-                
-    return False, -1, -1, 0, 0, 0.0
-
-def create_grid_image(image_data_list, title, duration, video_url, stream_url, diag_info, output_file, grid_size, output_root=DEFAULT_PREVIEW_OUTPUT, web_meta=None):
+def create_grid_image(image_data_list, title, duration, video_url, stream_url, diag_info, output_file, grid_size, output_root=DEFAULT_PREVIEW_OUTPUT, web_meta=None, tag_details=None):
     """
     將指定數量截圖合成宮格圖片，並標註時間標籤。
     """
@@ -258,26 +234,6 @@ def create_grid_image(image_data_list, title, duration, video_url, stream_url, d
             print(f"[!] 讀取圖片失敗 {path}: {e}")
 
     if not pil_images:
-        return False
-
-    # 自動檢查重複圖片
-    has_dup, idx1, idx2, ts1, ts2, score = check_images_has_duplicates(pil_images)
-    if has_dup:
-        similarity_pct = max(0.0, min(100.0, (1.0 - (score / 255.0)) * 100.0))
-        truncated_stream_url = stream_url[:120] + "..." if len(stream_url) > 120 else stream_url
-        
-        dup_log_text = (
-            f"[SKIP] 影片任務跳過 (檢測到畫面重複)\n"
-            f"  - 影片標題: {title}\n"
-            f"  - 影片網址: {video_url}\n"
-            f"  - 串流診斷: Format ID: [{diag_info.get('format_id')}] | Ext: [{diag_info.get('ext')}] | Protocol: [{diag_info.get('protocol')}] | Res: [{diag_info.get('resolution')}] | Codecs: [{diag_info.get('codecs')}]\n"
-            f"  - 串流網址: {truncated_stream_url}\n"
-            f"  - 重複狀況: 第 {idx1+1} 張 [{format_time(ts1)}] 與 第 {idx2+1} 張 [{format_time(ts2)}] 畫面重複\n"
-            f"  - 畫面相似度: {similarity_pct:.2f}% (像素差異分: {score:.2f} / 臨界值: 2.50)\n"
-            f"  - 處理動作: 已自動清理暫存檔，跳過不輸出任何圖片檔。"
-        )
-        print(f"\n{dup_log_text}")
-        log_event(dup_log_text, output_dir=output_root)
         return False
 
     sample_img = pil_images[0][1]
@@ -345,6 +301,9 @@ def create_grid_image(image_data_list, title, duration, video_url, stream_url, d
 
     exif = grid_img.getexif()
     exif[0x010e] = video_url  # 將影片網址寫入 JPG 圖片 EXIF Metadata (ImageDescription)
+    if tag_details:
+        tagger_section = "===TAGGER_V1===\n" + json.dumps(tag_details, ensure_ascii=False, separators=(",", ":"))
+        exif[0x9286] = b"ASCII\x00\x00\x00" + tagger_section.encode("utf-8")
     grid_img.save(output_file, quality=95, exif=exif)
     if web_meta is not None:
         video_meta.write_grid_jpg_web_meta(output_file, web_meta, url=video_url)
@@ -373,8 +332,40 @@ def summarize_tag_batch(image_paths, tagger):
     return results
 
 
+def calculate_tag_divergence(frame_tag_sets):
+    """計算一個宮格內 25 張圖彼此 TAG 的平均 Jaccard 距離。"""
+    if len(frame_tag_sets) < 2:
+        return 0.0
+    distances = []
+    for index, tags in enumerate(frame_tag_sets):
+        for other_tags in frame_tag_sets[index + 1:]:
+            union = tags | other_tags
+            distances.append(1.0 - len(tags & other_tags) / len(union) if union else 0.0)
+    return sum(distances) / len(distances)
+
+
+def rename_by_tag_divergence(records, output_dir):
+    """所有宮格都完成後，將分歧度最高的檔案重新命名為 001。"""
+    ranked = sorted(records, key=lambda record: (-record["divergence"], record["path"].name.lower()))
+    temporary_paths = []
+    for index, record in enumerate(ranked, start=1):
+        temporary = record["path"].with_name(f".__tag_rank_{index:03d}{record['path'].suffix}")
+        os.replace(record["path"], temporary)
+        temporary_paths.append((record, temporary))
+    ranking_lines = ["[TAG RANKING] 依 TAG 分歧度重新命名（001 最大）"]
+    for index, (record, temporary) in enumerate(temporary_paths, start=1):
+        original_stem = re.sub(r"^\d+-", "", record["path"].stem)
+        final_path = temporary.with_name(f"{index:03d}-{original_stem}{temporary.suffix}")
+        os.replace(temporary, final_path)
+        record["path"] = final_path
+        ranking_lines.append(f"  - {final_path.name}: 宮格內分歧度 {record['divergence']:.4f}")
+    ranking_text = "\n".join(ranking_lines)
+    print(ranking_text)
+    log_event(ranking_text, output_dir=output_dir)
+
+
 def process_single_video(video_url, args, tagger, index=1, total=1):
-    """下載 25 張畫面，同時 TAGGER 篩選；全部通過才輸出 5x5 宮格。"""
+    """下載並儲存 25 張畫面；TAGGER 僅記錄資料供整批排序。"""
     print(f"\n==================================================")
     print(f"[{index}/{total}] 開始處理影片: {video_url}")
     print(f"==================================================")
@@ -466,35 +457,50 @@ def process_single_video(video_url, args, tagger, index=1, total=1):
                 )
 
     if tag_errors:
-        print(f"[SKIP] TAGGER 有 {len(tag_errors)} 張錯誤，整個 {args.grid_size}x{args.grid_size} 宮格不儲存。")
-        for timestamp, reason in tag_errors:
-            print(f"  [FILTER] {format_time(timestamp)}：{reason}")
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        return False
+        tag_error_summary = f"[TAGGER WARN] 有 {len(tag_errors)} 張畫面無法取得 TAG；宮格仍會儲存並參與排序。"
+        print(tag_error_summary)
+        log_event(tag_error_summary, output_dir=args.output)
 
     general_count = sum(rating.strip().lower() == "general" for _, rating, _, _ in tag_results)
     smile_count = sum(score >= args.smile_min_confidence for _, _, score, _ in tag_results)
-    tagger_summary = (
-        f"[TAGGER] 最可能 RATING=general：{general_count} 張（需少於 {args.max_general_count + 1} 張）；"
-        f"smile：{smile_count} 張（需介於 {args.min_smile_count}～{args.max_smile_count} 張）。\n"
-        + "\n".join(
-            f"  - {format_time(timestamp)}: {caption_tags}"
-            for timestamp, _, _, caption_tags in sorted(tag_results)
-        )
-    )
+    tagger_summary = f"[TAGGER] 最可能 RATING=general：{general_count} 張；smile：{smile_count} 張（僅統計，不篩選）。"
     print(tagger_summary)
     log_event(tagger_summary, output_dir=args.output)
-    if general_count > args.max_general_count or not args.min_smile_count <= smile_count <= args.max_smile_count:
-        print(f"[SKIP] 宮格統計條件未通過，整個 {args.grid_size}x{args.grid_size} 宮格不儲存。")
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        return False
+
+    tag_results_by_timestamp = {
+        timestamp: (rating, smile_score, caption_tags)
+        for timestamp, rating, smile_score, caption_tags in tag_results
+    }
+    ordered_tag_results = [
+        (timestamp, *tag_results_by_timestamp.get(timestamp, ("", 0.0, "")))
+        for timestamp, _ in sorted(captured_image_data)
+    ]
+    frame_tag_details = [
+        {"timestamp": format_time(timestamp), "tags": caption_tags}
+        for timestamp, _, _, caption_tags in ordered_tag_results
+    ]
+    frame_tag_sets = [
+        {tag.strip() for tag in caption_tags.split(",") if tag.strip()}
+        for _, _, _, caption_tags in ordered_tag_results
+    ]
+    divergence = calculate_tag_divergence(frame_tag_sets)
+    tag_details = {
+        "tagger_repo": args.tagger_repo,
+        "tag_thresholds": {"general": 0.25, "character": 0.85},
+        "general_count": general_count,
+        "smile_count": smile_count,
+        "smile_min_confidence": args.smile_min_confidence,
+        "within_grid_tag_divergence": divergence,
+        "frames": frame_tag_details,
+    }
 
     captured_image_data.sort(key=lambda x: x[0])
 
-    print(f"\n[*] 全部 {expected_count} 張通過，正在進行重複圖片檢測與 {args.grid_size}x{args.grid_size} 宮格合成 ...")
+    print(f"\n[*] 全部 {expected_count} 張完成，正在合成 {args.grid_size}x{args.grid_size} 宮格 ...")
     success = create_grid_image(
         captured_image_data, title, duration, video_url, stream_url, diag_info,
-        final_output_file, args.grid_size, output_root=args.output, web_meta=info.get('web_meta')
+        final_output_file, args.grid_size, output_root=args.output, web_meta=info.get('web_meta'),
+        tag_details=tag_details,
     )
 
     shutil.rmtree(temp_dir, ignore_errors=True)
@@ -502,13 +508,13 @@ def process_single_video(video_url, args, tagger, index=1, total=1):
     if success:
         print(f"[DONE] 成功產出 {args.grid_size}x{args.grid_size} 宮格圖片！")
         print(f"[+] 檔案儲存路徑: {os.path.abspath(final_output_file)}")
-        return True
+        return {"path": Path(final_output_file), "divergence": divergence}
     else:
         print(f"[SKIP] 任務已跳過 (已將詳細診斷寫入 Log，不產生圖片檔)。")
         return False
 
 def main():
-    parser = argparse.ArgumentParser(description="影片 5x5 宮格定時截圖工具（下載時同步 GPU TAGGER 篩選）")
+    parser = argparse.ArgumentParser(description="影片 5x5 宮格定時截圖工具（下載時同步 GPU TAGGER，完成後依宮格內 TAG 分歧度排序）")
     parser.add_argument("target", nargs="?", default=EPORNER_DEFAULT_URL, help="影片網址、網站列表/分類/搜尋 URL、Eporner 關鍵字或包含網址的 txt 檔案路徑")
     parser.add_argument("-p", "--pages", type=int, default=1, help="連續擷取的頁數 (預設: 1 頁)")
     parser.add_argument("-q", "--quality", default="480p", help="畫質選擇（預設 480p，可選 best、1080p、720p 等）")
@@ -521,10 +527,7 @@ def main():
     parser.add_argument("-w", "--workers", type=int, default=25, help="每部影片並行截圖線程數（預設 25）")
     parser.add_argument("-m", "--max-videos", type=int, default=0, help="最多處理的影片數量 (預設: 0 代表無限制，全數處理)")
     parser.add_argument("--grid-size", type=int, default=5, choices=(5,), help="宮格邊長（固定 5，合計 25 張）")
-    parser.add_argument("--max-general-count", type=int, default=4, help="最可能 RATING=general 的最多張數（預設 4）")
-    parser.add_argument("--min-smile-count", type=int, default=2, help="smile TAG 的最少張數（預設 2）")
-    parser.add_argument("--max-smile-count", type=int, default=8, help="smile TAG 的最多張數（預設 8）")
-    parser.add_argument("--smile-min-confidence", type=float, default=0.25, help="smile TAG 信心值門檻（0~1，預設 0.25，與 Trainer GENERAL 門檻相同）")
+    parser.add_argument("--smile-min-confidence", type=float, default=0.25, help="smile TAG 統計信心值門檻（0~1，預設 0.25，與 Trainer GENERAL 門檻相同；不作篩選）")
     parser.add_argument("--tagger-repo", default=DEFAULT_REPO_ID, help="Hugging Face TAGGER repo")
     parser.add_argument("--tagger-batch-size", type=int, default=5, choices=(5,), help="TAGGER GPU 批次大小（固定 5）")
     
@@ -555,11 +558,17 @@ def main():
     
     completed_videos = 0
     skipped_videos = 0
+    completed_records = []
     for idx, url in enumerate(video_urls, 1):
-        if process_single_video(url, args, tagger, index=idx, total=total_videos):
+        record = process_single_video(url, args, tagger, index=idx, total=total_videos)
+        if record:
             completed_videos += 1
+            completed_records.append(record)
         else:
             skipped_videos += 1
+
+    if completed_records:
+        rename_by_tag_divergence(completed_records, args.output)
             
     summary_text = f"[BATCH DONE] 批次作業全數完成！成功: {completed_videos} 部 | 跳過/失敗: {skipped_videos} 部"
     print(f"\n[ALL DONE] {summary_text}")

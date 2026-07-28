@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
-title Video 5x5 Grid Capture and GPU Tagger Filter
+title Video 5x5 Grid Capture and GPU Tagger Ranking
 cd /d "%~dp0"
 
 set "ROOT=%~dp0"
@@ -37,5 +37,5 @@ if errorlevel 1 (
     exit /b !CAPTURE_EXIT!
 )
 
-echo [DONE] Passed 5x5 preview images are in output\01_preview_images.
+echo [DONE] 5x5 preview images are ranked by within-grid TAG divergence in output\01_preview_images.
 pause
