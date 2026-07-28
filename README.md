@@ -125,9 +125,11 @@ yt-dlp DEBUG 與下載百分比訊息。
 
 暫存位於 `output/00_temp/pipeline/`。Video 與 Chosen 預設分成兩個階段：
 
-1. 以 240P 每 180 秒下載一段；累計滿 BS（預設 3 段）才排入一次 `Demucs → MOSS`，並與下一批下載重疊。全部 240P 與 MOSS 完成後，才把完整時間軸交給 GROK。
+1. 以 240P 每 180 秒下載一段；每段一就緒就立刻排入 `Demucs → MOSS`，不等待湊滿 BS。全部 240P 與 MOSS 完成後，才把完整時間軸交給 GROK。
 2. Video／Chosen 預設啟用 30 秒三段：`N=ceil(30 秒／平均語音句長)`，固定選出情節 `N-1`、中段 `2N`、高潮 `3N` 句（總數 `<6N`）。每段內縮 0.1 秒後，才按原片時間下載高畫質切塊。
 3. 高畫質切塊下載後會同步進行音訊判斷／`enhance`，最後以 0.08 秒同步影音 crossfade 合併並 retime 字幕。
+
+Video／Chosen 預設可同時跑 2 支來源管線：前一支進入高畫質下載時，下一支會開始 240P、MOSS 與 GROK；MOSS 與音訊 GPU 仍安全序列化。可用環境變數 `PIPELINE_SOURCE_WORKERS=1` 改回單支，最多可設為 4。
 
 Preview 每段預設 180 秒，一次先下載 `--asr-batch-size` 段（預設 3 段，共最多 9 分鐘），再用同一批執行 `Demucs → MOSS BS ASR`；合併完整批次字幕後只送一次 OpenRouter 精選翻譯。下載與剪片完成後同樣會自動判斷 enhance。
 

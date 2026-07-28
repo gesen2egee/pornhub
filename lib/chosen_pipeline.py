@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from project_paths import (
@@ -523,19 +524,30 @@ def process_chosen_directory(
 
 def process_chosen_items(
     items: list[Path],
+    source_workers: int = 1,
     **options,
 ) -> tuple[int, int]:
-    """處理控制器已盤點的 Chosen 項目，避免執行途中重新掃描。"""
+    """處理控制器已盤點的 Chosen 項目；可與前片高畫質交疊下一片分析。"""
     ok = 0
     fail = 0
-    for index, item in enumerate(items, 1):
+    workers = max(1, min(int(source_workers), 4))
+
+    def process_one(index: int, item: Path) -> Path:
         _log(f"\n[chosen {index}/{len(items)}] {item.name}")
-        try:
-            process_chosen_item(item, **options)
-            ok += 1
-        except Exception as exc:
-            _log(f"  [FAIL] {exc}")
-            fail += 1
+        return process_chosen_item(item, **dict(options))
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="chosen-source") as executor:
+        futures = {
+            executor.submit(process_one, index, item): item
+            for index, item in enumerate(items, 1)
+        }
+        for future in as_completed(futures):
+            try:
+                future.result()
+                ok += 1
+            except Exception as exc:
+                _log(f"  [FAIL] {futures[future].name}：{exc}")
+                fail += 1
     return ok, fail
 
 

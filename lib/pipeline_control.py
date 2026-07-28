@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -21,6 +22,16 @@ from project_paths import (
 STAGE_ORDER = ("preview", "shorts", "video", "chosen")
 GRID_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm", ".m4v"}
+DEFAULT_SOURCE_PIPELINE_WORKERS = 2
+
+
+def source_pipeline_workers() -> int:
+    """同層可重疊的影片管線數；GPU worker 仍由各自鎖序列化。"""
+    try:
+        value = int(os.getenv("PIPELINE_SOURCE_WORKERS", str(DEFAULT_SOURCE_PIPELINE_WORKERS)))
+    except ValueError:
+        value = DEFAULT_SOURCE_PIPELINE_WORKERS
+    return max(1, min(value, 4))
 
 
 @dataclass(frozen=True)
@@ -475,38 +486,46 @@ def _execute_stage(
             options.reasoning_effort
             or os.getenv("STANDARD_TRANSLATE_REASONING", "none")
         )
-        failures = 0
-        for index, source in enumerate(sources, 1):
+        def process_video(index: int, source: Path) -> None:
             print(f"\n[video {index}/{len(sources)}] {source.name}")
-            try:
-                full_video_pipeline.process_full_video_from_grid(
-                    source,
-                    final_dir=VIDEOS_DIR,
-                    archive_dir=DOWNLOADED_DIR,
-                    keep_proxy=bool(options.keep_work),
-                    max_height=options.video_height or 480,
-                    enable_enhance=(
-                        options.enhance
-                    ),
-                    enable_asr=options.asr,
-                    export_subtitles=options.subtitles,
-                    enable_dialogue_trim=options.dialogue_trim,
-                    enable_translation=options.translation,
-                    enable_selective_download=options.selective_download,
-                    enable_three_phase_selection=options.three_phase_selection,
-                    enable_edge_padding=options.edge_padding,
-                    enable_metadata=options.metadata,
-                    dialogue_trim_threshold=options.trim_threshold,
-                    segment_gap=options.segment_gap,
-                    force=options.force,
-                    work_bucket="03_videos",
-                    archive_grid_on_done=options.archive_grid,
-                    moss_worker=moss_worker,
-                    audio_worker=audio_worker,
-                )
-            except Exception as exc:
-                print(f"  [FAIL] {exc}")
-                failures += 1
+            full_video_pipeline.process_full_video_from_grid(
+                source,
+                final_dir=VIDEOS_DIR,
+                archive_dir=DOWNLOADED_DIR,
+                keep_proxy=bool(options.keep_work),
+                max_height=options.video_height or 480,
+                enable_enhance=options.enhance,
+                enable_asr=options.asr,
+                export_subtitles=options.subtitles,
+                enable_dialogue_trim=options.dialogue_trim,
+                enable_translation=options.translation,
+                enable_selective_download=options.selective_download,
+                enable_three_phase_selection=options.three_phase_selection,
+                enable_edge_padding=options.edge_padding,
+                enable_metadata=options.metadata,
+                dialogue_trim_threshold=options.trim_threshold,
+                segment_gap=options.segment_gap,
+                force=options.force,
+                work_bucket="03_videos",
+                archive_grid_on_done=options.archive_grid,
+                moss_worker=moss_worker,
+                audio_worker=audio_worker,
+            )
+
+        workers = source_pipeline_workers()
+        print(f"[video] 來源管線併行={workers}；MOSS／音訊 GPU 仍會安全排隊")
+        failures = 0
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="video-source") as executor:
+            futures = {
+                executor.submit(process_video, index, source): source
+                for index, source in enumerate(sources, 1)
+            }
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    print(f"  [FAIL] {futures[future].name}：{exc}")
+                    failures += 1
         return failures
 
     if stage_name == "shorts":
@@ -570,6 +589,7 @@ def _execute_stage(
         force=options.force,
         moss_worker=moss_worker,
         audio_worker=audio_worker,
+        source_workers=source_pipeline_workers(),
     )
     print(f"[chosen] 完成：成功 {successes}；失敗 {failures}")
     return failures

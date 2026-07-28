@@ -18,7 +18,7 @@ import sys
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext, redirect_stdout
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from threading import Lock, Thread
 from typing import Any, Iterator
 
@@ -1154,18 +1154,20 @@ class MossAsrWorker:
             bufsize=1,
         )
         self._closed = False
+        self._lock = Lock()
         _log("  [MOSS 常駐] 已啟動；後續 ASR 片段不會重載權重")
 
     def transcribe(self, audio_paths: list[Path]) -> list[dict[str, Any]]:
         if self._closed or self._process.stdin is None or self._process.stdout is None:
             raise RuntimeError("MOSS 常駐程序已關閉")
         request = {"audio": [str(Path(path).resolve()) for path in audio_paths]}
-        try:
-            self._process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
-            self._process.stdin.flush()
-            line = self._process.stdout.readline()
-        except OSError as exc:
-            raise RuntimeError("MOSS 常駐程序通訊失敗") from exc
+        with self._lock:
+            try:
+                self._process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+                self._process.stdin.flush()
+                line = self._process.stdout.readline()
+            except OSError as exc:
+                raise RuntimeError("MOSS 常駐程序通訊失敗") from exc
         if not line:
             raise RuntimeError(
                 f"MOSS 常駐程序提早結束，ExitCode={self._process.poll()}"
@@ -1379,9 +1381,12 @@ def run_streamed_asr(
                 return
             jobs = [first]
             stop_after_batch = False
-            # 固定等待累計到 BS；只有收到結束訊號時才送出不足 BS 的尾批。
+            # 不等待湊滿 BS：已就緒的片段立即送 MOSS；只順手合併當下已排隊的片段。
             while len(jobs) < batch_limit:
-                next_job = job_queue.get()
+                try:
+                    next_job = job_queue.get_nowait()
+                except Empty:
+                    break
                 if next_job is None:
                     job_queue.task_done()
                     stop_after_batch = True
@@ -1391,7 +1396,7 @@ def run_streamed_asr(
                 queued = job_queue.qsize()
                 _log(
                     f"  [ASR 佇列] 已就緒 {queued + len(jobs)} 段；"
-                    f"本批 BS={len(jobs)}/{batch_limit}"
+                    f"立即送 MOSS，BS={len(jobs)}/{batch_limit}"
                 )
                 batch_work = work_dir / f"asr-batch-{jobs[0][0]:03d}"
                 paths = [job[2] for job in jobs]

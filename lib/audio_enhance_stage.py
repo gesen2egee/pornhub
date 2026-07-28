@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import uuid
+from threading import Lock
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -619,18 +620,20 @@ class AudioEnhanceWorker:
             bufsize=1,
         )
         self._closed = False
+        self._lock = Lock()
         print("[音訊 Enhance 常駐] 已啟動；權重將在首次使用後保留", flush=True)
 
     def prepare(self, videos: list[Path]) -> dict[Path, PreparedMedia]:
         if self._closed or self._process.stdin is None or self._process.stdout is None:
             raise RuntimeError("音訊 Enhance 常駐程序已關閉")
         request = {"videos": [str(Path(video).resolve()) for video in videos]}
-        try:
-            self._process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
-            self._process.stdin.flush()
-            line = self._process.stdout.readline()
-        except OSError as exc:
-            raise RuntimeError("音訊 Enhance 常駐程序通訊失敗") from exc
+        with self._lock:
+            try:
+                self._process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+                self._process.stdin.flush()
+                line = self._process.stdout.readline()
+            except OSError as exc:
+                raise RuntimeError("音訊 Enhance 常駐程序通訊失敗") from exc
         if not line:
             raise RuntimeError(
                 f"音訊 Enhance 常駐程序提早結束，ExitCode={self._process.poll()}"
