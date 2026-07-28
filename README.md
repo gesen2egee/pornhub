@@ -8,7 +8,7 @@
 
 ```text
 00_setup_or_update.bat  建立／更新完整執行環境
-01_run_capture.bat      產生 5×5 預覽圖並以 GPU TAGGER 排序
+01_run_capture.bat      產生 5×5 預覽圖並以 GPU TAGGER 標記
 02_run_download.bat     下載影片並同步處理字幕
 03_open_muse.bat        開啟 Muse 圖形介面
 .gitignore
@@ -100,7 +100,7 @@ Muse 會在瀏覽器開啟 `http://127.0.0.1:8765/`，所有操作與偏好都�
 
 ### 1. 產生 5×5 宮格
 
-雙擊 `01_run_capture.bat`，貼上影片、關鍵字或列表網址。每支影片會以 480p 同步抓取 25 張原始畫面；畫面一完成就由常駐 GPU 的 MobileNetV4 ONNX TAGGER 以 **batch size 5** 判斷。所有完成的 5×5 宮格都會儲存，不再依 `general` 或 `smile` 篩選；每張圖的逗號分隔 TAG 會寫進該 JPG 的 EXIF。整批完成後，程式會只比較每個宮格自己 25 張畫面的 TAG 差異，依平均分歧度由高到低重新命名，最高者為 `001-...jpg`。
+雙擊 `01_run_capture.bat`，貼上影片、關鍵字或列表網址。每支影片會以 480p 同步抓取 25 張原始畫面；畫面一完成就由常駐 GPU 的 MobileNetV4 ONNX TAGGER 以 **batch size 5** 判斷。所有完成的 5×5 宮格都會儲存，不再依 `general` 或 `smile` 篩選；每張圖的逗號分隔 TAG 會寫進該 JPG 的 EXIF。宮格會維持擷取順序的原始檔名，不會依 TAG 分歧度重新命名或排序。
 
 ```text
 output/01_preview_images/

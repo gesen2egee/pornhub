@@ -9,7 +9,6 @@ import urllib.request
 import urllib.parse
 import shutil
 import datetime
-from pathlib import Path
 import video_meta
 import sites
 from multilabel_tagger import DEFAULT_REPO_ID, MobileNetV4Tagger, score_for
@@ -332,40 +331,8 @@ def summarize_tag_batch(image_paths, tagger):
     return results
 
 
-def calculate_tag_divergence(frame_tag_sets):
-    """計算一個宮格內 25 張圖彼此 TAG 的平均 Jaccard 距離。"""
-    if len(frame_tag_sets) < 2:
-        return 0.0
-    distances = []
-    for index, tags in enumerate(frame_tag_sets):
-        for other_tags in frame_tag_sets[index + 1:]:
-            union = tags | other_tags
-            distances.append(1.0 - len(tags & other_tags) / len(union) if union else 0.0)
-    return sum(distances) / len(distances)
-
-
-def rename_by_tag_divergence(records, output_dir):
-    """所有宮格都完成後，將分歧度最高的檔案重新命名為 001。"""
-    ranked = sorted(records, key=lambda record: (-record["divergence"], record["path"].name.lower()))
-    temporary_paths = []
-    for index, record in enumerate(ranked, start=1):
-        temporary = record["path"].with_name(f".__tag_rank_{index:03d}{record['path'].suffix}")
-        os.replace(record["path"], temporary)
-        temporary_paths.append((record, temporary))
-    ranking_lines = ["[TAG RANKING] 依 TAG 分歧度重新命名（001 最大）"]
-    for index, (record, temporary) in enumerate(temporary_paths, start=1):
-        original_stem = re.sub(r"^\d+-", "", record["path"].stem)
-        final_path = temporary.with_name(f"{index:03d}-{original_stem}{temporary.suffix}")
-        os.replace(temporary, final_path)
-        record["path"] = final_path
-        ranking_lines.append(f"  - {final_path.name}: 宮格內分歧度 {record['divergence']:.4f}")
-    ranking_text = "\n".join(ranking_lines)
-    print(ranking_text)
-    log_event(ranking_text, output_dir=output_dir)
-
-
 def process_single_video(video_url, args, tagger, index=1, total=1):
-    """下載並儲存 25 張畫面；TAGGER 僅記錄資料供整批排序。"""
+    """下載並儲存 25 張畫面，並將每張的 TAG 寫入宮格 EXIF。"""
     print(f"\n==================================================")
     print(f"[{index}/{total}] 開始處理影片: {video_url}")
     print(f"==================================================")
@@ -457,7 +424,7 @@ def process_single_video(video_url, args, tagger, index=1, total=1):
                 )
 
     if tag_errors:
-        tag_error_summary = f"[TAGGER WARN] 有 {len(tag_errors)} 張畫面無法取得 TAG；宮格仍會儲存並參與排序。"
+        tag_error_summary = f"[TAGGER WARN] 有 {len(tag_errors)} 張畫面無法取得 TAG；宮格仍會儲存。"
         print(tag_error_summary)
         log_event(tag_error_summary, output_dir=args.output)
 
@@ -479,18 +446,12 @@ def process_single_video(video_url, args, tagger, index=1, total=1):
         {"timestamp": format_time(timestamp), "tags": caption_tags}
         for timestamp, _, _, caption_tags in ordered_tag_results
     ]
-    frame_tag_sets = [
-        {tag.strip() for tag in caption_tags.split(",") if tag.strip()}
-        for _, _, _, caption_tags in ordered_tag_results
-    ]
-    divergence = calculate_tag_divergence(frame_tag_sets)
     tag_details = {
         "tagger_repo": args.tagger_repo,
         "tag_thresholds": {"general": 0.25, "character": 0.85},
         "general_count": general_count,
         "smile_count": smile_count,
         "smile_min_confidence": args.smile_min_confidence,
-        "within_grid_tag_divergence": divergence,
         "frames": frame_tag_details,
     }
 
@@ -508,13 +469,13 @@ def process_single_video(video_url, args, tagger, index=1, total=1):
     if success:
         print(f"[DONE] 成功產出 {args.grid_size}x{args.grid_size} 宮格圖片！")
         print(f"[+] 檔案儲存路徑: {os.path.abspath(final_output_file)}")
-        return {"path": Path(final_output_file), "divergence": divergence}
+        return True
     else:
         print(f"[SKIP] 任務已跳過 (已將詳細診斷寫入 Log，不產生圖片檔)。")
         return False
 
 def main():
-    parser = argparse.ArgumentParser(description="影片 5x5 宮格定時截圖工具（下載時同步 GPU TAGGER，完成後依宮格內 TAG 分歧度排序）")
+    parser = argparse.ArgumentParser(description="影片 5x5 宮格定時截圖工具（下載時同步 GPU TAGGER 並寫入 EXIF）")
     parser.add_argument("target", nargs="?", default=EPORNER_DEFAULT_URL, help="影片網址、網站列表/分類/搜尋 URL、Eporner 關鍵字或包含網址的 txt 檔案路徑")
     parser.add_argument("-p", "--pages", type=int, default=1, help="連續擷取的頁數 (預設: 1 頁)")
     parser.add_argument("-q", "--quality", default="480p", help="畫質選擇（預設 480p，可選 best、1080p、720p 等）")
@@ -558,17 +519,11 @@ def main():
     
     completed_videos = 0
     skipped_videos = 0
-    completed_records = []
     for idx, url in enumerate(video_urls, 1):
-        record = process_single_video(url, args, tagger, index=idx, total=total_videos)
-        if record:
+        if process_single_video(url, args, tagger, index=idx, total=total_videos):
             completed_videos += 1
-            completed_records.append(record)
         else:
             skipped_videos += 1
-
-    if completed_records:
-        rename_by_tag_divergence(completed_records, args.output)
             
     summary_text = f"[BATCH DONE] 批次作業全數完成！成功: {completed_videos} 部 | 跳過/失敗: {skipped_videos} 部"
     print(f"\n[ALL DONE] {summary_text}")
