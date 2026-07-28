@@ -195,9 +195,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--chosen-height", type=int, metavar="P", help="Chosen 解析度高度，預設 1080"
     )
     parser.add_argument(
-        "--shorts-height", type=int, metavar="P", help="Shorts 解析度高度，預設 1080"
-    )
-    parser.add_argument(
         "--asr-backend",
         choices=("whisper", "moss", "voxtral", "grok-stt"),
         help="覆寫所選層級的 ASR backend",
@@ -342,7 +339,6 @@ def main(argv: list[str] | None = None) -> int:
         "preview_seconds",
         "video_height",
         "chosen_height",
-        "shorts_height",
         "trim_threshold",
         "asr_chunk_seconds",
         "asr_batch_size",
@@ -380,7 +376,6 @@ def main(argv: list[str] | None = None) -> int:
             "preview_seconds",
             "video_height",
             "chosen_height",
-            "shorts_height",
             "asr_backend",
             "translation_model",
             "reasoning_effort",
@@ -416,7 +411,6 @@ def main(argv: list[str] | None = None) -> int:
                 "preview_seconds",
                 "video_height",
                 "chosen_height",
-                "shorts_height",
                 "asr_backend",
                 "translation_model",
                 "reasoning_effort",
@@ -443,8 +437,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--video-height 只能用於 video 層")
     if args.chosen_height is not None and "chosen" not in stages:
         parser.error("--chosen-height 只能用於 chosen 層")
-    if args.shorts_height is not None and "shorts" not in stages:
-        parser.error("--shorts-height 只能用於 shorts 層")
     options = FeatureSwitches(
         asr=args.asr,
         demucs_asr=args.demucs_asr,
@@ -463,7 +455,6 @@ def main(argv: list[str] | None = None) -> int:
         preview_seconds=args.preview_seconds,
         video_height=args.video_height,
         chosen_height=args.chosen_height,
-        shorts_height=args.shorts_height,
         asr_backend=args.asr_backend,
         translation_model=args.translation_model,
         reasoning_effort=args.reasoning_effort,

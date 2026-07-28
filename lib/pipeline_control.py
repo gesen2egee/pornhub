@@ -54,7 +54,6 @@ class FeatureSwitches:
     preview_seconds: int | None = None
     video_height: int | None = None
     chosen_height: int | None = None
-    shorts_height: int | None = None
     asr_backend: str | None = None
     translation_model: str | None = None
     reasoning_effort: str | None = None
@@ -271,7 +270,6 @@ def resolve_stage_options(
         "preview_seconds": 180,
         "video_height": 480,
         "chosen_height": 1080,
-        "shorts_height": 1080,
         "asr_backend": "moss",
         "translation_model": (
             "x-ai/grok-4.5" if stage_name == "chosen" else "x-ai/grok-4.3"
@@ -355,6 +353,8 @@ def feature_environment(options: FeatureSwitches):
         "CHOSEN_OPENROUTER_MODEL",
         "TRANSLATE_REASONING_EFFORT",
         "CHOSEN_TRANSLATE_REASONING",
+        "HIGH_VIDEO_HEIGHT",
+        "HIGH_VIDEO_UNLIMITED",
     )
     before = {name: os.environ.get(name) for name in names}
     apply_feature_switches(options)
@@ -513,7 +513,7 @@ def _execute_stage(
                     final_dir=SHORTS_DIR,
                     archive_dir=DOWNLOADED_DIR,
                     keep_proxy=bool(options.keep_work),
-                    max_height=options.shorts_height or 1080,
+                    max_height=1080,
                     enable_enhance=options.enhance,
                     enable_asr=options.asr,
                     export_subtitles=options.subtitles,
@@ -533,6 +533,7 @@ def _execute_stage(
                     reuse_embedded_translation=True,
                     always_download_subtitle_ranges=True,
                     require_subtitle_ranges=True,
+                    unlimited_high_quality=True,
                 )
             except Exception as exc:
                 print(f"  [FAIL] {exc}")

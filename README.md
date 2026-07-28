@@ -25,7 +25,7 @@ output/
 ├── 00_temp/             下載、字幕與 FFmpeg 暫存
 ├── 01_preview_images/   01_run_capture.bat 產生的九宮格
 ├── 02_preview_videos/   前 3 分鐘低畫質 → Whisper 語音剪片 + 軟 SRT，不硬字幕/不 enhance
-├── 02_shorts/           內嵌翻譯時間軸直抓高畫質片段；僅 URL 先分析前 9 分鐘 240P
+├── 02_shorts/           內嵌翻譯時間軸直抓最高畫質片段；僅 URL 先分析前 9 分鐘 240P
 ├── 03_videos/           480P（對白>30s 剪片）+ 軟字幕，不 enhance
 ├── 04_downloaded/       已完成九宮格歸檔
 ├── 05_chosen/           精選輸入（可丟九宮格或含 URL 的影片）
@@ -37,7 +37,7 @@ output/
 | 流程 | 放入 | 畫質 | 字幕 | enhance | 輸出 |
 |------|------|------|------|---------|------|
 | 預覽 | `02_preview_videos` 九宮格或含 URL 影片 | 一次下載 BS 段低畫質（預設 3×3 分鐘）；語音>30s 剪片否則全留 | Demucs 人聲 → 批次 MOSS → 一次 Grok 精選翻譯 | 否 | 同目錄 |
-| Shorts | `02_shorts` 九宮格或含 URL 影片 | 有內嵌翻譯直接依時間軸抓 1080P；否則先抓前 9 分鐘 240P，再抓對應高畫質片段 | 重用內嵌翻譯，或 MOSS → Grok 精選翻譯 | 判斷 | 同目錄 |
+| Shorts | `02_shorts` 九宮格或含 URL 影片 | 有內嵌翻譯直接依時間軸抓來源最高畫質；否則先抓前 9 分鐘 240P，再抓對應最高畫質片段 | 重用內嵌翻譯，或 MOSS → Grok 精選翻譯 | 判斷 | 同目錄 |
 | 標準全片 | `03_videos` 九宮格或含 URL 影片 | 480P（Whisper 剪片） | Demucs 人聲 → Whisper + **Grok 4.3 none**（便宜） | 否 | `03_videos` |
 | 精選 | `05_chosen` 九宮格或影片 | 1080P | Demucs 人聲 → MOSS + **Grok 4.5 minimal** | 判斷 | `06_good` |
 | 歸檔 | （自動） | — | — | — | 九宮格→`04_downloaded`；chosen 來源影片刪除 |

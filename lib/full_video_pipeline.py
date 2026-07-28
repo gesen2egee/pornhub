@@ -449,18 +449,23 @@ def asr_stream_chunk_seconds(environment: dict[str, str] | None = None) -> float
 
 def _high_format_opts() -> tuple[str, list[str], int]:
     """回傳 (format, format_sort, concurrent_fragments)。"""
+    unlimited = os.getenv("HIGH_VIDEO_UNLIMITED", "0").strip().casefold() in {
+        "1", "true", "yes", "on",
+    }
     fmt = os.getenv("HIGH_VIDEO_FORMAT", HIGH_FORMAT).strip() or HIGH_FORMAT
     try:
         height = int(os.getenv("HIGH_VIDEO_HEIGHT", "720"))
     except ValueError:
         height = 720
-    if os.getenv("HIGH_VIDEO_FORMAT") is None:
+    if os.getenv("HIGH_VIDEO_FORMAT") is None and unlimited:
+        fmt = "bestvideo*+bestaudio/best"
+    elif os.getenv("HIGH_VIDEO_FORMAT") is None:
         fmt = (
             f"bestvideo[height<={height}]+bestaudio/"
             f"best[height<={height}]/"
             f"bestvideo*+bestaudio/best"
         )
-    sort = [f"res:{height}"]
+    sort = ["res"] if unlimited else [f"res:{height}"]
     try:
         concurrent = int(
             os.getenv(
@@ -1696,6 +1701,7 @@ def process_full_video_from_grid(
     reuse_embedded_translation: bool = False,
     always_download_subtitle_ranges: bool = False,
     require_subtitle_ranges: bool = False,
+    unlimited_high_quality: bool = False,
 ) -> Path:
     """
     單支來源循序流程：從九宮格或影片取得 URL，低畫質代理 → ASR/翻譯 →
@@ -1761,6 +1767,7 @@ def process_full_video_from_grid(
     edge_pad = resolve_edge_padding_seconds(enable_edge_padding)
     # 下載高度寫入 env，供 _high_format_opts 使用
     os.environ["HIGH_VIDEO_HEIGHT"] = str(max_height)
+    os.environ["HIGH_VIDEO_UNLIMITED"] = "1" if unlimited_high_quality else "0"
     os.environ["ENABLE_TRANSLATION"] = "1" if enable_translation else "0"
     os.environ["ENABLE_SELECTIVE_DOWNLOAD"] = (
         "1" if enable_selective_download else "0"
@@ -2004,7 +2011,7 @@ def process_full_video_from_grid(
             f"trim={'on' if enable_dialogue_trim else 'off'}；"
             f"selective={'on' if enable_selective_download else 'off'}；"
             f"enhance={'on' if enable_enhance else 'off'}；"
-            f"max_height={max_height}"
+            f"畫質={'來源最高' if unlimited_high_quality else f'{max_height}P 上限'}"
         )
 
         any_enhanced = False
