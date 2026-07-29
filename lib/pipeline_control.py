@@ -89,7 +89,7 @@ STAGES = {
         "第三層：Video",
         VIDEOS_DIR,
         "$$ 中預算",
-        "240P/MOSS 串流→Step 3.7 Flash（失敗改 Grok 4.5）30秒三段→關鍵格安全高畫質切塊、音訊判斷 enhance＋crossfade",
+        "240P/MOSS 串流→Grok 4.5（失敗改 Step 3.7 Flash）30秒三段→關鍵格安全高畫質切塊、音訊判斷 enhance＋crossfade",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
     "shorts": StageDefinition(
@@ -105,7 +105,7 @@ STAGES = {
         "第四層：Chosen",
         CHOSEN_DIR,
         "$$$ 高預算",
-        "240P/MOSS 串流→Step 3.7 Flash（失敗改 Grok 4.5）30秒三段→關鍵格安全 1080P 切塊、音訊判斷 enhance＋crossfade",
+        "240P/MOSS 串流→Grok 4.5（失敗改 Step 3.7 Flash）30秒三段→關鍵格安全 1080P 切塊、音訊判斷 enhance＋crossfade",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
 }
@@ -285,7 +285,7 @@ def resolve_stage_options(
         "video_height": 480,
         "chosen_height": 1080,
         "asr_backend": "moss",
-        "translation_model": "stepfun/step-3.7-flash",
+        "translation_model": "x-ai/grok-4.5",
         "reasoning_effort": "minimal",
         "trim_threshold": 30.0,
         "segment_gap": 1.5,
@@ -479,14 +479,14 @@ def _execute_stage(
             "STANDARD_ASR_BACKEND", "whisper"
         )
         os.environ["OPENROUTER_MODEL"] = options.translation_model or os.getenv(
-            "STANDARD_OPENROUTER_MODEL", "stepfun/step-3.7-flash"
+            "STANDARD_OPENROUTER_MODEL", "x-ai/grok-4.5"
         )
         os.environ["TRANSLATE_REASONING_EFFORT"] = (
             options.reasoning_effort
             or os.getenv("STANDARD_TRANSLATE_REASONING", "minimal")
         )
         os.environ["TRANSLATE_FALLBACK_MODEL"] = os.getenv(
-            "STANDARD_TRANSLATE_FALLBACK_MODEL", "x-ai/grok-4.5"
+            "STANDARD_TRANSLATE_FALLBACK_MODEL", "stepfun/step-3.7-flash"
         )
         def process_video(index: int, source: Path) -> None:
             print(f"\n[video {index}/{len(sources)}] {source.name}")
