@@ -164,12 +164,27 @@ def list_stage_sources(
     *,
     include_published: bool = False,
 ) -> list[Path]:
+    return list_sources_in_directory(
+        stage_name,
+        STAGES[stage_name].directory,
+        include_published=include_published,
+    )
+
+
+def list_sources_in_directory(
+    stage_name: str,
+    directory: str | Path,
+    *,
+    include_published: bool = False,
+) -> list[Path]:
+    """依指定 Profile Inbox 盤點來源，沿用各 Stage 的成品排除規則。"""
     stage = STAGES[stage_name]
-    if not stage.directory.is_dir():
+    root = Path(directory).resolve()
+    if not root.is_dir():
         return []
     return [
         path
-        for path in sorted(stage.directory.iterdir(), key=lambda item: item.name.casefold())
+        for path in sorted(root.iterdir(), key=lambda item: item.name.casefold())
         if path.is_file()
         and path.suffix.casefold() in stage.accepted_extensions
         and (
@@ -391,6 +406,9 @@ def run_stage(
     *,
     moss_worker=None,
     audio_worker=None,
+    source_dir: str | Path | None = None,
+    final_dir: str | Path | None = None,
+    archive_dir: str | Path | None = None,
 ) -> int:
     ensure_output_directories()
     options = resolve_stage_options(stage_name, options)
@@ -425,6 +443,9 @@ def run_stage(
                 options,
                 moss_worker=owned_moss,
                 audio_worker=owned_audio,
+                source_dir=source_dir,
+                final_dir=final_dir,
+                archive_dir=archive_dir,
             )
 
 
@@ -434,9 +455,18 @@ def _execute_stage(
     *,
     moss_worker=None,
     audio_worker=None,
+    source_dir: str | Path | None = None,
+    final_dir: str | Path | None = None,
+    archive_dir: str | Path | None = None,
 ) -> int:
-    sources = list_stage_sources(
-        stage_name, include_published=bool(options.force)
+    sources = (
+        list_sources_in_directory(
+            stage_name,
+            source_dir,
+            include_published=bool(options.force),
+        )
+        if source_dir is not None
+        else list_stage_sources(stage_name, include_published=bool(options.force))
     )
     if not sources:
         print(f"[SKIP] {STAGES[stage_name].title} 沒有待處理來源。")
@@ -451,7 +481,8 @@ def _execute_stage(
             try:
                 preview_pipeline.process_preview_from_grid(
                     source,
-                    final_dir=PREVIEW_VIDEOS_DIR,
+                    final_dir=Path(final_dir or PREVIEW_VIDEOS_DIR),
+                    archive_dir=Path(archive_dir or DOWNLOADED_DIR),
                     keep_work=options.keep_work,
                     enable_asr=options.asr,
                     export_subtitles=options.subtitles,
@@ -492,8 +523,8 @@ def _execute_stage(
             print(f"\n[video {index}/{len(sources)}] {source.name}")
             full_video_pipeline.process_full_video_from_grid(
                 source,
-                final_dir=VIDEOS_DIR,
-                archive_dir=DOWNLOADED_DIR,
+                final_dir=Path(final_dir or VIDEOS_DIR),
+                archive_dir=Path(archive_dir or DOWNLOADED_DIR),
                 keep_proxy=bool(options.keep_work),
                 max_height=options.video_height or 480,
                 enable_enhance=options.enhance,
@@ -539,8 +570,8 @@ def _execute_stage(
             try:
                 full_video_pipeline.process_full_video_from_grid(
                     source,
-                    final_dir=SHORTS_DIR,
-                    archive_dir=DOWNLOADED_DIR,
+                    final_dir=Path(final_dir or SHORTS_DIR),
+                    archive_dir=Path(archive_dir or DOWNLOADED_DIR),
                     keep_proxy=bool(options.keep_work),
                     max_height=1080,
                     enable_enhance=options.enhance,
@@ -573,7 +604,8 @@ def _execute_stage(
 
     successes, failures = chosen_pipeline.process_chosen_items(
         sources,
-        final_dir=GOOD_DIR,
+        final_dir=Path(final_dir or GOOD_DIR),
+        archive_dir=Path(archive_dir or DOWNLOADED_DIR),
         archive_grid=options.archive_grid,
         keep_work=bool(options.keep_work),
         enable_asr=options.asr,

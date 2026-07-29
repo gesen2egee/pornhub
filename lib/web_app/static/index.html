@@ -4,278 +4,351 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <title>Muse — 私人影片研究台</title>
-  <meta name="description" content="多網站搜尋、預覽、下載與字幕整合介面">
+  <title>Muse｜宮格篩選與影片處理台</title>
+  <meta name="description" content="宮格備份、資料夾 Profile、下載工作與影片分類管理">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22><rect width=%2264%22 height=%2264%22 rx=%2214%22 fill=%22%23d6ff3f%22/><path d=%22M16 45V19h8l8 12 8-12h8v26h-8V31l-8 12-8-12v14z%22 fill=%22%23121618%22/></svg>">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <a class="skip-link" href="#main">跳到主要內容</a>
+  <a class="skip-link" href="#workspace">跳到主要內容</a>
 
   <div class="privacy-screen" id="privacyScreen" hidden>
-    <div class="privacy-mark">M</div>
-    <p data-i18n="privacyTitle">畫面已暫時隱藏</p>
-    <button class="button button-primary" data-action="privacy-off" data-i18n="resume">繼續使用</button>
-    <span data-i18n="privacyHint">按 P 或 Esc 返回</span>
+    <div class="privacy-logo">M</div>
+    <strong>畫面已隱藏</strong>
+    <span>按 P 或 Esc 返回</span>
+    <button class="button primary" data-action="privacy-off">繼續使用</button>
   </div>
 
-  <header class="topbar">
-    <a class="brand" href="#" aria-label="Muse 首頁">
-      <span class="brand-mark">M</span>
-      <span class="brand-copy">
-        <strong>Muse</strong>
-        <small data-i18n="brandTagline">私人影片研究台</small>
-      </span>
-    </a>
-    <div class="header-status" aria-live="polite">
-      <span class="status-dot"></span>
-      <span data-i18n="localOnly">僅在本機運作</span>
-    </div>
-    <div class="header-actions">
-      <button class="icon-button" data-action="toggle-blur" title="切換縮圖模糊" aria-label="切換縮圖模糊">
-        <span class="icon-glyph">◉</span>
-      </button>
-      <button class="segmented-button" data-action="locale" aria-label="切換語言">
-        <span class="locale-zh active">中</span><span class="locale-en">EN</span>
-      </button>
-      <button class="icon-button" data-action="theme" title="切換日夜模式" aria-label="切換日夜模式">
-        <span class="theme-icon">☾</span>
-      </button>
-      <button class="avatar-button" data-action="settings" aria-label="開啟設定">設定</button>
-    </div>
-  </header>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#grids" aria-label="Muse 宮格庫">
+        <span class="brand-mark">M</span>
+        <span><strong>Muse</strong><small>本機素材工作台</small></span>
+      </a>
 
-  <main id="main">
-    <section class="hero">
-      <div class="hero-copy">
-        <p class="eyebrow" data-i18n="heroEyebrow">DISCOVER · REVIEW · KEEP</p>
-        <h1 data-i18n="heroTitle">從靈感到收藏，<br><em>只要四步。</em></h1>
-        <p data-i18n="heroDescription">一次搜尋多個來源，在工作分頁裡比較預覽，再把真正想看的內容送進下載與字幕流程。</p>
+      <nav class="main-nav" aria-label="主要功能">
+        <a href="#grids" data-route-link="grids"><span>▦</span><b>宮格庫</b><i id="navGridCount">—</i></a>
+        <a href="#capture" data-route-link="capture"><span>＋</span><b>建立宮格</b></a>
+        <a href="#profiles" data-route-link="profiles"><span>▤</span><b>處理資料夾</b></a>
+        <a href="#jobs" data-route-link="jobs"><span>↻</span><b>下載工作</b><i id="navJobCount"></i></a>
+        <a href="#library" data-route-link="library"><span>▶</span><b>影片庫</b></a>
+        <a href="#settings" data-route-link="settings"><span>⚙</span><b>設定</b></a>
+      </nav>
+
+      <div class="sidebar-status">
+        <span class="status-dot"></span>
+        <div><strong>本機模式</strong><small id="outputRootLabel">讀取工作區中…</small></div>
       </div>
+    </aside>
 
-      <div class="search-console">
-        <div class="search-row">
-          <span class="search-symbol" aria-hidden="true">⌕</span>
-          <input id="searchInput" type="search" autocomplete="off" data-i18n-placeholder="searchPlaceholder" placeholder="輸入關鍵字、貼上影片或列表網址">
-          <button class="button button-primary search-button" data-action="search">
-            <span data-i18n="search">搜尋</span>
-            <kbd>↵</kbd>
-          </button>
+    <div class="app-main">
+      <header class="topbar">
+        <div>
+          <p id="pageEyebrow">GRID LIBRARY</p>
+          <h1 id="pageTitle">宮格庫</h1>
         </div>
-        <div class="search-options">
-          <button class="site-picker-trigger" data-action="site-picker" aria-expanded="false">
-            <span class="stacked-dots" aria-hidden="true"><i></i><i></i><i></i></span>
-            <span id="siteSummary" data-i18n="siteSummary">6 個推薦來源</span>
-            <span>⌄</span>
-          </button>
-          <div class="site-picker" id="sitePicker" hidden>
-            <div class="picker-head">
-              <strong data-i18n="chooseSources">選擇搜尋來源</strong>
-              <button class="text-button" data-action="recommended-sites" data-i18n="recommended">只選推薦</button>
+        <div class="topbar-actions">
+          <button class="icon-button" data-action="refresh-page" title="重新整理" aria-label="重新整理">↻</button>
+          <button class="icon-button" data-action="toggle-blur" title="縮圖模糊" aria-label="切換縮圖模糊">◉</button>
+          <button class="icon-button" data-action="theme" title="日夜模式" aria-label="切換日夜模式">◐</button>
+          <button class="icon-button mobile-settings" data-action="open-settings" title="設定" aria-label="開啟設定">⚙</button>
+        </div>
+      </header>
+
+      <main id="workspace">
+        <section class="page" data-page="grids">
+          <div class="page-heading">
+            <div>
+              <h2>從宮格挑片，再送到指定處理資料夾</h2>
+              <p>宮格保留來源 URL、Metadata 與每格 TAG；路由預設只複製，原檔持續作為備份。</p>
             </div>
-            <div id="siteOptions" class="site-options"></div>
+            <a class="button primary" href="#capture">＋ 建立新宮格</a>
           </div>
-          <span class="option-divider"></span>
-          <label class="compact-field">
-            <span data-i18n="pages">頁數</span>
-            <select id="pageCount">
-              <option value="1">1</option>
-              <option value="2">2</option>
-              <option value="3">3</option>
+
+          <div class="metrics" id="gridMetrics">
+            <article><span>宮格庫</span><strong id="metricGridLibrary">—</strong><small>可篩選備份</small></article>
+            <article><span>已歸檔宮格</span><strong id="metricGridArchive">—</strong><small>完成流程備份</small></article>
+            <article class="wide"><span>路由原則</span><strong>Copy first</strong><small>挑選不會破壞原始宮格</small></article>
+          </div>
+
+          <div class="toolbar sticky-toolbar">
+            <label class="search-field grow">
+              <span>⌕</span>
+              <input id="gridQuery" type="search" placeholder="搜尋標題、來源或 TAG">
+            </label>
+            <select id="gridLocation" aria-label="宮格位置">
+              <option value="all">全部宮格</option>
             </select>
-          </label>
-          <span class="option-hint" data-i18n="searchHint">來源越多，搜尋時間越長</span>
-        </div>
-      </div>
-    </section>
-
-    <section class="workflow" aria-label="工作流程">
-      <button class="workflow-step active" data-view="discover">
-        <span class="step-number">01</span>
-        <span><strong data-i18n="stepDiscover">探索</strong><small data-i18n="stepDiscoverNote">跨站搜尋</small></span>
-      </button>
-      <span class="flow-line"></span>
-      <button class="workflow-step" data-view="preview">
-        <span class="step-number">02</span>
-        <span><strong data-i18n="stepPreview">預覽</strong><small data-i18n="stepPreviewNote">比較篩選</small></span>
-        <span class="count-badge" id="previewCount">0</span>
-      </button>
-      <span class="flow-line"></span>
-      <button class="workflow-step" data-view="queue">
-        <span class="step-number">03</span>
-        <span><strong data-i18n="stepQueue">佇列</strong><small data-i18n="stepQueueNote">確認品質</small></span>
-        <span class="count-badge" id="queueCount">0</span>
-      </button>
-      <span class="flow-line"></span>
-      <button class="workflow-step" data-view="library">
-        <span class="step-number">04</span>
-        <span><strong data-i18n="stepLibrary">收藏</strong><small data-i18n="stepLibraryNote">播放字幕</small></span>
-      </button>
-    </section>
-
-    <section class="workspace">
-      <div class="workspace-head">
-        <div class="workspace-title">
-          <div class="view-tabs" role="tablist">
-            <button class="view-tab active" data-view="discover" role="tab" aria-selected="true" data-i18n="allResults">全部結果</button>
-            <button class="view-tab" data-view="preview" role="tab" aria-selected="false">
-              <span data-i18n="previewTabs">預覽分頁</span>
-              <span class="tab-count" id="previewTabCount">0</span>
-            </button>
-            <button class="view-tab" data-view="queue" role="tab" aria-selected="false">
-              <span data-i18n="downloadQueue">下載佇列</span>
-              <span class="tab-count" id="queueTabCount">0</span>
-            </button>
-            <button class="view-tab" data-view="library" role="tab" aria-selected="false" data-i18n="myLibrary">我的收藏</button>
+            <input id="gridIncludeTags" class="tag-input" type="text" placeholder="包含 TAG，逗號分隔">
+            <input id="gridExcludeTags" class="tag-input" type="text" placeholder="排除 TAG，逗號分隔">
+            <button class="button subtle" data-action="apply-grid-filter">套用</button>
+            <button class="icon-button" data-action="grid-density" title="顯示密度">▦</button>
           </div>
-          <p id="resultSummary" aria-live="polite" data-i18n="emptySummary">準備好後，從上方開始搜尋</p>
-        </div>
-        <div class="workspace-tools">
-          <div class="density-control" role="group" aria-label="顯示密度">
-            <button class="active" data-density="comfortable" aria-label="舒適卡片">▦</button>
-            <button data-density="compact" aria-label="緊密卡片">▤</button>
-          </div>
-          <label class="sort-control">
-            <span data-i18n="sort">排序</span>
-            <select id="sortSelect">
-              <option value="relevance" data-i18n="sortRelevance">最相關</option>
-              <option value="newest" data-i18n="sortNewest">最新</option>
-              <option value="views" data-i18n="sortViews">最多觀看</option>
-              <option value="durationAsc" data-i18n="sortShortest">最短</option>
-              <option value="durationDesc" data-i18n="sortLongest">最長</option>
-              <option value="title" data-i18n="sortTitle">標題</option>
-            </select>
-          </label>
-          <button class="button button-secondary" data-action="filters" aria-expanded="false">
-            <span class="filter-symbol">≡</span>
-            <span data-i18n="filters">篩選</span>
-            <span class="filter-count" id="filterCount" hidden>0</span>
-          </button>
-        </div>
-      </div>
 
-      <div class="active-filter-row" id="activeFilters" hidden></div>
-      <aside class="filter-panel" id="filterPanel" hidden>
-        <div class="filter-group filter-search-group">
-          <strong data-i18n="filterKeyword">結果內關鍵字</strong>
-          <input id="withinQuery" class="filter-input" type="search" data-i18n-placeholder="filterKeywordPlaceholder" placeholder="標題、標籤或作者">
-        </div>
-        <div class="filter-group">
-          <strong data-i18n="source">來源</strong>
-          <select id="sourceFilter" class="filter-input">
-            <option value="all" data-i18n="allSources">全部來源</option>
-          </select>
-        </div>
-        <div class="filter-group">
-          <strong data-i18n="duration">片長</strong>
-          <div class="chip-row" id="durationChips">
-            <button class="filter-chip active" data-duration="all" data-i18n="any">不限</button>
-            <button class="filter-chip" data-duration="short">&lt; 10m</button>
-            <button class="filter-chip" data-duration="medium">10–30m</button>
-            <button class="filter-chip" data-duration="long">30m+</button>
+          <div class="result-line">
+            <span id="gridResultText">正在讀取宮格索引…</span>
+            <button class="text-button" data-action="select-visible">選取目前頁面</button>
           </div>
-        </div>
-        <div class="filter-group">
-          <strong data-i18n="availability">狀態</strong>
-          <label class="check-row"><input id="subtitleOnly" type="checkbox"><span data-i18n="hasSubtitle">已有軟字幕</span></label>
-          <label class="check-row"><input id="hideUnknown" type="checkbox"><span data-i18n="hideUnknown">隱藏未知片長</span></label>
-        </div>
-        <button class="text-button danger" data-action="clear-filters" data-i18n="clearFilters">清除全部篩選</button>
+          <div class="card-grid grid-library" id="gridCards"></div>
+          <div class="loading-card" id="gridLoading" hidden><span class="spinner"></span>正在建立宮格索引…</div>
+          <button class="button load-more" id="gridLoadMore" data-action="load-more-grids" hidden>載入更多宮格</button>
+        </section>
+
+        <section class="page" data-page="capture" hidden>
+          <div class="page-heading">
+            <div>
+              <h2>建立 5×5 宮格備份</h2>
+              <p>直接對應 `01_run_capture.bat`：輸入關鍵字、單片 URL 或列表 URL，完成後自動出現在宮格庫。</p>
+            </div>
+          </div>
+
+          <div class="capture-layout">
+            <form class="panel capture-form" id="captureForm">
+              <div class="panel-head">
+                <span class="step-badge">01</span>
+                <div><h3>來源與擷取範圍</h3><p>每支影片固定建立 25 格並寫入 TAG。</p></div>
+              </div>
+              <label class="field full">
+                <span>關鍵字／影片 URL／列表 URL</span>
+                <textarea id="captureTarget" rows="5" required placeholder="例如：massage&#10;或 https://…"></textarea>
+              </label>
+              <div class="form-grid three">
+                <label class="field"><span>頁數</span><input id="capturePages" type="number" min="1" max="20" value="1"></label>
+                <label class="field"><span>最多影片</span><input id="captureMaxVideos" type="number" min="0" max="500" value="20"><small>0 代表不限制</small></label>
+                <label class="field"><span>擷取畫質</span>
+                  <select id="captureQuality">
+                    <option value="360p">360P</option>
+                    <option value="480p" selected>480P</option>
+                    <option value="720p">720P</option>
+                    <option value="1080p">1080P</option>
+                    <option value="best">Best</option>
+                  </select>
+                </label>
+              </div>
+              <div class="callout">
+                <span>ⓘ</span>
+                <p><strong>完成後不會直接下載影片。</strong>宮格先進入宮格庫，由你挑選後才複製到某個處理 Profile 的 Inbox。</p>
+              </div>
+              <button class="button primary large" type="submit">開始建立宮格</button>
+            </form>
+
+            <aside class="panel flow-preview">
+              <h3>實際資料流</h3>
+              <ol>
+                <li><span>1</span><div><strong>解析來源</strong><small>網址、搜尋或列表</small></div></li>
+                <li><span>2</span><div><strong>同步擷取 25 格</strong><small>480P 預設，可自訂</small></div></li>
+                <li><span>3</span><div><strong>GPU TAGGER</strong><small>每格時間與視覺 TAG</small></div></li>
+                <li><span>4</span><div><strong>寫入宮格備份</strong><small>URL、Metadata、TAG 都在 JPG</small></div></li>
+              </ol>
+              <a class="button subtle full-width" href="#jobs">查看建立進度</a>
+            </aside>
+          </div>
+        </section>
+
+        <section class="page" data-page="profiles" hidden>
+          <div class="page-heading">
+            <div>
+              <h2>資料夾就是一套處理 Profile</h2>
+              <p>每個 Inbox 都能有自己的畫質、分鐘數、ASR、翻譯、剪片、字幕、增強與輸出位置。</p>
+            </div>
+            <button class="button primary" data-action="add-profile">＋ 新增 Profile</button>
+          </div>
+          <div class="profile-grid" id="profileCards"></div>
+          <div class="loading-card" id="profileLoading"><span class="spinner"></span>正在盤點處理資料夾…</div>
+        </section>
+
+        <section class="page" data-page="jobs" hidden>
+          <div class="page-heading">
+            <div>
+              <h2>真實下載與處理工作</h2>
+              <p>宮格建立與各 Profile 依序排隊；可查看目前 Pipeline 階段、Log、取消或重試。</p>
+            </div>
+            <button class="button subtle" data-action="refresh-jobs">重新整理</button>
+          </div>
+          <div class="job-list" id="jobList"></div>
+          <div class="empty-panel" id="jobEmpty" hidden><span>↻</span><h3>尚無工作紀錄</h3><p>建立宮格或執行處理 Profile 後會顯示在這裡。</p></div>
+        </section>
+
+        <section class="page" data-page="library" hidden>
+          <div class="page-heading">
+            <div>
+              <h2>依資料夾管理與觀看影片</h2>
+              <p>影片、字幕與相關 Sidecar 會一起移動；刪除先進入可復原回收區。</p>
+            </div>
+          </div>
+          <div class="toolbar sticky-toolbar">
+            <label class="search-field grow"><span>⌕</span><input id="videoQuery" type="search" placeholder="搜尋影片標題、來源或 TAG"></label>
+            <select id="videoLocation" aria-label="影片資料夾"><option value="all">全部影片</option></select>
+            <label class="inline-field"><span>一鍵收藏到</span><select id="favoriteTarget"></select></label>
+            <button class="button subtle" data-action="apply-video-filter">套用</button>
+          </div>
+          <div class="result-line"><span id="videoResultText">正在讀取影片庫…</span></div>
+          <div class="card-grid video-library" id="videoCards"></div>
+          <div class="loading-card" id="videoLoading" hidden><span class="spinner"></span>正在建立影片索引與縮圖…</div>
+          <button class="button load-more" id="videoLoadMore" data-action="load-more-videos" hidden>載入更多影片</button>
+        </section>
+
+        <section class="page" data-page="settings" hidden>
+          <div class="page-heading">
+            <div>
+              <h2>本機工作區設定</h2>
+              <p>收藏資料夾、回收區、宮格預設與介面偏好都能在這裡調整。</p>
+            </div>
+            <button class="button primary" data-action="save-settings">儲存設定</button>
+          </div>
+
+          <div class="settings-columns">
+            <section class="panel settings-section">
+              <div class="panel-head"><span class="step-badge">⌂</span><div><h3>路徑與收藏</h3><p>可使用絕對路徑或專案相對路徑。</p></div></div>
+              <label class="field"><span>目前 Output Root</span><input id="settingsOutputRoot" readonly><small>全域 Root 仍可由 `PORN_OUTPUT_DIR` 啟動環境變數覆寫。</small></label>
+              <label class="field"><span>可復原回收區</span><input id="settingsTrashDir"></label>
+              <div class="subsection-head"><strong>一鍵收藏資料夾</strong><button class="text-button" data-action="add-favorite-folder">＋ 新增</button></div>
+              <div class="folder-editor-list" id="favoriteFolderList"></div>
+            </section>
+
+            <section class="panel settings-section">
+              <div class="panel-head"><span class="step-badge">01</span><div><h3>建立宮格預設</h3><p>新工作仍可在送出前覆寫。</p></div></div>
+              <div class="form-grid three">
+                <label class="field"><span>畫質</span><select id="settingsCaptureQuality"><option>360p</option><option>480p</option><option>720p</option><option>1080p</option><option>best</option></select></label>
+                <label class="field"><span>頁數</span><input id="settingsCapturePages" type="number" min="1" max="20"></label>
+                <label class="field"><span>最多影片</span><input id="settingsCaptureMax" type="number" min="0" max="500"></label>
+              </div>
+              <div class="subsection-head"><strong>介面與隱私</strong></div>
+              <label class="switch-row"><span><strong>預設模糊縮圖</strong><small>游標移入或關閉後才顯示</small></span><input id="settingsBlur" type="checkbox" class="switch"></label>
+              <label class="switch-row"><span><strong>記住播放進度</strong><small>只存在目前瀏覽器</small></span><input id="settingsProgress" type="checkbox" class="switch"></label>
+              <label class="switch-row"><span><strong>有字幕時自動開啟</strong><small>優先顯示繁體中文字幕</small></span><input id="settingsSubtitle" type="checkbox" class="switch"></label>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div class="bulk-bar" id="bulkBar" hidden>
+    <div><strong id="bulkCount">0</strong><span> 個宮格已選</span></div>
+    <button class="text-button" data-action="clear-grid-selection">取消選取</button>
+    <span class="bulk-spacer"></span>
+    <select id="bulkProfile" aria-label="目標處理 Profile"></select>
+    <select id="bulkRouteMode" aria-label="路由方式">
+      <option value="copy">複製（保留宮格備份）</option>
+      <option value="move">移動</option>
+    </select>
+    <button class="button primary" data-action="route-selected-grids">送入處理資料夾</button>
+  </div>
+
+  <dialog class="detail-dialog" id="gridDialog">
+    <div class="dialog-head">
+      <div><span class="dialog-kicker">GRID BACKUP</span><h2 id="gridDialogTitle">宮格</h2></div>
+      <button class="icon-button" data-action="close-grid-dialog" aria-label="關閉">×</button>
+    </div>
+    <div class="grid-detail-layout">
+      <div class="grid-zoom"><img id="gridDialogImage" alt="完整 5×5 宮格"></div>
+      <aside class="inspector">
+        <dl id="gridDialogMeta"></dl>
+        <div><strong>常見 TAG</strong><div class="tag-list" id="gridDialogTags"></div></div>
+        <a id="gridDialogSource" class="button subtle full-width" target="_blank" rel="noreferrer">開啟來源頁</a>
+        <label class="field"><span>送入 Profile</span><select id="gridDialogProfile"></select></label>
+        <button class="button primary full-width" data-action="route-dialog-grid">複製到處理資料夾</button>
       </aside>
-
-      <div class="bulk-bar" id="bulkBar" hidden>
-        <span><strong id="selectedCount">0</strong> <span data-i18n="selected">個已選</span></span>
-        <button class="text-button" data-action="clear-selection" data-i18n="clearSelection">取消選取</button>
-        <span class="bulk-spacer"></span>
-        <button class="button button-secondary" data-action="move-preview" data-i18n="addPreview">加入預覽</button>
-        <button class="button button-primary" data-action="move-queue" data-i18n="addQueue">加入佇列</button>
-      </div>
-
-      <div id="contentArea">
-        <div class="empty-state" id="emptyState">
-          <div class="empty-visual">
-            <span></span><span></span><span></span>
-            <i>⌕</i>
-          </div>
-          <h2 data-i18n="emptyTitle">你的研究桌面已準備好</h2>
-          <p data-i18n="emptyDescription">輸入關鍵字並選擇來源；結果會留在本機，不會建立雲端帳號或同步紀錄。</p>
-          <div class="quick-searches">
-            <span data-i18n="trySearch">試試：</span>
-            <button data-query="asmr">ASMR</button>
-            <button data-query="story">Story</button>
-            <button data-query="massage">Massage</button>
-          </div>
-        </div>
-        <div class="loading-state" id="loadingState" hidden>
-          <div class="loading-orbit"><span></span></div>
-          <h2 data-i18n="searching">正在搜尋多個來源</h2>
-          <p id="loadingMessage" data-i18n="searchingNote">先回來的結果會優先整理，請稍候。</p>
-          <div class="skeleton-grid">
-            <i></i><i></i><i></i><i></i>
-          </div>
-        </div>
-        <div class="media-grid" id="mediaGrid" hidden></div>
-      </div>
-    </section>
-  </main>
-
-  <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+    </div>
+  </dialog>
 
   <dialog class="player-dialog" id="playerDialog">
     <div class="dialog-head">
-      <div>
-        <span class="source-pill" id="playerSource">LOCAL</span>
-        <h2 id="playerTitle">Preview</h2>
-      </div>
-      <button class="icon-button" data-action="close-player" aria-label="關閉播放器">×</button>
+      <div><span class="dialog-kicker" id="playerLocation">VIDEO</span><h2 id="playerTitle">影片</h2></div>
+      <button class="icon-button" data-action="close-player" aria-label="關閉">×</button>
     </div>
-    <div class="player-stage">
-      <video id="videoPlayer" controls playsinline preload="metadata">
-        <track id="subtitleTrack" kind="subtitles" srclang="zh-Hant" label="繁體中文">
-      </video>
-      <div class="player-fallback" id="playerFallback" hidden>
-        <span>↗</span>
-        <p data-i18n="remotePlaybackNote">此來源無法直接在瀏覽器播放，可開啟原始頁面或先加入動態預覽。</p>
-        <a class="button button-primary" id="sourceLink" target="_blank" rel="noreferrer" data-i18n="openSource">開啟來源</a>
-      </div>
-    </div>
-    <div class="dialog-actions">
-      <span id="subtitleStatus" class="subtitle-status"></span>
-      <span class="dialog-spacer"></span>
-      <button class="button button-secondary" data-action="dialog-preview" data-i18n="movePreview">移到預覽分頁</button>
-      <button class="button button-primary" data-action="dialog-queue" data-i18n="addQueue">加入佇列</button>
+    <video id="videoPlayer" controls playsinline preload="metadata">
+      <track id="subtitleTrack" kind="subtitles" srclang="zh-Hant" label="繁體中文">
+    </video>
+    <div class="player-actions">
+      <span id="playerSubtitleState">檢查字幕中…</span>
+      <span class="bulk-spacer"></span>
+      <select id="playerFavoriteTarget"></select>
+      <button class="button subtle" data-action="favorite-current-video">移到收藏</button>
+      <button class="button danger" data-action="trash-current-video">移到回收區</button>
     </div>
   </dialog>
 
-  <dialog class="settings-dialog" id="settingsDialog">
-    <div class="dialog-head">
-      <div>
-        <p class="eyebrow" data-i18n="preferences">PREFERENCES</p>
-        <h2 data-i18n="settings">介面設定</h2>
+  <dialog class="profile-dialog" id="profileDialog">
+    <form id="profileForm">
+      <div class="dialog-head">
+        <div><span class="dialog-kicker">FOLDER PROFILE</span><h2 id="profileDialogTitle">編輯處理 Profile</h2></div>
+        <button class="icon-button" type="button" data-action="close-profile-dialog" aria-label="關閉">×</button>
       </div>
-      <button class="icon-button" data-action="close-settings" aria-label="關閉設定">×</button>
-    </div>
-    <div class="settings-list">
-      <label>
-        <span><strong data-i18n="defaultBlur">預設模糊縮圖</strong><small data-i18n="defaultBlurNote">離開座位時更安心</small></span>
-        <input id="blurSetting" class="switch" type="checkbox">
-      </label>
-      <label>
-        <span><strong data-i18n="rememberProgress">記住播放進度</strong><small data-i18n="rememberProgressNote">只保存在這台裝置</small></span>
-        <input id="progressSetting" class="switch" type="checkbox" checked>
-      </label>
-      <label>
-        <span><strong data-i18n="autoSubtitle">自動開啟繁中字幕</strong><small data-i18n="autoSubtitleNote">有字幕時自動顯示</small></span>
-        <input id="subtitleSetting" class="switch" type="checkbox" checked>
-      </label>
-    </div>
-    <div class="shortcut-card">
-      <strong data-i18n="shortcuts">快捷鍵</strong>
-      <span><kbd>/</kbd><span data-i18n="focusSearch">搜尋</span></span>
-      <span><kbd>P</kbd><span data-i18n="privacyMode">隱私畫面</span></span>
-      <span><kbd>Esc</kbd><span data-i18n="close">關閉</span></span>
-    </div>
+      <input id="profileId" type="hidden">
+      <input id="profileSystem" type="hidden">
+      <div class="profile-form-body">
+        <section class="form-section">
+          <h3>資料夾與用途</h3>
+          <div class="form-grid two">
+            <label class="field"><span>Profile 名稱</span><input id="profileName" required maxlength="80"></label>
+            <label class="field"><span>處理模式</span>
+              <select id="profileMode">
+                <option value="preview">Preview｜低成本預覽</option>
+                <option value="shorts">Shorts｜精準片段</option>
+                <option value="video">Video｜標準成品</option>
+                <option value="chosen">Chosen｜高畫質精選</option>
+              </select>
+            </label>
+          </div>
+          <label class="field"><span>Inbox 資料夾</span><input id="profileInbox" required></label>
+          <label class="field"><span>成品資料夾</span><input id="profileOutput" required></label>
+          <label class="field"><span>宮格備份資料夾</span><input id="profileArchive" required></label>
+          <div class="form-grid two">
+            <label class="field"><span>送入方式</span><select id="profileRouteMode"><option value="copy">複製並保留宮格庫</option><option value="move">移動宮格</option></select></label>
+            <label class="switch-row compact"><span><strong>啟用 Profile</strong><small>停用後仍保留設定</small></span><input id="profileEnabled" type="checkbox" class="switch"></label>
+          </div>
+        </section>
+
+        <section class="form-section">
+          <h3>核心 Pipeline 開關</h3>
+          <div class="switch-grid">
+            <label class="switch-row"><span><strong>ASR</strong><small>語音辨識</small></span><input data-option="asr" type="checkbox" class="switch"></label>
+            <label class="switch-row"><span><strong>Demucs ASR</strong><small>辨識前分離人聲</small></span><input data-option="demucs_asr" type="checkbox" class="switch"></label>
+            <label class="switch-row"><span><strong>ASR Stream</strong><small>分段下載與批次辨識</small></span><input data-option="asr_stream" type="checkbox" class="switch"></label>
+            <label class="switch-row"><span><strong>輸出 SRT</strong><small>外掛軟字幕</small></span><input data-option="subtitles" type="checkbox" class="switch"></label>
+            <label class="switch-row"><span><strong>翻譯</strong><small>使用 OpenRouter</small></span><input data-option="translation" type="checkbox" class="switch"></label>
+            <label class="switch-row"><span><strong>對白剪片</strong><small>依字幕時間軸去空白</small></span><input data-option="dialogue_trim" type="checkbox" class="switch"></label>
+            <label class="switch-row"><span><strong>精選下載</strong><small>只抓保留時間範圍</small></span><input data-option="selective_download" type="checkbox" class="switch"></label>
+            <label class="switch-row"><span><strong>30 秒三段</strong><small>Video／Chosen 適用</small></span><input data-option="three_phase_selection" type="checkbox" class="switch"></label>
+            <label class="switch-row"><span><strong>0.75 秒延伸</strong><small>對白前後補空間</small></span><input data-option="edge_padding" type="checkbox" class="switch"></label>
+            <label class="switch-row"><span><strong>音訊增強</strong><small>自動判斷 Enhance</small></span><input data-option="enhance" type="checkbox" class="switch"></label>
+            <label class="switch-row"><span><strong>Metadata</strong><small>寫回影片與宮格</small></span><input data-option="metadata" type="checkbox" class="switch"></label>
+            <label class="switch-row"><span><strong>歸檔工作宮格</strong><small>原宮格庫備份不受影響</small></span><input data-option="archive" type="checkbox" class="switch"></label>
+            <label class="switch-row"><span><strong>保留工作檔</strong><small>除錯用，會占空間</small></span><input data-option="keep_work" type="checkbox" class="switch"></label>
+            <label class="switch-row"><span><strong>重用 ASR Cache</strong><small>避免重複辨識</small></span><input data-option="reuse_cache" type="checkbox" class="switch"></label>
+            <label class="switch-row danger-setting"><span><strong>Force 重跑</strong><small>覆寫既有結果判斷</small></span><input data-option="force" type="checkbox" class="switch"></label>
+          </div>
+        </section>
+
+        <section class="form-section">
+          <h3>模型、分鐘數與品質</h3>
+          <div class="form-grid three">
+            <label class="field"><span>Preview 每段秒數（180 = 3 分鐘）</span><input data-option="preview_seconds" type="number" min="1"></label>
+            <label class="field"><span>Video 高度</span><input data-option="video_height" type="number" min="144"></label>
+            <label class="field"><span>Chosen 高度</span><input data-option="chosen_height" type="number" min="144"></label>
+            <label class="field"><span>ASR Backend</span><select data-option="asr_backend"><option>moss</option><option>whisper</option><option>voxtral</option><option>grok-stt</option></select></label>
+            <label class="field wide-field"><span>翻譯 Model</span><input data-option="translation_model"></label>
+            <label class="field"><span>Reasoning</span><select data-option="reasoning_effort"><option>none</option><option>minimal</option><option>low</option><option>medium</option><option>high</option></select></label>
+            <label class="field"><span>啟動剪片門檻（秒）</span><input data-option="trim_threshold" type="number" min="0.1" step="0.1"></label>
+            <label class="field"><span>停頓切段（秒）</span><input data-option="segment_gap" type="number" min="0" step="0.1"></label>
+            <label class="field"><span>ASR Chunk（秒）</span><input data-option="asr_chunk_seconds" type="number" min="1"></label>
+            <label class="field"><span>ASR Batch Size</span><input data-option="asr_batch_size" type="number" min="1"></label>
+          </div>
+          <div class="validation-message" id="profileValidation" hidden></div>
+        </section>
+      </div>
+      <div class="dialog-footer">
+        <button class="button danger" id="deleteProfileButton" type="button" data-action="delete-profile" hidden>刪除 Profile</button>
+        <span class="bulk-spacer"></span>
+        <button class="button subtle" type="button" data-action="close-profile-dialog">取消</button>
+        <button class="button primary" type="submit">儲存 Profile</button>
+      </div>
+    </form>
   </dialog>
 
+  <div class="toast-region" id="toastRegion" aria-live="polite"></div>
   <script src="/app.js" defer></script>
 </body>
 </html>

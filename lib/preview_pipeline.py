@@ -257,6 +257,7 @@ def collect_preview_until_dialogue(
 def process_preview_from_grid(
     jpg_path: Path,
     final_dir: Path | None = None,
+    archive_dir: Path | None = None,
     keep_work: bool = False,
     enable_asr: bool | None = None,
     export_subtitles: bool | None = None,
@@ -599,7 +600,7 @@ def process_preview_from_grid(
     if archive_grid_on_done and source_is_grid and jpg_path.exists():
         from project_paths import DOWNLOADED_DIR
 
-        fvp.archive_grid(jpg_path, DOWNLOADED_DIR)
+        fvp.archive_grid(jpg_path, Path(archive_dir or DOWNLOADED_DIR))
 
     if not keep_work:
         shutil.rmtree(work_dir, ignore_errors=True)

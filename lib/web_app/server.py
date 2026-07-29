@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
-import os
 import re
 import sys
 import webbrowser
@@ -17,7 +16,6 @@ from urllib.parse import parse_qs, unquote, urlsplit
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from project_paths import PREVIEW_VIDEOS_DIR, VIDEOS_DIR
 from web_app.services import (
     TASKS,
     decode_media_id,
@@ -27,10 +25,23 @@ from web_app.services import (
     search_sites,
     srt_to_vtt,
 )
+from web_app.workspace import (
+    allowed_roots,
+    dashboard_summary,
+    get_settings,
+    list_grids,
+    list_videos,
+    move_media,
+    profile_inventory,
+    restore_trashed_media,
+    route_grids,
+    save_settings,
+    thumbnail_path,
+    trash_media,
+)
 
 
 STATIC_DIR = Path(__file__).with_name("static")
-ALLOWED_MEDIA_ROOTS = (Path(PREVIEW_VIDEOS_DIR), Path(VIDEOS_DIR))
 MIME_TYPES = {
     ".js": "text/javascript; charset=utf-8",
     ".css": "text/css; charset=utf-8",
@@ -96,6 +107,47 @@ class MuseHandler(BaseHTTPRequestHandler):
                 items = scan_library()
                 self._send_json({"items": items, "count": len(items)})
                 return
+            if path == "/api/summary":
+                self._send_json(dashboard_summary())
+                return
+            if path == "/api/settings":
+                self._send_json({"settings": get_settings()})
+                return
+            if path == "/api/profiles":
+                self._send_json({"profiles": profile_inventory()})
+                return
+            if path == "/api/grids":
+                query = parse_qs(parsed.query)
+                payload = list_grids(
+                    query=(query.get("q") or [""])[0],
+                    location=(query.get("location") or ["all"])[0],
+                    include_tags=[
+                        item
+                        for raw in query.get("includeTags", [])
+                        for item in raw.split(",")
+                        if item
+                    ],
+                    exclude_tags=[
+                        item
+                        for raw in query.get("excludeTags", [])
+                        for item in raw.split(",")
+                        if item
+                    ],
+                    page=int((query.get("page") or ["1"])[0]),
+                    page_size=int((query.get("pageSize") or ["36"])[0]),
+                )
+                self._send_json(payload)
+                return
+            if path == "/api/videos":
+                query = parse_qs(parsed.query)
+                payload = list_videos(
+                    query=(query.get("q") or [""])[0],
+                    location=(query.get("location") or ["all"])[0],
+                    page=int((query.get("page") or ["1"])[0]),
+                    page_size=int((query.get("pageSize") or ["36"])[0]),
+                )
+                self._send_json(payload)
+                return
             if path == "/api/tasks":
                 self._send_json({"tasks": TASKS.all()})
                 return
@@ -119,6 +171,12 @@ class MuseHandler(BaseHTTPRequestHandler):
             if path.startswith("/media/"):
                 self._send_media(path.removeprefix("/media/"))
                 return
+            if path.startswith("/asset/"):
+                self._send_asset(path.removeprefix("/asset/"))
+                return
+            if path.startswith("/thumbnail/"):
+                self._send_thumbnail(path.removeprefix("/thumbnail/"))
+                return
             if path.startswith("/subtitles/") and path.endswith(".vtt"):
                 media_id = path.removeprefix("/subtitles/").removesuffix(".vtt")
                 self._send_subtitle(media_id)
@@ -138,6 +196,19 @@ class MuseHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         try:
             payload = self._read_json()
+            if parsed.path == "/api/settings":
+                settings = save_settings(dict(payload.get("settings") or payload))
+                self._send_json({"settings": settings})
+                return
+            if parsed.path == "/api/capture":
+                task = TASKS.start_grid_capture(
+                    str(payload.get("target") or ""),
+                    pages=int(payload.get("pages") or 1),
+                    max_videos=int(payload.get("maxVideos") or 20),
+                    quality=str(payload.get("quality") or "480p"),
+                )
+                self._send_json({"task": task}, HTTPStatus.ACCEPTED)
+                return
             if parsed.path == "/api/queue":
                 task = TASKS.start_capture(
                     list(payload.get("items") or []),
@@ -151,6 +222,41 @@ class MuseHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/download/start":
                 task = TASKS.start_download()
+                self._send_json({"task": task}, HTTPStatus.ACCEPTED)
+                return
+            if parsed.path == "/api/profiles/run":
+                task = TASKS.start_profile(str(payload.get("profileId") or ""))
+                self._send_json({"task": task}, HTTPStatus.ACCEPTED)
+                return
+            if parsed.path == "/api/grids/route":
+                result = route_grids(
+                    list(payload.get("itemIds") or []),
+                    str(payload.get("profileId") or ""),
+                    mode=str(payload.get("mode") or "") or None,
+                )
+                self._send_json(result)
+                return
+            if parsed.path == "/api/media/move":
+                result = move_media(
+                    str(payload.get("itemId") or ""),
+                    str(payload.get("targetId") or ""),
+                )
+                self._send_json(result)
+                return
+            if parsed.path == "/api/media/trash":
+                result = trash_media(str(payload.get("itemId") or ""))
+                self._send_json(result)
+                return
+            if parsed.path == "/api/media/restore":
+                result = restore_trashed_media(str(payload.get("token") or ""))
+                self._send_json(result)
+                return
+            if parsed.path == "/api/tasks/cancel":
+                task = TASKS.cancel(str(payload.get("taskId") or ""))
+                self._send_json({"task": task})
+                return
+            if parsed.path == "/api/tasks/retry":
+                task = TASKS.retry(str(payload.get("taskId") or ""))
                 self._send_json({"task": task}, HTTPStatus.ACCEPTED)
                 return
             self._send_json({"error": "未知的操作"}, HTTPStatus.NOT_FOUND)
@@ -190,7 +296,7 @@ class MuseHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_media(self, media_id: str) -> None:
-        path = decode_media_id(media_id, ALLOWED_MEDIA_ROOTS)
+        path = decode_media_id(media_id, allowed_roots())
         if not path.is_file():
             raise FileNotFoundError
         total = path.stat().st_size
@@ -232,7 +338,7 @@ class MuseHandler(BaseHTTPRequestHandler):
                 remaining -= len(chunk)
 
     def _send_subtitle(self, media_id: str) -> None:
-        media = decode_media_id(media_id, ALLOWED_MEDIA_ROOTS)
+        media = decode_media_id(media_id, allowed_roots())
         subtitle = media.with_suffix(".srt")
         if not subtitle.is_file():
             raise FileNotFoundError
@@ -242,6 +348,32 @@ class MuseHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/vtt; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-cache")
+        self._security_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_asset(self, asset_id: str) -> None:
+        path = decode_media_id(asset_id, allowed_roots())
+        if not path.is_file():
+            raise FileNotFoundError
+        self._send_binary_file(path, cache_control="private, max-age=300")
+
+    def _send_thumbnail(self, asset_id: str) -> None:
+        path = decode_media_id(asset_id, allowed_roots())
+        if not path.is_file():
+            raise FileNotFoundError
+        thumbnail = thumbnail_path(path)
+        self._send_binary_file(thumbnail, cache_control="private, max-age=86400")
+
+    def _send_binary_file(self, path: Path, *, cache_control: str) -> None:
+        body = path.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header(
+            "Content-Type",
+            mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+        )
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", cache_control)
         self._security_headers()
         self.end_headers()
         self.wfile.write(body)

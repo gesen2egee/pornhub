@@ -19,6 +19,7 @@ from pipeline_control import (
     print_stage_inventory,
     resolve_stage_options,
     run_interactive,
+    run_stage,
     run_stages,
     validate_stage_options,
 )
@@ -158,6 +159,21 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         metavar="STAGE",
         help="指定 preview、shorts、video、chosen；可用空白或逗號分隔",
+    )
+    parser.add_argument(
+        "--source-dir",
+        type=Path,
+        help="使用自訂 Profile Inbox；只能搭配單一 --stages",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="自訂 Profile 成品資料夾；只能搭配 --source-dir",
+    )
+    parser.add_argument(
+        "--archive-dir",
+        type=Path,
+        help="自訂 Profile 宮格備份資料夾；只能搭配 --source-dir",
     )
     _boolean_switch(parser, "translation", "開啟或關閉 OpenRouter 翻譯")
     _boolean_switch(parser, "asr", "開啟或關閉語音辨識")
@@ -363,6 +379,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--keep-proxy 只能搭配 --grid")
     if args.grid and (args.stages or args.interactive or args.list):
         parser.error("--grid 不能混用 --stages、--interactive 或 --list")
+    if args.grid and (args.source_dir or args.output_dir or args.archive_dir):
+        parser.error("--grid 不能混用自訂 Profile 資料夾")
+    if (args.output_dir or args.archive_dir) and not args.source_dir:
+        parser.error("--output-dir、--archive-dir 必須搭配 --source-dir")
+    if args.source_dir and (args.interactive or args.list):
+        parser.error("自訂 Profile 資料夾不能搭配 --interactive 或 --list")
     if args.list and any(
         getattr(args, name) is not None
         for name in (
@@ -396,6 +418,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--list 只盤點檔案，不能混用功能開關")
     if (args.retry_subtitles or args.repair_over_1080) and (
         args.grid
+        or args.source_dir
+        or args.output_dir
+        or args.archive_dir
         or args.stages
         or args.interactive
         or args.list
@@ -440,6 +465,8 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"錯誤：{exc}", file=sys.stderr)
         return 2
+    if args.source_dir and len(stages) != 1:
+        parser.error("--source-dir 必須明確指定單一 --stages")
     if args.preview_seconds is not None and "preview" not in stages:
         parser.error("--preview-seconds 只能用於 preview 層")
     if args.video_height is not None and "video" not in stages:
@@ -478,11 +505,20 @@ def main(argv: list[str] | None = None) -> int:
             print_stage_inventory(stage)
         return 0
     try:
-        failures = (
-            run_interactive(options, stages)
-            if args.interactive
-            else run_stages(stages, options)
-        )
+        if args.source_dir:
+            failures = run_stage(
+                stages[0],
+                options,
+                source_dir=args.source_dir.resolve(),
+                final_dir=args.output_dir.resolve() if args.output_dir else None,
+                archive_dir=args.archive_dir.resolve() if args.archive_dir else None,
+            )
+        else:
+            failures = (
+                run_interactive(options, stages)
+                if args.interactive
+                else run_stages(stages, options)
+            )
     except ValueError as exc:
         print(f"設定錯誤：{exc}", file=sys.stderr)
         return 2

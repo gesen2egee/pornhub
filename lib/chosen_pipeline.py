@@ -193,6 +193,7 @@ def process_chosen_grid(
     jpg_path: Path,
     *,
     final_dir: Path = GOOD_DIR,
+    archive_dir: Path = DOWNLOADED_DIR,
     archive_grid: bool = True,
     keep_work: bool = False,
     enable_asr: bool | None = None,
@@ -223,7 +224,7 @@ def process_chosen_grid(
     return full_video_pipeline.process_full_video_from_grid(
         jpg_path,
         final_dir=final_dir,
-        archive_dir=DOWNLOADED_DIR,
+        archive_dir=archive_dir,
         keep_proxy=keep_work,
         max_height=max_height or int(os.environ.get("HIGH_VIDEO_HEIGHT", "1080")),
         enable_enhance=True if enable_enhance is None else enable_enhance,
@@ -493,6 +494,7 @@ def process_chosen_item(path: Path, **options) -> Path:
         return process_chosen_grid(path, **options)
     if ext in VIDEO_EXTS:
         options.pop("archive_grid", None)
+        options.pop("archive_dir", None)
         return process_chosen_video(path, **options)
     raise ValueError(f"不支援的 chosen 項目：{path.name}")
 
