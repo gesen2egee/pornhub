@@ -736,7 +736,9 @@ def download_high_range(
     opts["format_sort"] = fsort
     opts["concurrent_fragment_downloads"] = concurrent
     opts["download_ranges"] = _ranges
-    opts["force_keyframes_at_cuts"] = True
+    # 不讓 yt-dlp 再用 FFmpeg 強制 Range 切點：串流片段在此步驟常回報
+    # AVERROR_INVALIDDATA。後續會以前置緩衝完整解碼，再本機精確重編碼，
+    # 因此輸出首格仍是關鍵影格且可完整驗證。
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([video_url])
