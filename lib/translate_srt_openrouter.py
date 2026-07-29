@@ -19,6 +19,7 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "z-ai/glm-5.2"
 # 預設每 60 條一批；設 0 或 TRANSLATE_BATCH_SIZE=0 則整份一次。
 DEFAULT_BATCH_SIZE = 60
+THREE_PHASE_SOFT_OVERAGE = 2
 SPEAKER_LABEL_PATTERN = re.compile(r"^\s*\[S\d+\]\s*", re.IGNORECASE)
 # 扁平格式：每行「id|正文」（無 JSON 殼、無前後文）
 LINE_PATTERN = re.compile(r"^\s*(\d+)\s*[|｜]\s*(.*?)\s*$")
@@ -791,26 +792,22 @@ def select_cues_three_phase(
     flat = _format_flat_lines(prepared)
     system = (
         "你是精通蒙太奇與動態剪輯的成人影片精選剪輯師。完整閱讀原文後，"
-        "先梳理劇情，再規劃並選出可承接的三段："
-        "情節篇、中段床戲篇、高潮床戲篇。所有說明、人物姓名、動名詞與專有稱呼"
+        "先梳理劇情，再規劃並選出可承接的三篇："
+        "情節篇、中段精華篇、高潮篇。所有說明、人物姓名、動名詞與專有稱呼"
         "都必須嚴格使用繁體中文，禁止任何英文、日文、韓文、簡體或其他外語殘留。\n\n"
         f"句數限制：情節篇最多 {budget['plot']} 句；中段篇最多 {budget['middle']} 句；"
         f"高潮篇最多 {budget['climax']} 句；可選結尾篇最多 {budget['ending']} 句；"
         f"情節＋中段合計最多 {budget['plot'] + budget['middle']} 句；全部最多 {budget['total']} 句。"
         "結尾篇可以完全不選，只有需要交代結尾、前後呼應或餘韻時才使用。若前段不足，優先以後段可承接內容補足，"
-        "但絕不可超過上限。"
+        "盡量不要超過上限。"
         "每個 id 只能選一次，各篇合併後 id 必須嚴格遞增。\n\n"
         "情節篇只用最少句數交代必要背景、人物關係、衝突與契約起點；"
-        "中段篇是自由剪取全片最有吸引力的精華，不受固定場景、性行為或橋段分類限制，"
-        "可混合曖昧、對白、互動、床戲與任何能挑動觀看者慾望的內容；"
-        "高潮篇以最激烈節奏的精華集中爆發並收尾；結尾篇只在需要時補上結尾前後呼應，不能搶走高潮。"
+        "中段篇是自由剪取全片最有吸引力的精華，可混合任何能挑動觀看者慾望的內容；"
+        "高潮篇以最激烈節奏的精華集中爆發並收尾；結尾篇只在需要時補上結尾前後呼應。\n\n"
         "你精通蒙太奇與動態剪輯，必須刪除不必要支線與重複句，安排鏡頭節奏，"
-        "只保留能讓劇情自圓其說、前後呼應的精華。\n"
-        "整個剪輯重點不是完整呈現劇情，而是挑動觀看者慾望；只需用最少劇情讓剪輯自圓其說。"
-        "慾望曲線不要拆成一堆階段，只要讓中段精華自然累積吸引力，最後由高潮篇以最激烈節奏把慾望集中推到高潮。"
-        "不要一開始耗盡高潮，也不要用同質呻吟灌水；每句都必須服務於吸引力、節奏、前後呼應或最後爆發。\n\n"
-        "輸入送入前已移除 S01、S02 等說話者標籤與所有時間碼；你只會看到依原片順序排列的 id|原文，"
-        "請依 id 與上下文判斷連續性，不要要求時間碼。\n\n"
+        "只讓留下的整篇劇情發展是能自圓其說、前後呼應。\n\n"
+        "整個剪輯重點不是完整呈現劇情，而是挑動觀看者慾望曲線，最後把慾望集中推到高潮。\n\n"
+        "你會看到依原片順序排列的 id|原文，請依 id 與上下文判斷連續性。\n\n"
         "輸出格式完全固定，不要 Markdown、JSON 或額外說明：\n"
         "===PLOT===\n"
         "以繁體中文寫設計稿，依序為【情節篇設計】、【中段精華篇設計】、【高潮篇設計】；"
@@ -854,10 +851,12 @@ def select_cues_three_phase(
     cumulative_middle = actual["plot"] + actual["middle"]
     if (
         not all(actual[name] for name in ("plot", "middle", "climax"))
-        or actual["plot"] > expected["plot"]
-        or cumulative_middle > expected["plot"] + expected["middle"]
-        or actual["ending"] > expected["ending"]
-        or len(ids) > int(budget["total"])
+        or actual["plot"] > expected["plot"] + THREE_PHASE_SOFT_OVERAGE
+        or actual["middle"] > expected["middle"] + THREE_PHASE_SOFT_OVERAGE
+        or actual["climax"] > expected["climax"] + THREE_PHASE_SOFT_OVERAGE
+        or cumulative_middle > expected["plot"] + expected["middle"] + THREE_PHASE_SOFT_OVERAGE
+        or actual["ending"] > expected["ending"] + THREE_PHASE_SOFT_OVERAGE
+        or len(ids) > int(budget["total"]) + THREE_PHASE_SOFT_OVERAGE
     ):
         raise RuntimeError(
             f"三段精選超出預算或有空篇：上限 {expected}，實際 {actual}"
