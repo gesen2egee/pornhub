@@ -85,7 +85,7 @@ def _cue_duration_seconds(cue: dict[str, Any]) -> float:
 
 
 def three_phase_budget(cues: list[dict[str, Any]]) -> dict[str, int | float]:
-    """以 30 秒／平均句長計算 N，並回傳嚴格小於三層上限的固定句數。"""
+    """以 30 秒／平均句長計算 N，並回傳三篇加可選結尾篇的句數上限。"""
     if not cues:
         raise ValueError("三段精選需要至少一條字幕")
     total = sum(_cue_duration_seconds(cue) for cue in cues)
@@ -93,13 +93,15 @@ def three_phase_budget(cues: list[dict[str, Any]]) -> dict[str, int | float]:
     if average <= 0:
         raise ValueError("無法由字幕時間軸計算平均語音長度")
     n = max(2, math.ceil(30.0 / average))
+    ending = math.ceil(0.5 * n)
     return {
         "n": n,
         "average_seconds": average,
         "plot": n - 1,
         "middle": 2 * n,
         "climax": 3 * n,
-        "total": 6 * n - 1,
+        "ending": ending,
+        "total": 6 * n - 1 + ending,
     }
 
 
@@ -767,7 +769,7 @@ def _parse_three_phase_selection(raw: str) -> tuple[str, dict[str, list[int]]]:
         raw or "",
         flags=re.DOTALL | re.IGNORECASE,
     )
-    phases = {"plot": [], "middle": [], "climax": []}
+    phases = {"plot": [], "middle": [], "climax": [], "ending": []}
     for line in (selection_match.group(1) if selection_match else "").splitlines():
         name, separator, values = line.partition("|")
         key = name.strip().casefold()
@@ -793,29 +795,32 @@ def select_cues_three_phase(
         "情節篇、中段床戲篇、高潮床戲篇。所有說明、人物姓名、動名詞與專有稱呼"
         "都必須嚴格使用繁體中文，禁止任何英文、日文、韓文、簡體或其他外語殘留。\n\n"
         f"句數限制：情節篇最多 {budget['plot']} 句；中段篇最多 {budget['middle']} 句；"
-        f"高潮篇最多 {budget['climax']} 句；情節＋中段合計最多 {budget['plot'] + budget['middle']} 句；"
-        f"三段合計最多 {budget['total']} 句。若前段不足，優先以後段可承接內容補足，"
+        f"高潮篇最多 {budget['climax']} 句；可選結尾篇最多 {budget['ending']} 句；"
+        f"情節＋中段合計最多 {budget['plot'] + budget['middle']} 句；全部最多 {budget['total']} 句。"
+        "結尾篇可以完全不選，只有需要交代結尾、前後呼應或餘韻時才使用。若前段不足，優先以後段可承接內容補足，"
         "但絕不可超過上限。"
         "每個 id 只能選一次，三段合併後 id 必須嚴格遞增。\n\n"
-        "三篇是剪輯功能分區，不是固定場景或死板標籤；不可為了湊分類而犧牲劇情、節奏或慾望曲線。"
-        "情節篇可包含必要的曖昧與誘惑，中段篇可保留少量劇情承接並逐步升溫，"
-        "高潮篇可包含通往高潮的承接、最強烈床戲、高潮後餘韻與結尾。"
+        "情節篇只用最少句數交代必要背景、人物關係、衝突與契約起點；"
+        "中段篇是自由剪取全片最有吸引力的精華，不受固定場景、性行為或橋段分類限制，"
+        "可混合曖昧、對白、互動、床戲與任何能挑動觀看者慾望的內容；"
+        "高潮篇以最激烈節奏的精華集中爆發並收尾；結尾篇只在需要時補上結尾前後呼應，不能搶走高潮。"
         "你精通蒙太奇與動態剪輯，必須刪除不必要支線與重複句，安排鏡頭節奏，"
         "只保留能讓劇情自圓其說、前後呼應的精華。\n"
-        "核心是建立完整的慾望曲線：由暗示、好奇、試探、誘惑、越界、服從或佔有，"
-        "逐步加壓、反覆升溫，最後把慾望集中推到高潮，再留下有意義的餘韻。"
-        "不可一開始就耗盡高潮，也不可用大量同質呻吟取代遞進；要挑動慾望、累積張力，"
-        "讓觀眾感覺每一段都比前一段更接近高潮。選句必須能承接前後，不可用冗長劇情取代有效升溫。\n\n"
+        "整個剪輯重點不是完整呈現劇情，而是挑動觀看者慾望；只需用最少劇情讓剪輯自圓其說。"
+        "慾望曲線不要拆成一堆階段，只要讓中段精華自然累積吸引力，最後由高潮篇以最激烈節奏把慾望集中推到高潮。"
+        "不要一開始耗盡高潮，也不要用同質呻吟灌水；每句都必須服務於吸引力、節奏、前後呼應或最後爆發。\n\n"
         "輸入送入前已移除 S01、S02 等說話者標籤與所有時間碼；你只會看到依原片順序排列的 id|原文，"
         "請依 id 與上下文判斷連續性，不要要求時間碼。\n\n"
         "輸出格式完全固定，不要 Markdown、JSON 或額外說明：\n"
         "===PLOT===\n"
-        "以繁體中文寫三段設計稿，依序為【情節篇設計】、【中段床戲篇設計】、【高潮床戲篇設計】，每段 80–150 字；"
-        "每段都要說明自身在慾望曲線中的功能，以及如何承接上一段並把張力交給下一段。\n"
+        "以繁體中文寫設計稿，依序為【情節篇設計】、【中段精華篇設計】、【高潮篇設計】；"
+        "若使用結尾篇，再寫【結尾篇設計】。每段 80–150 字，說明該段如何服務慾望、節奏與前後承接；"
+        "結尾篇若不需要，請寫【結尾篇設計】不需要，且不要選任何 id。\n"
         "===SELECTION===\n"
         f"PLOT|最多 {budget['plot']} 個逗號分隔 id\n"
         f"MIDDLE|最多 {budget['middle']} 個逗號分隔 id\n"
-        f"CLIMAX|最多 {budget['climax']} 個逗號分隔 id"
+        f"CLIMAX|最多 {budget['climax']} 個逗號分隔 id\n"
+        f"ENDING|最多 {budget['ending']} 個逗號分隔 id；若不需要請留空"
     )
     effort = os.getenv("TRANSLATE_REASONING_EFFORT", "minimal").strip() or "minimal"
     if effort == "none" and "grok-4.5" in model.casefold():
@@ -845,12 +850,13 @@ def select_cues_three_phase(
     plot, phases = _parse_three_phase_selection(raw)
     expected = {name: int(budget[name]) for name in phases}
     actual = {name: len(ids) for name, ids in phases.items()}
-    ids = [item for name in ("plot", "middle", "climax") for item in phases[name]]
+    ids = [item for name in ("plot", "middle", "climax", "ending") for item in phases[name]]
     cumulative_middle = actual["plot"] + actual["middle"]
     if (
-        not all(actual.values())
+        not all(actual[name] for name in ("plot", "middle", "climax"))
         or actual["plot"] > expected["plot"]
         or cumulative_middle > expected["plot"] + expected["middle"]
+        or actual["ending"] > expected["ending"]
         or len(ids) > int(budget["total"])
     ):
         raise RuntimeError(
