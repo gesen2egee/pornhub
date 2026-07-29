@@ -89,8 +89,8 @@ DOWNLOAD_SOCKET_TIMEOUT = 30
 DOWNLOAD_RETRIES = 3
 SEGMENT_DOWNLOAD_ATTEMPTS = 2
 SEGMENT_RECOVERY_ATTEMPTS = 1
-# 高畫質切塊採八條分開請求；每條相隔一秒啟動，避免同時衝擊來源站點。
-SEGMENT_DOWNLOAD_WORKERS = 8
+# 高畫質切塊採五條分開請求；每條相隔一秒啟動，避免同時衝擊來源站點。
+SEGMENT_DOWNLOAD_WORKERS = 5
 SEGMENT_DOWNLOAD_START_INTERVAL_SECONDS = 1.0
 # 先多抓來源關鍵影格之前的內容，再在本機精確重編碼。這讓成品每段的第一格
 # 都是新關鍵影格，而不依賴遠端 Range 恰好落在來源的 I-frame。
@@ -99,12 +99,16 @@ HIGH_RANGE_KEYFRAME_POSTROLL_SECONDS = 1.0
 HIGH_RANGE_CONCURRENT_FRAGMENTS = 1
 ASR_STREAM_CHUNK_SECONDS = 180.0
 
-# 多支來源管線可同時進入高畫質階段；此鎖使八條限制套用到整個程序，
-# 而非每支影片各自八條而意外放大。
+# 多支來源管線可同時進入高畫質階段；此鎖使五條限制套用到整個程序，
+# 而非每支影片各自五條而意外放大。
 _SEGMENT_DOWNLOAD_SEMAPHORES: dict[int, BoundedSemaphore] = {}
 _SEGMENT_DOWNLOAD_SEMAPHORE_LOCK = Lock()
 _SEGMENT_DOWNLOAD_START_LOCK = Lock()
 _NEXT_SEGMENT_DOWNLOAD_START = 0.0
+# 下一支影片可先跑 240P、Demucs、MOSS、GROK；只有進到高畫質下載時才等候。
+_HIGH_QUALITY_DOWNLOAD_PHASE_LOCK = Lock()
+# 即使未來建立多個 MOSS worker，也不允許不同影片同時佔用 MOSS 推理。
+_MOSS_INFERENCE_LOCK = Lock()
 
 # 由外部 benchmark 注入 PipelineMetrics；未注入則不計時
 _ACTIVE_METRICS: Any | None = None
@@ -202,7 +206,7 @@ def _positive_int_env(name: str, default: int) -> int:
 def segment_download_workers(
     environment: dict[str, str] | None = None,
 ) -> int:
-    """回傳高畫質切塊的同時下載請求數（預設八條、最多八條）。"""
+    """回傳高畫質切塊的同時下載請求數（預設五條、最多五條）。"""
     environment = os.environ if environment is None else environment
     try:
         requested = int(
@@ -252,6 +256,15 @@ def segment_download_slot(workers: int) -> Iterator[None]:
         delay = scheduled - time.monotonic()
         if delay > 0:
             time.sleep(delay)
+        yield
+
+
+@contextmanager
+def high_quality_download_phase(video_stem: str) -> Iterator[None]:
+    """全程序一次只允許一支影片下載高畫質；不阻擋其他影片的 240P/ASR/GROK。"""
+    _log(f"  [高畫質排程] {video_stem} 等待高畫質下載槽位")
+    with _HIGH_QUALITY_DOWNLOAD_PHASE_LOCK:
+        _log(f"  [高畫質排程] {video_stem} 取得槽位，開始高畫質下載")
         yield
 
 
@@ -713,7 +726,7 @@ def download_high_range(
         yield {"start_time": source_start, "end_time": source_end}
 
     fmt, fsort, concurrent = _high_format_opts()
-    # 八條範圍請求已提供網路平行度，避免每條再開多個 fragment 造成限流。
+    # 五條範圍請求已提供網路平行度，避免每條再開多個 fragment 造成限流。
     concurrent = _positive_int_env(
         "HIGH_RANGE_CONCURRENT_FRAGMENTS",
         HIGH_RANGE_CONCURRENT_FRAGMENTS,
@@ -1313,7 +1326,9 @@ class MossAsrWorker:
         if self._closed or self._process.stdin is None or self._process.stdout is None:
             raise RuntimeError("MOSS 常駐程序已關閉")
         request = {"audio": [str(Path(path).resolve()) for path in audio_paths]}
-        with self._lock:
+        # self._lock 保護同一常駐程序的 stdin/stdout；全域鎖保證多支影片、
+        # 甚至意外建立多個 worker 時，仍只會有一筆 MOSS 推理在執行。
+        with _MOSS_INFERENCE_LOCK, self._lock:
             try:
                 self._process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
                 self._process.stdin.flush()
@@ -1414,9 +1429,8 @@ def run_asr_batch(
     work_dir: Path,
     moss_worker: MossAsrWorker | None = None,
 ) -> list[dict[str, Any]]:
-    """每段先 Demucs，再以目前可用的動態 BS 做 ASR。"""
+    """相容入口：每段先 Demucs，再以目前可用的動態 BS 做 ASR。"""
     from asr_audio import prepare_asr_audio
-    from asr_backends import selected_asr_backend_name
 
     if not proxy_paths:
         return []
@@ -1424,6 +1438,19 @@ def run_asr_batch(
         prepare_asr_audio(path, work_dir / f"demucs-{index:03d}")
         for index, path in enumerate(proxy_paths, 1)
     ]
+    return run_asr_audio_batch(asr_audio, work_dir, moss_worker=moss_worker)
+
+
+def run_asr_audio_batch(
+    asr_audio: list[Path],
+    work_dir: Path,
+    moss_worker: MossAsrWorker | None = None,
+) -> list[dict[str, Any]]:
+    """對已完成人聲分離的音檔做 ASR；讓 Demucs 與 MOSS 可用佇列重疊。"""
+    from asr_backends import selected_asr_backend_name
+
+    if not asr_audio:
+        return []
     if moss_worker is not None:
         try:
             return moss_worker.transcribe(asr_audio)
@@ -1435,6 +1462,9 @@ def run_asr_batch(
     if backend_name in {"voxtral", "grok-stt", "whisper"} or (
         "moss" in str(current).casefold() and current.exists()
     ):
+        if backend_name == "moss":
+            with _MOSS_INFERENCE_LOCK:
+                return run_asr_batch_local(asr_audio)
         return run_asr_batch_local(asr_audio)
 
     moss_python = Path(os.getenv("MOSS_PYTHON", str(DEFAULT_MOSS_PYTHON)))
@@ -1457,11 +1487,13 @@ def run_asr_batch(
         str(result_path),
     ]
     _log(f"  [2/5] 啟動 MOSS 子程序批次 ASR：BS={len(asr_audio)}")
-    proc = subprocess.run(cmd, cwd=str(ROOT), env=env, check=False)
+    # 沒有常駐 worker 時也同樣要串列化，避免兩支影片各自啟動 MOSS 搶資源。
+    with _MOSS_INFERENCE_LOCK:
+        proc = subprocess.run(cmd, cwd=str(ROOT), env=env, check=False)
     if proc.returncode != 0 or not result_path.is_file():
         raise RuntimeError(f"MOSS 批次 ASR 子程序失敗，ExitCode={proc.returncode}")
     payload = json.loads(result_path.read_text(encoding="utf-8"))
-    if not isinstance(payload, list) or len(payload) != len(proxy_paths):
+    if not isinstance(payload, list) or len(payload) != len(asr_audio):
         raise RuntimeError("MOSS 批次 ASR 回傳格式或數量不符。")
     return payload
 
@@ -1516,48 +1548,76 @@ def run_streamed_asr(
     ]
     _log(
         f"  [ASR 串流] 240P 共 {len(ranges)} 段，每段最多 {chunk_seconds / 60:.1f} 分鐘；"
-        "累計滿 BS 後批次 ASR，並與下一批下載重疊"
+        "下載→人聲分離→MOSS 三段佇列重疊"
     )
     from asr_backends import asr_batch_size
 
-    job_queue: Queue[tuple[int, float, Path] | None] = Queue()
+    demucs_queue: Queue[tuple[int, float, Path] | None] = Queue()
+    moss_queue: Queue[tuple[int, float, Path] | None] = Queue()
     completed: dict[int, tuple[float, dict[str, Any]]] = {}
     worker_errors: list[BaseException] = []
     batch_limit = asr_batch_size()
 
-    def consume_asr_queue(moss_worker: MossAsrWorker | None) -> None:
+    def consume_demucs_queue() -> None:
+        """下載一完成就做人聲分離；不等待 MOSS 是否空閒。"""
+        from asr_audio import prepare_asr_audio
+
         while True:
-            first = job_queue.get()
+            job = demucs_queue.get()
+            if job is None:
+                demucs_queue.task_done()
+                moss_queue.put(None)
+                return
+            index, start, proxy_path = job
+            try:
+                _log(f"  [人聲分離佇列] 開始第 {index}/{len(ranges)} 段")
+                audio_path = prepare_asr_audio(
+                    proxy_path,
+                    work_dir / f"demucs-{index:03d}",
+                )
+                moss_queue.put((index, start, audio_path))
+                _log(
+                    f"  [人聲分離佇列] 完成第 {index}/{len(ranges)} 段；"
+                    f"等待 MOSS {moss_queue.qsize()} 段"
+                )
+            except BaseException as exc:
+                worker_errors.append(exc)
+                moss_queue.put(None)
+                return
+            finally:
+                demucs_queue.task_done()
+
+    def consume_moss_queue() -> None:
+        while True:
+            first = moss_queue.get()
             if first is None:
-                job_queue.task_done()
+                moss_queue.task_done()
                 return
             jobs = [first]
             stop_after_batch = False
-            # 不等待湊滿 BS：已就緒的片段立即送 MOSS；只順手合併當下已排隊的片段。
+            # 不等待湊滿 BS：人聲分離一完成就立即送唯一的 MOSS 推理槽。
             while len(jobs) < batch_limit:
                 try:
-                    next_job = job_queue.get_nowait()
+                    next_job = moss_queue.get_nowait()
                 except Empty:
                     break
                 if next_job is None:
-                    job_queue.task_done()
+                    moss_queue.task_done()
                     stop_after_batch = True
                     break
                 jobs.append(next_job)
             try:
-                queued = job_queue.qsize()
+                queued = moss_queue.qsize()
                 _log(
-                    f"  [ASR 佇列] 已就緒 {queued + len(jobs)} 段；"
-                    f"立即送 MOSS，BS={len(jobs)}/{batch_limit}"
+                    f"  [MOSS 佇列] 已就緒 {queued + len(jobs)} 段；"
+                    f"取得唯一推理槽後送 MOSS，BS={len(jobs)}/{batch_limit}"
                 )
                 batch_work = work_dir / f"asr-batch-{jobs[0][0]:03d}"
                 paths = [job[2] for job in jobs]
-                results = (
-                    run_asr_batch(paths, batch_work)
-                    if moss_worker is None
-                    else run_asr_batch(
-                        paths, batch_work, moss_worker=moss_worker
-                    )
+                results = run_asr_audio_batch(
+                    paths,
+                    batch_work,
+                    moss_worker=moss_worker,
                 )
                 for job, result in zip(jobs, results):
                     completed[job[0]] = (job[1], result)
@@ -1566,31 +1626,37 @@ def run_streamed_asr(
                 return
             finally:
                 for _job in jobs:
-                    job_queue.task_done()
+                    moss_queue.task_done()
             if stop_after_batch:
                 return
 
-    worker = Thread(
-        target=consume_asr_queue,
-        args=(moss_worker,),
-        name="asr-queue",
+    demucs_worker = Thread(
+        target=consume_demucs_queue,
+        name="demucs-queue",
         daemon=True,
     )
-    worker.start()
+    moss_queue_worker = Thread(
+        target=consume_moss_queue,
+        name="moss-queue",
+        daemon=True,
+    )
+    demucs_worker.start()
+    moss_queue_worker.start()
     try:
         for index, (start, end) in enumerate(ranges, 1):
             if worker_errors:
                 break
             proxy_part = work_dir / f"{video_stem}.proxy.asr{index:03d}.mp4"
             download_proxy_range(video_url, proxy_part, start, end)
-            job_queue.put((index, start, proxy_part))
+            demucs_queue.put((index, start, proxy_part))
             _log(
-                f"  [ASR 佇列] 已排入第 {index}/{len(ranges)} 段；"
-                f"等待中 {job_queue.qsize()} 段"
+                f"  [240P 佇列] 第 {index}/{len(ranges)} 段下載完成；"
+                f"已排入人聲分離，等待中 {demucs_queue.qsize()} 段"
             )
     finally:
-        job_queue.put(None)
-        worker.join()
+        demucs_queue.put(None)
+        demucs_worker.join()
+        moss_queue_worker.join()
     if worker_errors:
         raise RuntimeError(f"ASR 佇列失敗：{worker_errors[0]}") from worker_errors[0]
     if len(completed) != len(ranges):
@@ -1780,7 +1846,8 @@ def run_parallel_delivery_phase(
         enhanced = False
         if segments is None:
             _log("  [第二階段] 下載完整高畫質影片")
-            download_high_full(video_url, high_path)
+            with high_quality_download_phase(video_stem):
+                download_high_full(video_url, high_path)
             enhance_future = (
                 submit_enhance(high_path)
                 if enable_enhance
@@ -1872,69 +1939,72 @@ def run_parallel_delivery_phase(
                         normal_attempts,
                     )
 
-            queued_downloads: dict[
-                Future[Exception | None], tuple[int, Path, float, float]
-            ] = {}
-            # ThreadPoolExecutor 會固定保留 download_workers 個進行中請求；任何
-            # 一段完成時會自動取出下一段，無須猜測連線／啟動延遲再人工等待。
-            with ThreadPoolExecutor(
-                max_workers=download_workers,
-                thread_name_prefix="high-range",
-            ) as downloader:
-                for index, (start, end) in enumerate(segments):
-                    part = work_dir / f"{video_stem}.seg{index:03d}.mp4"
-                    if part.exists() and has_video_stream(part) is True:
-                        queue_enhance(index, part)
-                        continue
-                    future = downloader.submit(
-                        download_in_slot,
+            still_failed: list[
+                tuple[int, Path, float, float, Exception]
+            ] = []
+            # 此鎖只包住高畫質下載與補抓。下一支影片可以在等待時繼續 240P、
+            # 人聲分離、MOSS 與 GROK；一旦進到高畫質則依影片順序接力。
+            with high_quality_download_phase(video_stem):
+                queued_downloads: dict[
+                    Future[Exception | None], tuple[int, Path, float, float]
+                ] = {}
+                # ThreadPoolExecutor 會固定保留 download_workers 個進行中請求；任何
+                # 一段完成時會自動取出下一段，無須猜測連線／啟動延遲再人工等待。
+                with ThreadPoolExecutor(
+                    max_workers=download_workers,
+                    thread_name_prefix="high-range",
+                ) as downloader:
+                    for index, (start, end) in enumerate(segments):
+                        part = work_dir / f"{video_stem}.seg{index:03d}.mp4"
+                        if part.exists() and has_video_stream(part) is True:
+                            queue_enhance(index, part)
+                            continue
+                        future = downloader.submit(
+                            download_in_slot,
+                            index,
+                            part,
+                            start,
+                            end,
+                        )
+                        queued_downloads[future] = (index, part, start, end)
+
+                    for future in as_completed(queued_downloads):
+                        index, part, start, end = queued_downloads[future]
+                        try:
+                            error = future.result()
+                        except Exception as exc:  # 防禦：工作執行緒不可中斷整批下載。
+                            error = exc
+                        if error is None:
+                            queue_enhance(index, part)
+                        else:
+                            failed_downloads.append((index, part, start, end, error))
+                            progress.update(pending_failures=1)
+
+                recovery_attempts = _positive_int_env(
+                    "SEGMENT_RECOVERY_ATTEMPTS",
+                    SEGMENT_RECOVERY_ATTEMPTS,
+                )
+                if failed_downloads:
+                    _log(
+                        f"\n  [第二階段] {len(failed_downloads)} 段並行下載失敗，"
+                        "改為單線補下載"
+                    )
+                for index, part, start, end, previous_error in failed_downloads:
+                    progress.update(retries=1)
+                    error = try_download(
                         index,
                         part,
                         start,
                         end,
+                        recovery_attempts,
                     )
-                    queued_downloads[future] = (index, part, start, end)
-
-                for future in as_completed(queued_downloads):
-                    index, part, start, end = queued_downloads[future]
-                    try:
-                        error = future.result()
-                    except Exception as exc:  # 防禦：工作執行緒不可中斷整批下載。
-                        error = exc
                     if error is None:
+                        progress.update(pending_failures=-1)
                         queue_enhance(index, part)
                     else:
-                        failed_downloads.append((index, part, start, end, error))
-                        progress.update(pending_failures=1)
-
-            recovery_attempts = _positive_int_env(
-                "SEGMENT_RECOVERY_ATTEMPTS",
-                SEGMENT_RECOVERY_ATTEMPTS,
-            )
-            still_failed: list[
-                tuple[int, Path, float, float, Exception]
-            ] = []
-            if failed_downloads:
-                _log(
-                    f"\n  [第二階段] {len(failed_downloads)} 段並行下載失敗，"
-                    "改為單線補下載"
-                )
-            for index, part, start, end, previous_error in failed_downloads:
-                progress.update(retries=1)
-                error = try_download(
-                    index,
-                    part,
-                    start,
-                    end,
-                    recovery_attempts,
-                )
-                if error is None:
-                    progress.update(pending_failures=-1)
-                    queue_enhance(index, part)
-                else:
-                    still_failed.append(
-                        (index, part, start, end, error or previous_error)
-                    )
+                        still_failed.append(
+                            (index, part, start, end, error or previous_error)
+                        )
 
             parts: list[Path] = []
             for index in sorted(part_futures):
