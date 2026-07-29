@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""05_chosen 精選管線：九宮格或影片（只取 URL）→ 1080P + MOSS + GLM 5.2 + enhance → 06_good。
+"""05_chosen 精選管線：九宮格或影片（只取 URL）→ 1080P + MOSS + MiniMax M3 + enhance → 06_good。
 
 來源清理：
   - 九宮格 JPG → 移到 04_downloaded
@@ -150,14 +150,17 @@ def _apply_chosen_env(
     enable_enhance: bool | None = None,
     max_height: int | None = None,
 ) -> None:
-    """精選：MOSS + GLM 5.2 minimal 翻譯 + 1080P enhance（較貴、品質優先）。"""
+    """精選：MOSS + MiniMax M3 翻譯（失敗改用 Grok 4.5）+ 1080P enhance。"""
     os.environ["ASR_BACKEND"] = os.getenv("CHOSEN_ASR_BACKEND", "moss")
-    # 所有層級統一使用 GLM 5.2 minimal。
+    # Chosen 固定使用 MiniMax M3；第一次請求失敗時由翻譯層改用 Grok 4.5。
     os.environ["OPENROUTER_MODEL"] = os.getenv(
-        "CHOSEN_OPENROUTER_MODEL", "z-ai/glm-5.2"
+        "CHOSEN_OPENROUTER_MODEL", "minimax/minimax-m3"
     )
     os.environ["TRANSLATE_REASONING_EFFORT"] = os.getenv(
-        "CHOSEN_TRANSLATE_REASONING", "minimal"
+        "CHOSEN_TRANSLATE_REASONING", "none"
+    )
+    os.environ["TRANSLATE_FALLBACK_MODEL"] = os.getenv(
+        "CHOSEN_TRANSLATE_FALLBACK_MODEL", "x-ai/grok-4.5"
     )
     os.environ["HIGH_VIDEO_HEIGHT"] = os.getenv("CHOSEN_VIDEO_HEIGHT", "1080")
     if enable_translation is not None:
@@ -504,7 +507,7 @@ def process_chosen_directory(
         _log("[chosen] 05_chosen 沒有九宮格或影片")
         return 0, 0
     _log(
-        f"[chosen] 精選管線 1080P + MOSS + GLM 5.2 minimal + enhance → 06_good，"
+        f"[chosen] 精選管線 1080P + MOSS + MiniMax M3（失敗改 Grok 4.5）+ enhance → 06_good，"
         f"共 {len(items)} 項"
     )
     ok = 0

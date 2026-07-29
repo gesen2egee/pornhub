@@ -79,7 +79,7 @@ def resolve_edge_padding_seconds(
 def three_phase_selection_enabled(
     environment: dict[str, str] | None = None,
 ) -> bool:
-    """30 秒三段 GLM 5.2 精選開關；Video／Chosen 由控制器預設開啟。"""
+    """30 秒三段模型精選開關；Video／Chosen 由控制器預設開啟。"""
     environment = os.environ if environment is None else environment
     value = environment.get("ENABLE_THREE_PHASE_SELECTION", "1").strip().casefold()
     return value not in {"0", "false", "no", "off"}
@@ -105,7 +105,7 @@ _SEGMENT_DOWNLOAD_SEMAPHORES: dict[int, BoundedSemaphore] = {}
 _SEGMENT_DOWNLOAD_SEMAPHORE_LOCK = Lock()
 _SEGMENT_DOWNLOAD_START_LOCK = Lock()
 _NEXT_SEGMENT_DOWNLOAD_START = 0.0
-# 下一支影片可先跑 240P、Demucs、MOSS、GLM 5.2；只有進到高畫質下載時才等候。
+# 下一支影片可先跑 240P、Demucs、MOSS、模型翻譯；只有進到高畫質下載時才等候。
 _HIGH_QUALITY_DOWNLOAD_PHASE_LOCK = Lock()
 # 即使未來建立多個 MOSS worker，也不允許不同影片同時佔用 MOSS 推理。
 _MOSS_INFERENCE_LOCK = Lock()
@@ -261,7 +261,7 @@ def segment_download_slot(workers: int) -> Iterator[None]:
 
 @contextmanager
 def high_quality_download_phase(video_stem: str) -> Iterator[None]:
-    """全程序一次只允許一支影片下載高畫質；不阻擋其他影片的 240P/ASR/GLM 5.2。"""
+    """全程序一次只允許一支影片下載高畫質；不阻擋其他影片的 240P/ASR/翻譯。"""
     _log(f"  [高畫質排程] {video_stem} 等待高畫質下載槽位")
     with _HIGH_QUALITY_DOWNLOAD_PHASE_LOCK:
         _log(f"  [高畫質排程] {video_stem} 取得槽位，開始高畫質下載")
@@ -977,7 +977,9 @@ def selective_download_enabled(
 
 
 def _cues_for_translation(asr: dict[str, Any]) -> list[dict[str, Any]]:
-    cues = asr.get("cues") or []
+    # 精選結果會把 cues 換成保留句；source_cues 保留完整 ASR，
+    # 讓預算規則更新後可以重新從全片字幕計算，而不是拿舊精選重算。
+    cues = asr.get("source_cues") or asr.get("cues") or []
     if not cues and asr.get("original_srt"):
         cues = entries_to_cues(srt_text_to_entries(asr["original_srt"]))
     return list(cues)
@@ -988,6 +990,21 @@ def _filter_cues_by_ids(
     keep_ids: set[int],
 ) -> list[dict[str, Any]]:
     return [dict(c) for c in cues if int(c.get("id", -1)) in keep_ids]
+
+
+def _translation_model_candidates(primary: str) -> list[str]:
+    """回傳主要模型與至多一個失敗後備模型。"""
+    models = [primary]
+    fallback = os.getenv("TRANSLATE_FALLBACK_MODEL", "").strip()
+    if fallback and fallback.casefold() != primary.casefold():
+        models.append(fallback)
+    return models
+
+
+def _log_translation_fallback(primary: str, fallback: str, exc: Exception) -> None:
+    _log(
+        f"  [!] {primary} 翻譯／精選失敗，改用後備模型 {fallback}：{exc}"
+    )
 
 
 def complete_cached_translation(
@@ -1025,32 +1042,41 @@ def complete_cached_translation(
     cues = _cues_for_translation(asr)
     if not cues:
         raise RuntimeError("翻譯已開啟，但 ASR 快取沒有可翻譯的 cues")
-    model_name = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
-    try:
-        if use_selective:
-            result = translate_cues_selective(cues, api_key, model_name)
-            kept = result["kept_cues"]
-            asr["translated_srt"] = format_srt(kept)
-            asr["plot_summary"] = result.get("plot") or ""
-            asr["selective_is_full"] = bool(result.get("is_full"))
-            asr["selective_kept_ids"] = [
-                int(c["id"]) for c in kept
-            ]
-            asr["selective_dropped_ids"] = list(result.get("dropped_ids") or [])
-            # 精選省略時原文也只留對應句，方便 retime／剪片對齊
-            if not result.get("is_full"):
-                keep_ids = {int(c["id"]) for c in kept}
-                filtered = _filter_cues_by_ids(cues, keep_ids)
-                if filtered:
-                    asr["cues"] = filtered
-                    asr["original_srt"] = format_srt(filtered)
+    primary_model = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
+    for attempt, model_name in enumerate(_translation_model_candidates(primary_model)):
+        try:
+            if use_selective:
+                result = translate_cues_selective(cues, api_key, model_name)
+                kept = result["kept_cues"]
+                asr["source_cues"] = cues
+                asr["translated_srt"] = format_srt(kept)
+                asr["plot_summary"] = result.get("plot") or ""
+                asr["selective_is_full"] = bool(result.get("is_full"))
+                asr["selective_kept_ids"] = [int(c["id"]) for c in kept]
+                asr["selective_dropped_ids"] = list(result.get("dropped_ids") or [])
+                # 精選省略時原文也只留對應句，方便 retime／剪片對齊
+                if not result.get("is_full"):
+                    keep_ids = {int(c["id"]) for c in kept}
+                    filtered = _filter_cues_by_ids(cues, keep_ids)
+                    if filtered:
+                        asr["cues"] = filtered
+                        asr["original_srt"] = format_srt(filtered)
+            else:
+                translated = translate_cues(cues, api_key, model_name)
+                asr["translated_srt"] = format_srt(translated)
+                asr["outcome"] = "translated"
+            asr["translation_model"] = model_name
+            asr["translation_fallback_used"] = attempt > 0
             asr["outcome"] = "translated"
-        else:
-            translated = translate_cues(cues, api_key, model_name)
-            asr["translated_srt"] = format_srt(translated)
-            asr["outcome"] = "translated"
-    except Exception as exc:
-        raise RuntimeError(f"翻譯已開啟，但 OpenRouter 翻譯失敗：{exc}") from exc
+            break
+        except Exception as exc:
+            models = _translation_model_candidates(primary_model)
+            if attempt + 1 < len(models):
+                _log_translation_fallback(primary_model, models[attempt + 1], exc)
+            else:
+                raise RuntimeError(
+                    f"翻譯已開啟，但 OpenRouter 翻譯失敗：{exc}"
+                ) from exc
     if cache_path is not None:
         cache_path.write_text(
             json.dumps(asr, ensure_ascii=False, indent=2),
@@ -1063,10 +1089,11 @@ def complete_three_phase_translation(
     asr: dict[str, Any],
     cache_path: Path | None = None,
 ) -> dict[str, Any]:
-    """GLM 5.2 30 秒三段規劃、嚴格選句後，再將保留句翻成繁中。"""
+    """30 秒三段規劃、嚴格選句後，再將保留句翻成繁中。"""
     if (
         (asr.get("translated_srt") or "").strip()
         and asr.get("selection_mode") == "three_phase_30s"
+        and asr.get("three_phase_budget_version") == 2
     ):
         return asr
     api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY")
@@ -1076,30 +1103,105 @@ def complete_three_phase_translation(
         DEFAULT_MODEL,
         format_srt,
         select_cues_three_phase,
+        three_phase_budget,
         translate_cues,
     )
 
     cues = _cues_for_translation(asr)
     if not cues:
         raise RuntimeError("三段精選需要帶時間軸的 ASR cues")
-    model_name = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
-    selected = select_cues_three_phase(cues, api_key, model_name)
+    primary_model = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
+    models = _translation_model_candidates(primary_model)
+    budget = three_phase_budget(cues)
+
+    # 完整字幕本來就少於整體 7.5N 上限時，直接翻譯全片，
+    # 不浪費一次精選請求，也不做不必要的刪句。
+    if len(cues) < int(budget["total"]):
+        _log(
+            f"  [三段精選] 完整字幕 {len(cues)} 句 < 總上限 {budget['total']} 句，"
+            "改為全片翻譯"
+        )
+        translated = None
+        used_model = primary_model
+        fallback_used = False
+        for attempt, model_name in enumerate(models):
+            try:
+                translated = translate_cues(cues, api_key, model_name)
+                used_model = model_name
+                fallback_used = attempt > 0
+                break
+            except Exception as exc:
+                if attempt + 1 < len(models):
+                    _log_translation_fallback(primary_model, models[attempt + 1], exc)
+                else:
+                    raise RuntimeError(f"全片翻譯失敗：{exc}") from exc
+        asr = dict(asr)
+        all_ids = [int(cue["id"]) for cue in cues]
+        asr["cues"] = cues
+        asr["source_cues"] = cues
+        asr["original_srt"] = format_srt(cues)
+        asr["translated_srt"] = format_srt(translated)
+        asr["plot_summary"] = ""
+        asr["three_phase_design"] = ""
+        asr["three_phase_selection"] = {}
+        asr["three_phase_budget"] = budget
+        asr["three_phase_budget_version"] = 2
+        asr["selective_kept_ids"] = all_ids
+        asr["selective_dropped_ids"] = []
+        asr["selective_is_full"] = True
+        asr["selection_mode"] = "three_phase_30s"
+        asr["translation_model"] = used_model
+        asr["translation_fallback_used"] = fallback_used
+        asr["outcome"] = "translated"
+        if cache_path is not None:
+            cache_path.write_text(
+                json.dumps(asr, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        return asr
+
+    selected = None
+    translated = None
+    used_model = primary_model
+    fallback_used = False
+    for attempt, model_name in enumerate(models):
+        try:
+            candidate = select_cues_three_phase(cues, api_key, model_name)
+            candidate_kept = candidate["kept_cues"]
+            candidate_translated = translate_cues(candidate_kept, api_key, model_name)
+            selected = candidate
+            translated = candidate_translated
+            used_model = model_name
+            fallback_used = attempt > 0
+            break
+        except Exception as exc:
+            if attempt + 1 < len(models):
+                _log_translation_fallback(primary_model, models[attempt + 1], exc)
+            else:
+                raise RuntimeError(f"三段精選／翻譯失敗：{exc}") from exc
+    if selected is None or translated is None:
+        raise RuntimeError("三段精選／翻譯沒有產生結果")
+
     kept = selected["kept_cues"]
-    translated = translate_cues(kept, api_key, model_name)
+    kept_ids = [int(cue["id"]) for cue in kept]
+    is_full = len(kept) == len(cues)
     asr = dict(asr)
     asr["cues"] = kept
+    asr["source_cues"] = cues
     asr["original_srt"] = format_srt(kept)
     asr["translated_srt"] = format_srt(translated)
     asr["plot_summary"] = selected["plot"]
     asr["three_phase_design"] = selected["plot"]
     asr["three_phase_selection"] = selected["phases"]
     asr["three_phase_budget"] = selected["budget"]
-    asr["selective_kept_ids"] = [int(cue["id"]) for cue in kept]
+    asr["three_phase_budget_version"] = 2
+    asr["selective_kept_ids"] = kept_ids
     asr["selective_dropped_ids"] = sorted(
-        int(cue["id"]) for cue in cues if int(cue["id"]) not in set(asr["selective_kept_ids"])
+        int(cue["id"]) for cue in cues if int(cue["id"]) not in set(kept_ids)
     )
-    asr["selective_is_full"] = False
+    asr["selective_is_full"] = is_full
     asr["selection_mode"] = "three_phase_30s"
+    asr["translation_model"] = used_model
+    asr["translation_fallback_used"] = fallback_used
     asr["outcome"] = "translated"
     if cache_path is not None:
         cache_path.write_text(json.dumps(asr, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1132,15 +1234,28 @@ def run_asr_translate_local(proxy_path: Path) -> dict[str, Any]:
     original_srt = format_srt(cues) if cues else ""
     translated_srt = ""
     outcome = "empty"
+    translation_model = model_name
     if cues and translation_enabled:
         _log("  [3/5] OpenRouter 翻譯")
-        try:
-            translated = translate_cues(cues, api_key, model_name)
-            translated_srt = format_srt(translated)
-            outcome = "translated"
-        except Exception as exc:
-            _log(f"  [!] 翻譯失敗，保留原文：{exc}")
-            outcome = "translation_failed"
+        for attempt, candidate_model in enumerate(
+            _translation_model_candidates(model_name)
+        ):
+            try:
+                translated = translate_cues(cues, api_key, candidate_model)
+                translated_srt = format_srt(translated)
+                model_name = candidate_model
+                outcome = "translated"
+                break
+            except Exception as exc:
+                models = _translation_model_candidates(model_name)
+                if attempt + 1 < len(models):
+                    _log_translation_fallback(
+                        model_name, models[attempt + 1], exc
+                    )
+                else:
+                    _log(f"  [!] 翻譯失敗，保留原文：{exc}")
+                    outcome = "translation_failed"
+        translation_model = model_name
     elif cues:
         _log("  [3/5] OpenRouter 翻譯已由開關停用")
         outcome = "transcribed"
@@ -1149,6 +1264,11 @@ def run_asr_translate_local(proxy_path: Path) -> dict[str, Any]:
         "original_srt": original_srt,
         "translated_srt": translated_srt,
         "outcome": outcome,
+        "translation_model": translation_model,
+        "translation_fallback_used": bool(
+            cues and model_name.casefold()
+            != os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL).casefold()
+        ),
         "cues": cues,
     }
 
@@ -1967,7 +2087,7 @@ def run_parallel_delivery_phase(
                 tuple[int, Path, float, float, Exception]
             ] = []
             # 此鎖只包住高畫質下載與補抓。下一支影片可以在等待時繼續 240P、
-            # 人聲分離、MOSS 與 GLM 5.2；一旦進到高畫質則依影片順序接力。
+            # 人聲分離、MOSS 與翻譯；一旦進到高畫質則依影片順序接力。
             with high_quality_download_phase(video_stem):
                 queued_downloads: dict[
                     Future[Exception | None], tuple[int, Path, float, float]
@@ -2440,7 +2560,7 @@ def process_full_video_from_grid(
                 selective_done = True
             else:
                 _log(
-                    "  [三段精選] 等完整 240P/MOSS 後送 GLM 5.2："
+                    "  [三段精選] 等完整 240P/MOSS 後送 MiniMax M3（失敗改 Grok 4.5）："
                     "30 秒 N 三段、保留完整選段…"
                     if enable_three_phase_selection
                     else "  [精選下載] 先劇情整理 + 選擇性翻譯（歌詞則完整翻譯）…"

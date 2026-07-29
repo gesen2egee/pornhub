@@ -89,7 +89,7 @@ STAGES = {
         "第三層：Video",
         VIDEOS_DIR,
         "$$ 中預算",
-        "240P/MOSS 串流→GLM 5.2 minimal 30秒三段→關鍵格安全高畫質切塊、音訊判斷 enhance＋crossfade",
+        "240P/MOSS 串流→MiniMax M3（失敗改 Grok 4.5）30秒三段→關鍵格安全高畫質切塊、音訊判斷 enhance＋crossfade",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
     "shorts": StageDefinition(
@@ -105,7 +105,7 @@ STAGES = {
         "第四層：Chosen",
         CHOSEN_DIR,
         "$$$ 高預算",
-        "240P/MOSS 串流→GLM 5.2 minimal 30秒三段→關鍵格安全 1080P 切塊、音訊判斷 enhance＋crossfade",
+        "240P/MOSS 串流→MiniMax M3（失敗改 Grok 4.5）30秒三段→關鍵格安全 1080P 切塊、音訊判斷 enhance＋crossfade",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
 }
@@ -286,9 +286,10 @@ def resolve_stage_options(
         "chosen_height": 1080,
         "asr_backend": "moss",
         "translation_model": (
-            "z-ai/glm-5.2"
+            "minimax/minimax-m3" if stage_name in {"video", "chosen"}
+            else "z-ai/glm-5.2"
         ),
-        "reasoning_effort": "minimal",
+        "reasoning_effort": "none" if stage_name in {"video", "chosen"} else "minimal",
         "trim_threshold": 30.0,
         "segment_gap": 1.5,
         "asr_chunk_seconds": 180,
@@ -369,6 +370,7 @@ def feature_environment(options: FeatureSwitches):
         "CHOSEN_ASR_BACKEND",
         "OPENROUTER_MODEL",
         "CHOSEN_OPENROUTER_MODEL",
+        "TRANSLATE_FALLBACK_MODEL",
         "TRANSLATE_REASONING_EFFORT",
         "CHOSEN_TRANSLATE_REASONING",
         "HIGH_VIDEO_HEIGHT",
@@ -480,11 +482,14 @@ def _execute_stage(
             "STANDARD_ASR_BACKEND", "whisper"
         )
         os.environ["OPENROUTER_MODEL"] = options.translation_model or os.getenv(
-            "STANDARD_OPENROUTER_MODEL", "z-ai/glm-5.2"
+            "STANDARD_OPENROUTER_MODEL", "minimax/minimax-m3"
         )
         os.environ["TRANSLATE_REASONING_EFFORT"] = (
             options.reasoning_effort
-            or os.getenv("STANDARD_TRANSLATE_REASONING", "minimal")
+            or os.getenv("STANDARD_TRANSLATE_REASONING", "none")
+        )
+        os.environ["TRANSLATE_FALLBACK_MODEL"] = os.getenv(
+            "STANDARD_TRANSLATE_FALLBACK_MODEL", "x-ai/grok-4.5"
         )
         def process_video(index: int, source: Path) -> None:
             print(f"\n[video {index}/{len(sources)}] {source.name}")

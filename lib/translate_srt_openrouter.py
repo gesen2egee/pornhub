@@ -1,4 +1,4 @@
-"""使用 OpenRouter GLM 5.2 將字幕翻譯為繁體中文。"""
+"""使用 OpenRouter 模型將字幕翻譯為繁體中文。"""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import requests
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-# 所有翻譯與精選層級統一使用 GLM 5.2。
+# Preview 等未指定層級使用 GLM 5.2；Video／Chosen 由管線控制器改用 MiniMax M3。
 DEFAULT_MODEL = "z-ai/glm-5.2"
 # 預設每 60 條一批；設 0 或 TRANSLATE_BATCH_SIZE=0 則整份一次。
 DEFAULT_BATCH_SIZE = 60
@@ -86,7 +86,7 @@ def _cue_duration_seconds(cue: dict[str, Any]) -> float:
 
 
 def three_phase_budget(cues: list[dict[str, Any]]) -> dict[str, int | float]:
-    """以 30 秒／平均句長計算 N，並回傳三篇加可選結尾篇的句數上限。"""
+    """以 30 秒／平均句長計算 N，回傳三篇加固定結尾篇的句數上限。"""
     if not cues:
         raise ValueError("三段精選需要至少一條字幕")
     total = sum(_cue_duration_seconds(cue) for cue in cues)
@@ -100,9 +100,9 @@ def three_phase_budget(cues: list[dict[str, Any]]) -> dict[str, int | float]:
         "average_seconds": average,
         "plot": n - 1,
         "middle": 2 * n,
-        "climax": 3 * n,
+        "climax": 4 * n,
         "ending": ending,
-        "total": 6 * n - 1 + ending,
+        "total": 7 * n - 1 + ending,
     }
 
 
@@ -759,7 +759,7 @@ def translate_cues_selective(
 
 
 def _parse_three_phase_selection(raw: str) -> tuple[str, dict[str, list[int]]]:
-    """解析 GLM 5.2 的三段設計稿與固定數量選句。"""
+    """解析模型的三段設計稿與固定數量選句。"""
     plot_match = re.search(
         r"===PLOT===\s*(.*?)(?====SELECTION===|\Z)",
         raw or "",
@@ -784,7 +784,7 @@ def select_cues_three_phase(
     api_key: str,
     model: str = DEFAULT_MODEL,
 ) -> dict[str, Any]:
-    """先由 GLM 5.2 寫三段設計，再依 30 秒 N 預算選出連續可承接字幕。"""
+    """先由模型寫三段設計，再依 30 秒 N 預算選出連續可承接字幕。"""
     global LAST_TRANSLATE_STATS
     budget = three_phase_budget(cues)
     prepared = strip_speaker_labels(cues)
@@ -796,9 +796,9 @@ def select_cues_three_phase(
         "情節篇、中段精華篇、高潮篇。所有說明、人物姓名、動名詞與專有稱呼"
         "都必須嚴格使用繁體中文，禁止任何英文、日文、韓文、簡體或其他外語殘留。\n\n"
         f"句數限制：情節篇最多 {budget['plot']} 句；中段篇最多 {budget['middle']} 句；"
-        f"高潮篇最多 {budget['climax']} 句；可選結尾篇最多 {budget['ending']} 句；"
+        f"高潮篇最多 {budget['climax']} 句；結尾篇固定使用、最多 {budget['ending']} 句；"
         f"情節＋中段合計最多 {budget['plot'] + budget['middle']} 句；全部最多 {budget['total']} 句。"
-        "結尾篇可以完全不選，只有需要交代結尾、前後呼應或餘韻時才使用。若前段不足，優先以後段可承接內容補足，"
+        "結尾篇不可留空，請在需要交代結尾、前後呼應或餘韻的位置選取；若前段不足，優先以後段可承接內容補足，"
         "盡量不要超過上限。"
         "每個 id 只能選一次，各篇合併後 id 必須嚴格遞增。\n\n"
         "情節篇只用最少句數交代必要背景、人物關係、衝突與契約起點；"
@@ -811,13 +811,12 @@ def select_cues_three_phase(
         "輸出格式完全固定，不要 Markdown、JSON 或額外說明：\n"
         "===PLOT===\n"
         "以繁體中文寫設計稿，依序為【情節篇設計】、【中段精華篇設計】、【高潮篇設計】；"
-        "若使用結尾篇，再寫【結尾篇設計】。每段 80–150 字，說明該段如何服務慾望、節奏與前後承接；"
-        "結尾篇若不需要，請寫【結尾篇設計】不需要，且不要選任何 id。\n"
+        "必須寫【結尾篇設計】。每段 80–150 字，說明該段如何服務慾望、節奏與前後承接。\n"
         "===SELECTION===\n"
         f"PLOT|最多 {budget['plot']} 個逗號分隔 id\n"
         f"MIDDLE|最多 {budget['middle']} 個逗號分隔 id\n"
         f"CLIMAX|最多 {budget['climax']} 個逗號分隔 id\n"
-        f"ENDING|最多 {budget['ending']} 個逗號分隔 id；若不需要請留空"
+        f"ENDING|最多 {budget['ending']} 個逗號分隔 id；結尾篇固定使用，不可留空"
     )
     effort = os.getenv("TRANSLATE_REASONING_EFFORT", "minimal").strip() or "minimal"
     if effort == "none" and "grok-4.5" in model.casefold():
@@ -850,7 +849,7 @@ def select_cues_three_phase(
     ids = [item for name in ("plot", "middle", "climax", "ending") for item in phases[name]]
     cumulative_middle = actual["plot"] + actual["middle"]
     if (
-        not all(actual[name] for name in ("plot", "middle", "climax"))
+        not all(actual[name] for name in ("plot", "middle", "climax", "ending"))
         or actual["plot"] > expected["plot"] + THREE_PHASE_SOFT_OVERAGE
         or actual["middle"] > expected["middle"] + THREE_PHASE_SOFT_OVERAGE
         or actual["climax"] > expected["climax"] + THREE_PHASE_SOFT_OVERAGE
