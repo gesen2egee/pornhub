@@ -28,6 +28,7 @@ from project_paths import (
     DOWNLOADED_DIR,
     LIB_DIR,
     MOSS_VENV_DIR,
+    TASKS_DIR,
     TEMP_DIR,
     VIDEOS_DIR,
     ensure_output_directories,
@@ -87,6 +88,8 @@ def three_phase_selection_enabled(
 
 DOWNLOAD_SOCKET_TIMEOUT = 30
 DOWNLOAD_RETRIES = 3
+ASR_PROXY_DOWNLOAD_ATTEMPTS = 3
+ASR_PROXY_RETRY_DELAY_SECONDS = 3.0
 SEGMENT_DOWNLOAD_ATTEMPTS = 2
 SEGMENT_RECOVERY_ATTEMPTS = 1
 # 高畫質切塊採五條分開請求；每條相隔一秒啟動，避免同時衝擊來源站點。
@@ -105,6 +108,7 @@ _SEGMENT_DOWNLOAD_SEMAPHORES: dict[int, BoundedSemaphore] = {}
 _SEGMENT_DOWNLOAD_SEMAPHORE_LOCK = Lock()
 _SEGMENT_DOWNLOAD_START_LOCK = Lock()
 _NEXT_SEGMENT_DOWNLOAD_START = 0.0
+_ASR_PROXY_FAILURE_LOG_LOCK = Lock()
 # 下一支影片可先跑 240P、Demucs、MOSS、模型翻譯；只有進到高畫質下載時才等候。
 _HIGH_QUALITY_DOWNLOAD_PHASE_LOCK = Lock()
 # 即使未來建立多個 MOSS worker，也不允許不同影片同時佔用 MOSS 推理。
@@ -524,28 +528,108 @@ def download_proxy_range(
     start: float,
     end: float,
 ) -> Path:
-    """下載單一 ≤240P 區段，完成後可立即交給 Demucs 與 ASR。"""
+    """下載單一 ≤240P 區段；暫時串流失敗時清理後重試。"""
     import yt_dlp
 
-    out_path.unlink(missing_ok=True)
     start = max(0.0, float(start))
     end = max(start + 0.05, float(end))
+    attempts = _positive_int_env(
+        "ASR_PROXY_DOWNLOAD_ATTEMPTS", ASR_PROXY_DOWNLOAD_ATTEMPTS
+    )
+    try:
+        retry_delay = max(
+            0.0,
+            float(
+                os.getenv(
+                    "ASR_PROXY_RETRY_DELAY_SECONDS",
+                    str(ASR_PROXY_RETRY_DELAY_SECONDS),
+                )
+            ),
+        )
+    except ValueError:
+        retry_delay = ASR_PROXY_RETRY_DELAY_SECONDS
 
     def _ranges(_info_dict, _ydl):
         yield {"start_time": start, "end_time": end}
 
-    opts = _base_ydl_opts(out_path, "download_low", video_url)
-    opts["format"] = PROXY_FORMAT
-    opts["download_ranges"] = _ranges
-    opts["force_keyframes_at_cuts"] = True
-    _log(f"  [1/5] 下載 240P ASR 區段 {start:.0f}–{end:.0f}s → {out_path.name}")
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([video_url])
-    if not out_path.exists() or has_video_stream(out_path) is not True:
-        raise RuntimeError(
-            f"240P ASR 區段下載失敗：{out_path.name} ({start:.2f}-{end:.2f}s)"
+    for attempt in range(1, attempts + 1):
+        for partial in (
+            out_path,
+            Path(f"{out_path}.part"),
+            Path(f"{out_path}.ytdl"),
+            TEMP_DIR / f"{out_path.name}.part",
+            TEMP_DIR / f"{out_path.name}.ytdl",
+        ):
+            partial.unlink(missing_ok=True)
+        opts = _base_ydl_opts(out_path, "download_low", video_url)
+        opts["format"] = PROXY_FORMAT
+        opts["download_ranges"] = _ranges
+        opts["force_keyframes_at_cuts"] = True
+        label = f"（第 {attempt}/{attempts} 次）" if attempts > 1 else ""
+        _log(
+            f"  [1/5] 下載 240P ASR 區段 {start:.0f}–{end:.0f}s{label}"
+            f" → {out_path.name}"
         )
-    return out_path
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([video_url])
+            if not out_path.exists() or has_video_stream(out_path) is not True:
+                raise RuntimeError("下載後檔案不存在或沒有可用的影像流")
+            return out_path
+        except Exception as exc:
+            _record_asr_proxy_failure(
+                video_url=video_url,
+                out_path=out_path,
+                start=start,
+                end=end,
+                attempt=attempt,
+                attempts=attempts,
+                error=exc,
+            )
+            if attempt >= attempts:
+                raise RuntimeError(
+                    "240P ASR 區段下載失敗："
+                    f"{out_path.name} ({start:.2f}-{end:.2f}s)，"
+                    f"已重試 {attempts} 次；最後錯誤：{exc}"
+                ) from exc
+            _log(
+                f"  [240P 重試] 第 {attempt}/{attempts} 次失敗：{exc}；"
+                f"{retry_delay:.1f}s 後清理暫存重試"
+            )
+            if retry_delay:
+                time.sleep(retry_delay)
+    raise AssertionError("ASR 代理下載重試迴圈未正常結束")
+
+
+def _record_asr_proxy_failure(
+    *,
+    video_url: str,
+    out_path: Path,
+    start: float,
+    end: float,
+    attempt: int,
+    attempts: int,
+    error: Exception,
+) -> None:
+    """把可重現 ASR 分段失敗的上下文寫入 tasks，供後續診斷。"""
+    record = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "video_url": video_url,
+        "output": str(out_path),
+        "range_seconds": [round(start, 3), round(end, 3)],
+        "attempt": attempt,
+        "attempts": attempts,
+        "error_type": type(error).__name__,
+        "error": str(error),
+    }
+    try:
+        log_path = TASKS_DIR / "ffmpeg-errors" / "asr-proxy-failures.jsonl"
+        with _ASR_PROXY_FAILURE_LOG_LOCK:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as log_exc:
+        _log(f"  [!] 無法寫入 ASR 失敗紀錄：{log_exc}")
 
 
 def remote_duration(video_url: str) -> float | None:
