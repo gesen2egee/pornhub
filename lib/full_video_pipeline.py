@@ -618,12 +618,34 @@ def _high_format_opts() -> tuple[str, list[str], int]:
     return fmt, sort, max(1, concurrent)
 
 
+def _high_range_format_opts() -> tuple[str, list[str], int]:
+    """範圍下載優先選直接 HTTPS MP4，避免 HLS 必經 FFmpeg 時拒絕奇異分片名稱。"""
+    fmt, sort, concurrent = _high_format_opts()
+    # 使用者明確指定格式時不可覆寫；否則範圍下載先選能讓 FFmpeg 直接 seek 的
+    # HTTPS 檔案，沒有才回退既有最佳格式（可能是 HLS）。
+    if os.getenv("HIGH_VIDEO_FORMAT") is not None:
+        return fmt, sort, concurrent
+    unlimited = os.getenv("HIGH_VIDEO_UNLIMITED", "0").strip().casefold() in {
+        "1", "true", "yes", "on",
+    }
+    try:
+        height = int(os.getenv("HIGH_VIDEO_HEIGHT", "720"))
+    except ValueError:
+        height = 720
+    direct = (
+        "best[protocol=https]"
+        if unlimited
+        else f"best[protocol=https][height<={height}]/best[protocol=https]"
+    )
+    return f"{direct}/{fmt}", sort, concurrent
+
+
 def download_high_full(video_url: str, out_path: Path) -> Path:
     import yt_dlp
 
     if out_path.exists():
         out_path.unlink()
-    fmt, fsort, concurrent = _high_format_opts()
+    fmt, fsort, concurrent = _high_range_format_opts()
     opts = _base_ydl_opts(out_path, "download_full", video_url)
     opts["format"] = fmt
     opts["format_sort"] = fsort
@@ -725,7 +747,7 @@ def download_high_range(
     def _ranges(info_dict, ydl):
         yield {"start_time": source_start, "end_time": source_end}
 
-    fmt, fsort, concurrent = _high_format_opts()
+    fmt, fsort, concurrent = _high_range_format_opts()
     # 五條範圍請求已提供網路平行度，避免每條再開多個 fragment 造成限流。
     concurrent = _positive_int_env(
         "HIGH_RANGE_CONCURRENT_FRAGMENTS",
