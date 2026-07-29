@@ -2560,7 +2560,7 @@ def process_full_video_from_grid(
                 selective_done = True
             else:
                 _log(
-                    "  [三段精選] 等完整 240P/MOSS 後送 MiniMax M3（失敗改 Grok 4.5）："
+                    "  [三段精選] 等完整 240P/MOSS 後送 Step 3.7 Flash（失敗改 Grok 4.5）："
                     "30 秒 N 三段、保留完整選段…"
                     if enable_three_phase_selection
                     else "  [精選下載] 先劇情整理 + 選擇性翻譯（歌詞則完整翻譯）…"

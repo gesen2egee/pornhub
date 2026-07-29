@@ -15,8 +15,8 @@ import requests
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-# Preview 等未指定層級使用 GLM 5.2；Video／Chosen 由管線控制器改用 MiniMax M3。
-DEFAULT_MODEL = "z-ai/glm-5.2"
+# 所有未指定層級的翻譯預設使用 Step 3.7 Flash；Video／Chosen 另有 Grok 4.5 後備。
+DEFAULT_MODEL = "stepfun/step-3.7-flash"
 # 預設每 60 條一批；設 0 或 TRANSLATE_BATCH_SIZE=0 則整份一次。
 DEFAULT_BATCH_SIZE = 60
 THREE_PHASE_SOFT_OVERAGE = 2

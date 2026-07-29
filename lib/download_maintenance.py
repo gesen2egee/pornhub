@@ -661,13 +661,13 @@ def process_official_directory(selected_jpgs=None):
     if not jpg_files:
         return 0
 
-    # 480P：Whisper ASR（剪片依據）+ MiniMax M3 翻譯；失敗改用 Grok 4.5；關閉 enhance
+    # 480P：Whisper ASR（剪片依據）+ Step 3.7 Flash 翻譯；失敗改用 Grok 4.5；關閉 enhance
     os.environ["ASR_BACKEND"] = os.getenv("STANDARD_ASR_BACKEND", "whisper")
     os.environ["OPENROUTER_MODEL"] = os.getenv(
-        "STANDARD_OPENROUTER_MODEL", "minimax/minimax-m3"
+        "STANDARD_OPENROUTER_MODEL", "stepfun/step-3.7-flash"
     )
     os.environ["TRANSLATE_REASONING_EFFORT"] = os.getenv(
-        "STANDARD_TRANSLATE_REASONING", "none"
+        "STANDARD_TRANSLATE_REASONING", "minimal"
     )
     os.environ["TRANSLATE_FALLBACK_MODEL"] = os.getenv(
         "STANDARD_TRANSLATE_FALLBACK_MODEL", "x-ai/grok-4.5"
@@ -678,7 +678,7 @@ def process_official_directory(selected_jpgs=None):
 
     print(
         f"[+] 標準片管線 [{VIDEO_DIR}/] 共 {len(jpg_files)} 張 "
-        f"（代理 → Whisper + MiniMax M3（失敗改 Grok 4.5）→ 480P 剪片，不 enhance）\n"
+        f"（代理 → Whisper + Step 3.7 Flash（失敗改 Grok 4.5）→ 480P 剪片，不 enhance）\n"
     )
     success_count = 0
     failed_count = 0
@@ -861,7 +861,7 @@ def run_download_process(
             print("\n==================================================")
             print(
                 " [階段 2/3] 03_videos"
-                "（Whisper+MiniMax M3（失敗改 Grok 4.5）→480P 剪片，不 enhance）"
+                "（Whisper+Step 3.7 Flash（失敗改 Grok 4.5）→480P 剪片，不 enhance）"
             )
             print("==================================================")
             download_failures += process_official_directory(
@@ -870,12 +870,12 @@ def run_download_process(
                 ),
             ) or 0
 
-        # 【階段 3】精選：1080P + MOSS + MiniMax M3 + enhance → 06_good
+        # 【階段 3】精選：1080P + MOSS + Step 3.7 Flash + enhance → 06_good
         if not retry_subtitles and not repair_over_1080 and chosen_items:
             print("\n==================================================")
             print(
                 " [階段 3/3] 05_chosen"
-                "（1080P + MOSS + MiniMax M3（失敗改 Grok 4.5）+ enhance → 06_good）"
+                "（1080P + MOSS + Step 3.7 Flash（失敗改 Grok 4.5）+ enhance → 06_good）"
             )
             print("==================================================")
             import chosen_pipeline
