@@ -1,4 +1,4 @@
-"""使用 OpenRouter Grok 將字幕翻譯為繁體中文。"""
+"""使用 OpenRouter GLM 5.2 將字幕翻譯為繁體中文。"""
 
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ import requests
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-# 預設給 03 標準片：4.3 + none（便宜）。精選 05 會覆寫成 4.5 + minimal。
-DEFAULT_MODEL = "x-ai/grok-4.3"
+# 所有翻譯與精選層級統一使用 GLM 5.2。
+DEFAULT_MODEL = "z-ai/glm-5.2"
 # 預設每 60 條一批；設 0 或 TRANSLATE_BATCH_SIZE=0 則整份一次。
 DEFAULT_BATCH_SIZE = 60
 SPEAKER_LABEL_PATTERN = re.compile(r"^\s*\[S\d+\]\s*", re.IGNORECASE)
@@ -272,15 +272,7 @@ def _translate_batch(
 ) -> dict[int, str]:
     items = [{"id": cue["id"], "text": cue["text"]} for cue in cues]
     max_tokens = int(os.getenv("TRANSLATE_MAX_TOKENS", "32000"))
-    effort = os.getenv("TRANSLATE_REASONING_EFFORT", "none").strip() or "none"
-    # grok-4.5 等模型強制 reasoning，none 會 400；自動升到 minimal
-    model_l = model.casefold()
-    if effort == "none" and ("grok-4.5" in model_l or "grok-4-5" in model_l):
-        effort = "minimal"
-        print(
-            f"  [translate] {model} 不支援 reasoning=none，改用 minimal",
-            flush=True,
-        )
+    effort = os.getenv("TRANSLATE_REASONING_EFFORT", "minimal").strip() or "minimal"
     body_template = {
         "model": model,
         "messages": [
@@ -498,7 +490,7 @@ def translate_cues(
     cost_sum = sum(float(c) for c in costs) if costs else None
     LAST_TRANSLATE_STATS = {
         "model": model,
-        "reasoning_effort": os.getenv("TRANSLATE_REASONING_EFFORT", "none"),
+        "reasoning_effort": os.getenv("TRANSLATE_REASONING_EFFORT", "minimal"),
         "format": "flat_id_pipe",
         "batch_size": 0 if single_shot else step,
         "cues": len(cues),
@@ -764,7 +756,7 @@ def translate_cues_selective(
 
 
 def _parse_three_phase_selection(raw: str) -> tuple[str, dict[str, list[int]]]:
-    """解析 GROK 的三段設計稿與固定數量選句。"""
+    """解析 GLM 5.2 的三段設計稿與固定數量選句。"""
     plot_match = re.search(
         r"===PLOT===\s*(.*?)(?====SELECTION===|\Z)",
         raw or "",
@@ -789,7 +781,7 @@ def select_cues_three_phase(
     api_key: str,
     model: str = DEFAULT_MODEL,
 ) -> dict[str, Any]:
-    """先由 GROK 寫三段設計，再依 30 秒 N 預算選出連續可承接字幕。"""
+    """先由 GLM 5.2 寫三段設計，再依 30 秒 N 預算選出連續可承接字幕。"""
     global LAST_TRANSLATE_STATS
     budget = three_phase_budget(cues)
     prepared = strip_speaker_labels(cues)

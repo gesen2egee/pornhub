@@ -661,13 +661,13 @@ def process_official_directory(selected_jpgs=None):
     if not jpg_files:
         return 0
 
-    # 480P：Whisper ASR（剪片依據）+ Grok 4.3 none 翻譯；關閉 enhance
+    # 480P：Whisper ASR（剪片依據）+ GLM 5.2 minimal 翻譯；關閉 enhance
     os.environ["ASR_BACKEND"] = os.getenv("STANDARD_ASR_BACKEND", "whisper")
     os.environ["OPENROUTER_MODEL"] = os.getenv(
-        "STANDARD_OPENROUTER_MODEL", "x-ai/grok-4.3"
+        "STANDARD_OPENROUTER_MODEL", "z-ai/glm-5.2"
     )
     os.environ["TRANSLATE_REASONING_EFFORT"] = os.getenv(
-        "STANDARD_TRANSLATE_REASONING", "none"
+        "STANDARD_TRANSLATE_REASONING", "minimal"
     )
     os.environ["HIGH_VIDEO_HEIGHT"] = os.getenv("STANDARD_VIDEO_HEIGHT", "480")
     os.environ["AUDIO_AUTO_ENHANCE"] = "0"
@@ -675,7 +675,7 @@ def process_official_directory(selected_jpgs=None):
 
     print(
         f"[+] 標準片管線 [{VIDEO_DIR}/] 共 {len(jpg_files)} 張 "
-        f"（代理 → Whisper + Grok 4.3 none → 480P 剪片，不 enhance）\n"
+        f"（代理 → Whisper + GLM 5.2 minimal → 480P 剪片，不 enhance）\n"
     )
     success_count = 0
     failed_count = 0
@@ -858,7 +858,7 @@ def run_download_process(
             print("\n==================================================")
             print(
                 " [階段 2/3] 03_videos"
-                "（Whisper+Grok4.3 none→480P 剪片，不 enhance）"
+                "（Whisper+GLM 5.2 minimal→480P 剪片，不 enhance）"
             )
             print("==================================================")
             download_failures += process_official_directory(
@@ -867,12 +867,12 @@ def run_download_process(
                 ),
             ) or 0
 
-        # 【階段 3】精選：1080P + MOSS + Grok 4.5 + enhance → 06_good
+        # 【階段 3】精選：1080P + MOSS + GLM 5.2 + enhance → 06_good
         if not retry_subtitles and not repair_over_1080 and chosen_items:
             print("\n==================================================")
             print(
                 " [階段 3/3] 05_chosen"
-                "（1080P + MOSS + Grok 4.5 minimal + enhance → 06_good）"
+                "（1080P + MOSS + GLM 5.2 minimal + enhance → 06_good）"
             )
             print("==================================================")
             import chosen_pipeline

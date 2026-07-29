@@ -174,7 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
     _boolean_switch(
         parser,
         "three-phase-selection",
-        "開啟或關閉 30 秒 N 三段 GROK 精選（Video、Chosen 預設開）",
+        "開啟或關閉 30 秒 N 三段 GLM 5.2 精選（Video、Chosen 預設開）",
     )
     _boolean_switch(
         parser,

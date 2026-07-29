@@ -89,7 +89,7 @@ STAGES = {
         "第三層：Video",
         VIDEOS_DIR,
         "$$ 中預算",
-        "240P/MOSS 串流→Grok 30秒三段→關鍵格安全高畫質切塊、音訊判斷 enhance＋crossfade",
+        "240P/MOSS 串流→GLM 5.2 minimal 30秒三段→關鍵格安全高畫質切塊、音訊判斷 enhance＋crossfade",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
     "shorts": StageDefinition(
@@ -105,7 +105,7 @@ STAGES = {
         "第四層：Chosen",
         CHOSEN_DIR,
         "$$$ 高預算",
-        "240P/MOSS 串流→Grok 30秒三段→關鍵格安全 1080P 切塊、音訊判斷 enhance＋crossfade",
+        "240P/MOSS 串流→GLM 5.2 minimal 30秒三段→關鍵格安全 1080P 切塊、音訊判斷 enhance＋crossfade",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
 }
@@ -286,9 +286,9 @@ def resolve_stage_options(
         "chosen_height": 1080,
         "asr_backend": "moss",
         "translation_model": (
-            "x-ai/grok-4.5" if stage_name in {"video", "chosen"} else "x-ai/grok-4.3"
+            "z-ai/glm-5.2"
         ),
-        "reasoning_effort": "minimal" if stage_name in {"video", "chosen"} else "none",
+        "reasoning_effort": "minimal",
         "trim_threshold": 30.0,
         "segment_gap": 1.5,
         "asr_chunk_seconds": 180,
@@ -480,11 +480,11 @@ def _execute_stage(
             "STANDARD_ASR_BACKEND", "whisper"
         )
         os.environ["OPENROUTER_MODEL"] = options.translation_model or os.getenv(
-            "STANDARD_OPENROUTER_MODEL", "x-ai/grok-4.3"
+            "STANDARD_OPENROUTER_MODEL", "z-ai/glm-5.2"
         )
         os.environ["TRANSLATE_REASONING_EFFORT"] = (
             options.reasoning_effort
-            or os.getenv("STANDARD_TRANSLATE_REASONING", "none")
+            or os.getenv("STANDARD_TRANSLATE_REASONING", "minimal")
         )
         def process_video(index: int, source: Path) -> None:
             print(f"\n[video {index}/{len(sources)}] {source.name}")

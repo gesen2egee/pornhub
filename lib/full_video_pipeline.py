@@ -79,7 +79,7 @@ def resolve_edge_padding_seconds(
 def three_phase_selection_enabled(
     environment: dict[str, str] | None = None,
 ) -> bool:
-    """30 秒三段 GROK 精選開關；Video／Chosen 由控制器預設開啟。"""
+    """30 秒三段 GLM 5.2 精選開關；Video／Chosen 由控制器預設開啟。"""
     environment = os.environ if environment is None else environment
     value = environment.get("ENABLE_THREE_PHASE_SELECTION", "1").strip().casefold()
     return value not in {"0", "false", "no", "off"}
@@ -105,7 +105,7 @@ _SEGMENT_DOWNLOAD_SEMAPHORES: dict[int, BoundedSemaphore] = {}
 _SEGMENT_DOWNLOAD_SEMAPHORE_LOCK = Lock()
 _SEGMENT_DOWNLOAD_START_LOCK = Lock()
 _NEXT_SEGMENT_DOWNLOAD_START = 0.0
-# 下一支影片可先跑 240P、Demucs、MOSS、GROK；只有進到高畫質下載時才等候。
+# 下一支影片可先跑 240P、Demucs、MOSS、GLM 5.2；只有進到高畫質下載時才等候。
 _HIGH_QUALITY_DOWNLOAD_PHASE_LOCK = Lock()
 # 即使未來建立多個 MOSS worker，也不允許不同影片同時佔用 MOSS 推理。
 _MOSS_INFERENCE_LOCK = Lock()
@@ -261,7 +261,7 @@ def segment_download_slot(workers: int) -> Iterator[None]:
 
 @contextmanager
 def high_quality_download_phase(video_stem: str) -> Iterator[None]:
-    """全程序一次只允許一支影片下載高畫質；不阻擋其他影片的 240P/ASR/GROK。"""
+    """全程序一次只允許一支影片下載高畫質；不阻擋其他影片的 240P/ASR/GLM 5.2。"""
     _log(f"  [高畫質排程] {video_stem} 等待高畫質下載槽位")
     with _HIGH_QUALITY_DOWNLOAD_PHASE_LOCK:
         _log(f"  [高畫質排程] {video_stem} 取得槽位，開始高畫質下載")
@@ -1063,7 +1063,7 @@ def complete_three_phase_translation(
     asr: dict[str, Any],
     cache_path: Path | None = None,
 ) -> dict[str, Any]:
-    """GROK 30 秒三段規劃、嚴格選句後，再將保留句翻成繁中。"""
+    """GLM 5.2 30 秒三段規劃、嚴格選句後，再將保留句翻成繁中。"""
     if (
         (asr.get("translated_srt") or "").strip()
         and asr.get("selection_mode") == "three_phase_30s"
@@ -1967,7 +1967,7 @@ def run_parallel_delivery_phase(
                 tuple[int, Path, float, float, Exception]
             ] = []
             # 此鎖只包住高畫質下載與補抓。下一支影片可以在等待時繼續 240P、
-            # 人聲分離、MOSS 與 GROK；一旦進到高畫質則依影片順序接力。
+            # 人聲分離、MOSS 與 GLM 5.2；一旦進到高畫質則依影片順序接力。
             with high_quality_download_phase(video_stem):
                 queued_downloads: dict[
                     Future[Exception | None], tuple[int, Path, float, float]
@@ -2440,7 +2440,7 @@ def process_full_video_from_grid(
                 selective_done = True
             else:
                 _log(
-                    "  [三段精選] 等完整 240P/MOSS 後送 GROK："
+                    "  [三段精選] 等完整 240P/MOSS 後送 GLM 5.2："
                     "30 秒 N 三段、保留完整選段…"
                     if enable_three_phase_selection
                     else "  [精選下載] 先劇情整理 + 選擇性翻譯（歌詞則完整翻譯）…"
