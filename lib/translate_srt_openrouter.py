@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -26,6 +27,35 @@ LINE_PATTERN = re.compile(r"^\s*(\d+)\s*[|｜]\s*(.*?)\s*$")
 
 # 最近一次 translate_cues 的用量統計（時間 / tokens / cost），供測試腳本讀取。
 LAST_TRANSLATE_STATS: dict[str, Any] = {}
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """先寫同目錄暫存檔再替換，避免中斷時留下半份 JSON。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _cue_fingerprint(cues: list[dict[str, Any]]) -> str:
+    """只以會影響翻譯的 id、時間與文字辨識同一批來源字幕。"""
+    source = [
+        {
+            "id": int(cue["id"]),
+            "time": str(cue.get("time") or ""),
+            "text": str(cue.get("text") or ""),
+        }
+        for cue in cues
+    ]
+    encoded = json.dumps(
+        source,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 SYSTEM_PROMPT = (
     "你是字幕校正與翻譯專家。每行格式為 id|原文（ASR 聽寫）。"
@@ -419,6 +449,8 @@ def translate_cues(
     api_key: str,
     model: str = DEFAULT_MODEL,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    *,
+    checkpoint_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     """翻譯字幕。預設每 batch_size 條一批；batch_size<=0 則整份一次。
 
@@ -455,21 +487,70 @@ def translate_cues(
     single_shot = step >= len(translated_cues)
     stats_sink: list[dict[str, Any]] = []
     t_all = time.perf_counter()
+    fingerprint = _cue_fingerprint(cues)
+    saved_translations: dict[int, str] = {}
+    if checkpoint_path is not None and checkpoint_path.is_file():
+        try:
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            if (
+                checkpoint.get("schema") == "translation_v1"
+                and checkpoint.get("source_fingerprint") == fingerprint
+                and checkpoint.get("model") == model
+            ):
+                saved_translations = {
+                    int(cue_id): str(text)
+                    for cue_id, text in dict(
+                        checkpoint.get("translations") or {}
+                    ).items()
+                    if str(text).strip()
+                }
+        except (OSError, ValueError, TypeError):
+            saved_translations = {}
 
     with requests.Session() as session:
         for start in range(0, len(translated_cues), step):
             batch = translated_cues[start : start + step]
-            translations = _translate_batch(
-                batch,
-                api_key,
-                model,
-                session,
-                stats_sink=stats_sink,
-            )
+            missing_batch = [
+                cue
+                for cue in batch
+                if int(cue["id"]) not in saved_translations
+            ]
+            if missing_batch:
+                translations = _translate_batch(
+                    missing_batch,
+                    api_key,
+                    model,
+                    session,
+                    stats_sink=stats_sink,
+                )
+                saved_translations.update(translations)
+                if checkpoint_path is not None:
+                    _atomic_write_json(
+                        checkpoint_path,
+                        {
+                            "schema": "translation_v1",
+                            "source_fingerprint": fingerprint,
+                            "model": model,
+                            "complete": len(saved_translations)
+                            >= len(translated_cues),
+                            "completed_ids": sorted(saved_translations),
+                            "translations": {
+                                str(cue_id): saved_translations[cue_id]
+                                for cue_id in sorted(saved_translations)
+                            },
+                        },
+                    )
+            else:
+                translations = saved_translations
+                print(
+                    f"OpenRouter 翻譯 checkpoint 重用 "
+                    f"{start + 1}-{start + len(batch)}/{len(cues)}",
+                    flush=True,
+                )
             for cue in batch:
                 body = SPEAKER_LABEL_PATTERN.sub(
                     "",
-                    translations[int(cue["id"])],
+                    saved_translations[int(cue["id"])],
                 ).strip()
                 prefix = speaker_prefixes[int(cue["id"])]
                 cue["text"] = f"{prefix} {body}".strip()

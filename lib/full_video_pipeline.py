@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -109,6 +110,7 @@ _SEGMENT_DOWNLOAD_SEMAPHORE_LOCK = Lock()
 _SEGMENT_DOWNLOAD_START_LOCK = Lock()
 _NEXT_SEGMENT_DOWNLOAD_START = 0.0
 _ASR_PROXY_FAILURE_LOG_LOCK = Lock()
+_PIPELINE_CHECKPOINT_LOCK = Lock()
 # 下一支影片可先跑 240P、Demucs、MOSS、模型翻譯；只有進到高畫質下載時才等候。
 _HIGH_QUALITY_DOWNLOAD_PHASE_LOCK = Lock()
 # 即使未來建立多個 MOSS worker，也不允許不同影片同時佔用 MOSS 推理。
@@ -116,6 +118,147 @@ _MOSS_INFERENCE_LOCK = Lock()
 
 # 由外部 benchmark 注入 PipelineMetrics；未注入則不計時
 _ACTIVE_METRICS: Any | None = None
+
+CHECKPOINT_FILE_NAMES = {
+    "asr_source.json",
+    "selection.json",
+    "translation.json",
+    "pipeline_state.json",
+}
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """原子替換 JSON，程序中斷時不會破壞上一版 checkpoint。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _read_json_dict(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _update_pipeline_state(path: Path | None, **changes: Any) -> None:
+    if path is None:
+        return
+    with _PIPELINE_CHECKPOINT_LOCK:
+        state = _read_json_dict(path)
+        state.setdefault("schema", "pipeline_state_v1")
+        state.update(changes)
+        state["updated_at_epoch"] = round(time.time(), 3)
+        _atomic_write_json(path, state)
+
+
+def _record_high_quality_segment(
+    state_path: Path | None,
+    *,
+    index: int,
+    start: float,
+    end: float,
+    path: Path,
+) -> None:
+    if state_path is None:
+        return
+    with _PIPELINE_CHECKPOINT_LOCK:
+        state = _read_json_dict(state_path)
+        state.setdefault("schema", "pipeline_state_v1")
+        high_quality = dict(state.get("high_quality") or {})
+        segments = dict(high_quality.get("segments") or {})
+        segments[str(index)] = {
+            "complete": True,
+            "start": round(float(start), 3),
+            "end": round(float(end), 3),
+            "path": path.name,
+        }
+        high_quality["segments"] = segments
+        high_quality["completed"] = sum(
+            1 for item in segments.values() if item.get("complete") is True
+        )
+        state["high_quality"] = high_quality
+        state["updated_at_epoch"] = round(time.time(), 3)
+        _atomic_write_json(state_path, state)
+
+
+def _prepare_high_quality_manifest(
+    state_path: Path | None,
+    segments_to_download: list[tuple[float, float]],
+    video_stem: str,
+) -> dict[str, Any]:
+    if state_path is None:
+        return {}
+    with _PIPELINE_CHECKPOINT_LOCK:
+        state = _read_json_dict(state_path)
+        state.setdefault("schema", "pipeline_state_v1")
+        high_quality = dict(state.get("high_quality") or {})
+        high_quality["mode"] = "segments"
+        high_quality["total"] = len(segments_to_download)
+        previous = dict(high_quality.get("segments") or {})
+        high_quality["segments"] = {
+            str(index): item
+            for index, (start, end) in enumerate(segments_to_download)
+            if (
+                (item := dict(previous.get(str(index)) or {})).get("complete")
+                is True
+                and abs(float(item.get("start") or -1) - start) < 0.01
+                and abs(float(item.get("end") or -1) - end) < 0.01
+                and item.get("path") == f"{video_stem}.seg{index:03d}.mp4"
+            )
+        }
+        high_quality["completed"] = len(high_quality["segments"])
+        state["high_quality"] = high_quality
+        state["updated_at_epoch"] = round(time.time(), 3)
+        _atomic_write_json(state_path, state)
+        return high_quality
+
+
+def _cleanup_work_media_preserving_checkpoints(work_dir: Path) -> None:
+    """成功發布後只清大型暫存，保留四份可稽核 checkpoint。"""
+    for child in sorted(work_dir.rglob("*"), reverse=True):
+        if child.is_file():
+            if child.parent == work_dir and child.name in CHECKPOINT_FILE_NAMES:
+                continue
+            try:
+                child.unlink()
+            except OSError:
+                pass
+        elif child.is_dir():
+            try:
+                child.rmdir()
+            except OSError:
+                pass
+
+
+def _source_asr_payload(
+    asr: dict[str, Any],
+    duration: float | None = None,
+) -> dict[str, Any]:
+    """從舊混合快取抽出不可被精選／翻譯覆蓋的原始 ASR。"""
+    from translate_srt_openrouter import format_srt
+
+    cues = list(asr.get("source_cues") or asr.get("cues") or [])
+    source_duration = float(
+        duration if duration is not None else asr.get("source_duration") or 0.0
+    )
+    return {
+        "schema": "asr_source_v1",
+        "complete": True,
+        "language": asr.get("language"),
+        "original_srt": format_srt(cues) if cues else str(
+            asr.get("original_srt") or ""
+        ),
+        "translated_srt": "",
+        "outcome": "transcribed" if cues else "empty",
+        "cues": cues,
+        "source_duration": source_duration,
+    }
 
 
 def set_pipeline_metrics(metrics: Any | None) -> None:
@@ -1069,6 +1212,21 @@ def _cues_for_translation(asr: dict[str, Any]) -> list[dict[str, Any]]:
     return list(cues)
 
 
+def _cues_fingerprint(cues: list[dict[str, Any]]) -> str:
+    payload = [
+        {
+            "id": int(cue["id"]),
+            "time": str(cue.get("time") or ""),
+            "text": str(cue.get("text") or ""),
+        }
+        for cue in cues
+    ]
+    encoded = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _filter_cues_by_ids(
     cues: list[dict[str, Any]],
     keep_ids: set[int],
@@ -1096,6 +1254,8 @@ def complete_cached_translation(
     cache_path: Path | None = None,
     *,
     selective: bool | None = None,
+    translation_path: Path | None = None,
+    state_path: Path | None = None,
 ) -> dict[str, Any]:
     """翻譯既有 ASR；開關為 ON 卻缺 key/時間軸時明確失敗。
 
@@ -1146,7 +1306,12 @@ def complete_cached_translation(
                         asr["cues"] = filtered
                         asr["original_srt"] = format_srt(filtered)
             else:
-                translated = translate_cues(cues, api_key, model_name)
+                translated = translate_cues(
+                    cues,
+                    api_key,
+                    model_name,
+                    checkpoint_path=translation_path,
+                )
                 asr["translated_srt"] = format_srt(translated)
                 asr["outcome"] = "translated"
             asr["translation_model"] = model_name
@@ -1162,16 +1327,25 @@ def complete_cached_translation(
                     f"翻譯已開啟，但 OpenRouter 翻譯失敗：{exc}"
                 ) from exc
     if cache_path is not None:
-        cache_path.write_text(
-            json.dumps(asr, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        _atomic_write_json(cache_path, asr)
+    _update_pipeline_state(
+        state_path,
+        translation={
+            "complete": True,
+            "model": asr.get("translation_model"),
+            "cue_count": len(asr.get("cues") or []),
+        },
+    )
     return asr
 
 
 def complete_three_phase_translation(
     asr: dict[str, Any],
     cache_path: Path | None = None,
+    *,
+    selection_path: Path | None = None,
+    translation_path: Path | None = None,
+    state_path: Path | None = None,
 ) -> dict[str, Any]:
     """30 秒三段規劃、嚴格選句後，再將保留句翻成繁中。"""
     if (
@@ -1197,6 +1371,7 @@ def complete_three_phase_translation(
     primary_model = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
     models = _translation_model_candidates(primary_model)
     budget = three_phase_budget(cues)
+    source_fingerprint = _cues_fingerprint(cues)
 
     # 完整字幕本來就少於整體 7.5N 上限時，直接翻譯全片，
     # 不浪費一次精選請求，也不做不必要的刪句。
@@ -1205,12 +1380,40 @@ def complete_three_phase_translation(
             f"  [三段精選] 完整字幕 {len(cues)} 句 < 總上限 {budget['total']} 句，"
             "改為全片翻譯"
         )
+        all_ids = [int(cue["id"]) for cue in cues]
+        if selection_path is not None:
+            _atomic_write_json(
+                selection_path,
+                {
+                    "schema": "selection_v1",
+                    "complete": True,
+                    "source_fingerprint": source_fingerprint,
+                    "mode": "three_phase_30s",
+                    "budget_version": 2,
+                    "model": None,
+                    "is_full": True,
+                    "kept_ids": all_ids,
+                    "dropped_ids": [],
+                    "plot": "",
+                    "phases": {},
+                    "budget": budget,
+                },
+            )
+        _update_pipeline_state(
+            state_path,
+            selection={"complete": True, "kept": len(all_ids), "is_full": True},
+        )
         translated = None
         used_model = primary_model
         fallback_used = False
         for attempt, model_name in enumerate(models):
             try:
-                translated = translate_cues(cues, api_key, model_name)
+                translated = translate_cues(
+                    cues,
+                    api_key,
+                    model_name,
+                    checkpoint_path=translation_path,
+                )
                 used_model = model_name
                 fallback_used = attempt > 0
                 break
@@ -1220,7 +1423,6 @@ def complete_three_phase_translation(
                 else:
                     raise RuntimeError(f"全片翻譯失敗：{exc}") from exc
         asr = dict(asr)
-        all_ids = [int(cue["id"]) for cue in cues]
         asr["cues"] = cues
         asr["source_cues"] = cues
         asr["original_srt"] = format_srt(cues)
@@ -1237,23 +1439,107 @@ def complete_three_phase_translation(
         asr["translation_model"] = used_model
         asr["translation_fallback_used"] = fallback_used
         asr["outcome"] = "translated"
+        _update_pipeline_state(
+            state_path,
+            translation={
+                "complete": True,
+                "model": used_model,
+                "cue_count": len(all_ids),
+            },
+        )
         if cache_path is not None:
-            cache_path.write_text(
-                json.dumps(asr, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            _atomic_write_json(cache_path, asr)
         return asr
 
     selected = None
     translated = None
-    used_model = primary_model
-    fallback_used = False
+    selection_model = primary_model
+    if selection_path is not None and selection_path.is_file():
+        saved = _read_json_dict(selection_path)
+        if (
+            saved.get("schema") == "selection_v1"
+            and saved.get("complete") is True
+            and saved.get("source_fingerprint") == source_fingerprint
+            and saved.get("budget_version") == 2
+        ):
+            kept_ids = {int(value) for value in saved.get("kept_ids") or []}
+            kept_cues = _filter_cues_by_ids(cues, kept_ids)
+            if kept_cues:
+                selected = {
+                    "kept_cues": kept_cues,
+                    "plot": str(saved.get("plot") or ""),
+                    "phases": dict(saved.get("phases") or {}),
+                    "budget": dict(saved.get("budget") or budget),
+                }
+                selection_model = str(saved.get("model") or primary_model)
+                _log(
+                    f"  [三段精選 checkpoint] 重用 {len(kept_cues)} 條選句"
+                )
+                _update_pipeline_state(
+                    state_path,
+                    selection={
+                        "complete": True,
+                        "model": selection_model,
+                        "kept": len(kept_cues),
+                        "resumed": True,
+                    },
+                )
+    if selected is None:
+        for attempt, model_name in enumerate(models):
+            try:
+                selected = select_cues_three_phase(cues, api_key, model_name)
+                selection_model = model_name
+                if selection_path is not None:
+                    kept_ids = [
+                        int(cue["id"]) for cue in selected["kept_cues"]
+                    ]
+                    kept_id_set = set(kept_ids)
+                    _atomic_write_json(
+                        selection_path,
+                        {
+                            "schema": "selection_v1",
+                            "complete": True,
+                            "source_fingerprint": source_fingerprint,
+                            "mode": "three_phase_30s",
+                            "budget_version": 2,
+                            "model": model_name,
+                            "is_full": len(kept_ids) == len(cues),
+                            "kept_ids": kept_ids,
+                            "dropped_ids": [
+                                int(cue["id"])
+                                for cue in cues
+                                if int(cue["id"]) not in kept_id_set
+                            ],
+                            "plot": selected.get("plot") or "",
+                            "phases": selected.get("phases") or {},
+                            "budget": selected.get("budget") or budget,
+                        },
+                    )
+                _update_pipeline_state(
+                    state_path,
+                    selection={
+                        "complete": True,
+                        "model": model_name,
+                        "kept": len(selected["kept_cues"]),
+                    },
+                )
+                break
+            except Exception as exc:
+                if attempt + 1 < len(models):
+                    _log_translation_fallback(
+                        primary_model, models[attempt + 1], exc
+                    )
+                else:
+                    raise RuntimeError(f"三段精選失敗：{exc}") from exc
+    candidate_kept = selected["kept_cues"] if selected is not None else []
     for attempt, model_name in enumerate(models):
         try:
-            candidate = select_cues_three_phase(cues, api_key, model_name)
-            candidate_kept = candidate["kept_cues"]
-            candidate_translated = translate_cues(candidate_kept, api_key, model_name)
-            selected = candidate
-            translated = candidate_translated
+            translated = translate_cues(
+                candidate_kept,
+                api_key,
+                model_name,
+                checkpoint_path=translation_path,
+            )
             used_model = model_name
             fallback_used = attempt > 0
             break
@@ -1261,7 +1547,7 @@ def complete_three_phase_translation(
             if attempt + 1 < len(models):
                 _log_translation_fallback(primary_model, models[attempt + 1], exc)
             else:
-                raise RuntimeError(f"三段精選／翻譯失敗：{exc}") from exc
+                raise RuntimeError(f"精選字幕翻譯失敗：{exc}") from exc
     if selected is None or translated is None:
         raise RuntimeError("三段精選／翻譯沒有產生結果")
 
@@ -1286,9 +1572,23 @@ def complete_three_phase_translation(
     asr["selection_mode"] = "three_phase_30s"
     asr["translation_model"] = used_model
     asr["translation_fallback_used"] = fallback_used
+    asr["selection_model"] = selection_model
     asr["outcome"] = "translated"
+    _update_pipeline_state(
+        state_path,
+        selection={
+            "complete": True,
+            "model": selection_model,
+            "kept": len(kept_ids),
+        },
+        translation={
+            "complete": True,
+            "model": used_model,
+            "cue_count": len(kept_ids),
+        },
+    )
     if cache_path is not None:
-        cache_path.write_text(json.dumps(asr, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(cache_path, asr)
     return asr
 
 
@@ -1386,7 +1686,7 @@ def run_asr_translate(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
             f"找不到 MOSS 環境：{moss_python}。請先執行 00_setup_or_update.bat。"
         )
 
-    result_path = work_dir / "asr_result.json"
+    result_path = work_dir / "asr_worker_result.json"
     result_path.unlink(missing_ok=True)
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
@@ -1405,7 +1705,9 @@ def run_asr_translate(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
         raise RuntimeError(
             f"MOSS ASR 子程序失敗，ExitCode={proc.returncode}"
         )
-    return json.loads(result_path.read_text(encoding="utf-8"))
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    result_path.unlink(missing_ok=True)
+    return payload
 
 
 def run_asr_only_local(proxy_path: Path) -> dict[str, Any]:
@@ -1445,7 +1747,7 @@ def run_asr_only(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
         raise RuntimeError(
             f"找不到 MOSS 環境：{moss_python}。請先執行 00_setup_or_update.bat。"
         )
-    result_path = work_dir / "asr_result.json"
+    result_path = work_dir / "asr_worker_result.json"
     result_path.unlink(missing_ok=True)
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
@@ -1463,7 +1765,9 @@ def run_asr_only(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
     proc = subprocess.run(cmd, cwd=str(ROOT), env=env, check=False)
     if proc.returncode != 0 or not result_path.is_file():
         raise RuntimeError(f"MOSS ASR 子程序失敗，ExitCode={proc.returncode}")
-    return json.loads(result_path.read_text(encoding="utf-8"))
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    result_path.unlink(missing_ok=True)
+    return payload
 
 
 def run_asr_batch_local(proxy_paths: list[Path]) -> list[dict[str, Any]]:
@@ -1753,6 +2057,8 @@ def run_streamed_asr(
     *,
     moss_worker: MossAsrWorker | None = None,
     max_duration: float | None = None,
+    checkpoint_path: Path | None = None,
+    state_path: Path | None = None,
 ) -> tuple[dict[str, Any], float]:
     """分段下載 240P 並批次 ASR；可限制只分析影片開頭一段時間。"""
     from translate_srt_openrouter import format_srt
@@ -1785,6 +2091,76 @@ def run_streamed_asr(
     completed: dict[int, tuple[float, dict[str, Any]]] = {}
     worker_errors: list[BaseException] = []
     batch_limit = asr_batch_size()
+    if checkpoint_path is not None and checkpoint_path.is_file():
+        checkpoint = _read_json_dict(checkpoint_path)
+        same_source = (
+            checkpoint.get("schema") == "asr_source_v1"
+            and abs(float(checkpoint.get("source_duration") or -1) - duration) < 0.5
+            and abs(float(checkpoint.get("chunk_seconds") or -1) - chunk_seconds) < 0.01
+        )
+        if same_source:
+            for key, item in dict(checkpoint.get("chunks") or {}).items():
+                try:
+                    index = int(key)
+                    result = dict(item["result"])
+                    start = float(item["start"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if 1 <= index <= len(ranges):
+                    completed[index] = (start, result)
+            if completed:
+                _log(
+                    f"  [ASR checkpoint] 已完成 {len(completed)}/{len(ranges)} 段，"
+                    "本次只補缺少部分"
+                )
+
+    def build_asr_snapshot(*, complete: bool) -> dict[str, Any]:
+        merged: list[dict[str, Any]] = []
+        languages: list[str] = []
+        chunks: dict[str, Any] = {}
+        for index in sorted(completed):
+            start, result = completed[index]
+            cues = result.get("cues") or []
+            merged.extend(_offset_asr_cues(cues, start, len(merged) + 1))
+            language = result.get("language")
+            if language and language not in languages:
+                languages.append(str(language))
+            chunks[str(index)] = {
+                "start": start,
+                "end": ranges[index - 1][1],
+                "result": result,
+            }
+        return {
+            "schema": "asr_source_v1",
+            "complete": complete,
+            "language": ",".join(languages) or "multilingual",
+            "original_srt": format_srt(merged) if merged else "",
+            "translated_srt": "",
+            "outcome": "transcribed" if merged else "empty",
+            "cues": merged,
+            "source_duration": duration,
+            "chunk_seconds": chunk_seconds,
+            "total_chunks": len(ranges),
+            "completed_chunks": sorted(completed),
+            "chunks": chunks,
+        }
+
+    def persist_asr_checkpoint() -> None:
+        if checkpoint_path is None:
+            return
+        with _PIPELINE_CHECKPOINT_LOCK:
+            snapshot = build_asr_snapshot(
+                complete=len(completed) == len(ranges)
+            )
+            _atomic_write_json(checkpoint_path, snapshot)
+        _update_pipeline_state(
+            state_path,
+            asr={
+                "complete": snapshot["complete"],
+                "completed": len(completed),
+                "total": len(ranges),
+            },
+        )
 
     def consume_demucs_queue() -> None:
         """下載一完成就做人聲分離；不等待 MOSS 是否空閒。"""
@@ -1849,6 +2225,7 @@ def run_streamed_asr(
                 )
                 for job, result in zip(jobs, results):
                     completed[job[0]] = (job[1], result)
+                persist_asr_checkpoint()
             except BaseException as exc:
                 worker_errors.append(exc)
                 return
@@ -1874,8 +2251,18 @@ def run_streamed_asr(
         for index, (start, end) in enumerate(ranges, 1):
             if worker_errors:
                 break
+            if index in completed:
+                _log(f"  [ASR checkpoint] 跳過已完成第 {index}/{len(ranges)} 段")
+                continue
             proxy_part = work_dir / f"{video_stem}.proxy.asr{index:03d}.mp4"
-            download_proxy_range(video_url, proxy_part, start, end)
+            if not (
+                proxy_part.is_file()
+                and has_video_stream(proxy_part) is True
+                and _decodes_cleanly(proxy_part)
+            ):
+                download_proxy_range(video_url, proxy_part, start, end)
+            else:
+                _log(f"  [240P checkpoint] 重用第 {index}/{len(ranges)} 段")
             demucs_queue.put((index, start, proxy_part))
             _log(
                 f"  [240P 佇列] 第 {index}/{len(ranges)} 段下載完成；"
@@ -1892,25 +2279,19 @@ def run_streamed_asr(
             f"ASR 佇列完成數量不符：{len(completed)}/{len(ranges)}"
         )
 
-    merged: list[dict] = []
-    languages: list[str] = []
+    snapshot = build_asr_snapshot(complete=True)
+    if checkpoint_path is not None:
+        with _PIPELINE_CHECKPOINT_LOCK:
+            _atomic_write_json(checkpoint_path, snapshot)
+        _update_pipeline_state(
+            state_path,
+            asr={"complete": True, "completed": len(ranges), "total": len(ranges)},
+        )
     for index in range(1, len(ranges) + 1):
-        start, result = completed[index]
+        _start, result = completed[index]
         cues = result.get("cues") or []
-        merged.extend(_offset_asr_cues(cues, start, len(merged) + 1))
-        language = result.get("language")
-        if language and language not in languages:
-            languages.append(str(language))
         _log(f"  [ASR 串流] 完成 {index}/{len(ranges)}：{len(cues)} 段字幕")
-
-    return {
-        "language": ",".join(languages) or "multilingual",
-        "original_srt": format_srt(merged) if merged else "",
-        "translated_srt": "",
-        "outcome": "transcribed" if merged else "empty",
-        "cues": merged,
-        "source_duration": duration,
-    }, duration
+    return snapshot, duration
 
 
 def enhance_parts(
@@ -2020,18 +2401,32 @@ def enhance_full_video(
     return video, bool(media.enhanced)
 
 
-def _translate_after_asr(asr: dict[str, Any], cache_path: Path) -> dict[str, Any]:
+def _translate_after_asr(
+    asr: dict[str, Any],
+    cache_path: Path | None,
+    translation_path: Path | None = None,
+    state_path: Path | None = None,
+) -> dict[str, Any]:
     """第二階段的 OpenRouter 工作；翻譯失敗時保留原文並讓其他並行工作完成。"""
     try:
         # 精選翻譯會在分段規劃前同步完成；能進到背景翻譯的都是一般翻譯。
-        # 明確關閉 selective，避免精選失敗回退後仍受環境開關影響而再次走精選。
-        return complete_cached_translation(asr, cache_path, selective=False)
+        # 明確關閉 selective，避免一般翻譯受環境開關影響而誤走精選。
+        return complete_cached_translation(
+            asr,
+            cache_path,
+            selective=False,
+            translation_path=translation_path,
+            state_path=state_path,
+        )
     except Exception as exc:
         _log(f"  [!] OpenRouter 翻譯失敗，保留原文：{exc}")
         asr["translated_srt"] = ""
         asr["outcome"] = "translation_failed"
-        cache_path.write_text(
-            json.dumps(asr, ensure_ascii=False, indent=2), encoding="utf-8"
+        if cache_path is not None:
+            _atomic_write_json(cache_path, asr)
+        _update_pipeline_state(
+            state_path,
+            translation={"complete": False, "error": str(exc)},
         )
         return asr
 
@@ -2045,7 +2440,9 @@ def run_parallel_delivery_phase(
     *,
     enable_translation: bool,
     enable_enhance: bool,
-    asr_cache: Path,
+    asr_cache: Path | None,
+    translation_path: Path | None = None,
+    state_path: Path | None = None,
     audio_worker=None,
     audio_crossfade_seconds: float = 0.0,
 ) -> tuple[Path, str, str, bool]:
@@ -2066,7 +2463,11 @@ def run_parallel_delivery_phase(
         if enable_translation:
             _log("  [第二階段] OpenRouter 翻譯、高畫質下載、Enhance 可同時進行")
             translation_future = translator.submit(
-                _translate_after_asr, asr, asr_cache
+                _translate_after_asr,
+                asr,
+                asr_cache,
+                translation_path,
+                state_path,
             )
         else:
             _log("  [第二階段] 翻譯已關閉；開始高畫質下載與 Enhance")
@@ -2076,6 +2477,10 @@ def run_parallel_delivery_phase(
             _log("  [第二階段] 下載完整高畫質影片")
             with high_quality_download_phase(video_stem):
                 download_high_full(video_url, high_path)
+            _update_pipeline_state(
+                state_path,
+                high_quality={"complete": True, "mode": "full"},
+            )
             enhance_future = (
                 submit_enhance(high_path)
                 if enable_enhance
@@ -2103,6 +2508,12 @@ def run_parallel_delivery_phase(
             failed_downloads: list[
                 tuple[int, Path, float, float, Exception]
             ] = []
+            saved_high = _prepare_high_quality_manifest(
+                state_path,
+                segments,
+                video_stem,
+            )
+            saved_segments = dict(saved_high.get("segments") or {})
 
             def queue_enhance(
                 index: int,
@@ -2139,6 +2550,13 @@ def run_parallel_delivery_phase(
                             part,
                             start,
                             end,
+                        )
+                        _record_high_quality_segment(
+                            state_path,
+                            index=index,
+                            start=start,
+                            end=end,
+                            path=part,
                         )
                         return None
                     except Exception as exc:
@@ -2184,9 +2602,29 @@ def run_parallel_delivery_phase(
                 ) as downloader:
                     for index, (start, end) in enumerate(segments):
                         part = work_dir / f"{video_stem}.seg{index:03d}.mp4"
-                        if part.exists() and has_video_stream(part) is True:
+                        saved_part = dict(saved_segments.get(str(index)) or {})
+                        range_matches = (
+                            saved_part.get("complete") is True
+                            and abs(float(saved_part.get("start") or -1) - start)
+                            < 0.01
+                            and abs(float(saved_part.get("end") or -1) - end)
+                            < 0.01
+                            and saved_part.get("path") == part.name
+                        )
+                        if (
+                            range_matches
+                            and part.exists()
+                            and has_video_stream(part) is True
+                            and _decodes_cleanly(part)
+                        ):
+                            _log(
+                                f"  [高畫質 checkpoint] 重用第 "
+                                f"{index + 1}/{len(segments)} 段"
+                            )
                             queue_enhance(index, part)
                             continue
+                        if part.exists():
+                            part.unlink(missing_ok=True)
                         future = downloader.submit(
                             download_in_slot,
                             index,
@@ -2277,9 +2715,8 @@ def run_parallel_delivery_phase(
                 asr["outcome"] = asr.get("outcome") or "translated"
             else:
                 asr["outcome"] = "transcribed" if original_srt else "empty"
-            asr_cache.write_text(
-                json.dumps(asr, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            if asr_cache is not None:
+                _atomic_write_json(asr_cache, asr)
 
     if segments is not None:
         if original_srt.strip():
@@ -2301,6 +2738,15 @@ def run_parallel_delivery_phase(
         _log("  [第二階段] 翻譯、切塊下載與 Enhance 已全部完成；字幕已 retime")
     else:
         _log("  [第二階段] 翻譯、完整下載與 Enhance 已全部完成")
+    if state_path is not None:
+        high_quality_state = dict(
+            _read_json_dict(state_path).get("high_quality") or {}
+        )
+        high_quality_state["complete"] = True
+        _update_pipeline_state(
+            state_path,
+            high_quality=high_quality_state,
+        )
     return high_path, original_srt, translated_srt, enhanced
 
 
@@ -2515,7 +2961,11 @@ def process_full_video_from_grid(
 
     proxy_path = work_dir / f"{video_stem}.proxy.mp4"
     high_path = work_dir / f"{video_stem}.high.mp4"
-    asr_cache = work_dir / "asr_result.json"
+    asr_source_path = work_dir / "asr_source.json"
+    selection_path = work_dir / "selection.json"
+    translation_path = work_dir / "translation.json"
+    state_path = work_dir / "pipeline_state.json"
+    legacy_asr_cache = work_dir / "asr_result.json"
     reuse_asr = os.getenv("REUSE_ASR_RESULT", "1").strip().lower() not in {
         "0", "false", "no", "off",
     }
@@ -2525,13 +2975,16 @@ def process_full_video_from_grid(
             embedded_asr = load_embedded_translation(jpg_path, video_url)
         except Exception as exc:
             _log(f"  [Shorts] 讀取內嵌翻譯失敗，改走 240P 分析：{exc}")
-    # 清理舊分段／成品暫存，但保留可用的 proxy 以利續跑
-    for stale in work_dir.glob(f"{video_stem}.seg*.mp4"):
-        stale.unlink(missing_ok=True)
+    # 保留已完成的 240P／高畫質切片；是否可重用由 manifest 的範圍驗證決定。
     for stale in work_dir.glob(f"{video_stem}.high*.mp4"):
         stale.unlink(missing_ok=True)
-    for stale in work_dir.glob("*.enhanced.mp4"):
-        stale.unlink(missing_ok=True)
+
+    if not asr_source_path.is_file() and legacy_asr_cache.is_file():
+        legacy = _read_json_dict(legacy_asr_cache)
+        if legacy:
+            migrated = _source_asr_payload(legacy)
+            _atomic_write_json(asr_source_path, migrated)
+            _log("  [checkpoint] 已將舊 asr_result.json 遷移為 asr_source.json")
 
     _log("=" * 60)
     _log(f"正式片循序管線：{video_stem}")
@@ -2544,16 +2997,20 @@ def process_full_video_from_grid(
         if embedded_asr is not None:
             asr = embedded_asr
             duration = float(asr.get("source_duration") or 0.0)
-            asr_cache.write_text(
-                json.dumps(asr, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+            _atomic_write_json(
+                asr_source_path,
+                _source_asr_payload(asr, duration),
             )
             _log("  [Shorts] 已有內嵌翻譯字幕，直接重用時間軸")
             if asr.get("embedded_timeline_restored"):
                 _log("  [Shorts] 已將剪輯後字幕反向映射回原片絕對時間")
-        elif reuse_asr and asr_cache.is_file():
+        elif (
+            reuse_asr
+            and asr_source_path.is_file()
+            and _read_json_dict(asr_source_path).get("complete") is True
+        ):
             try:
-                asr = json.loads(asr_cache.read_text(encoding="utf-8"))
+                asr = _read_json_dict(asr_source_path)
                 if not enable_translation:
                     asr["translated_srt"] = ""
                     asr["outcome"] = "transcribed"
@@ -2561,7 +3018,7 @@ def process_full_video_from_grid(
                 if duration <= 0:
                     duration = remote_duration(video_url) or 0.0
                 _log(
-                    f"  [ASR] 重用既有字幕快取：{asr_cache.name}"
+                    f"  [ASR] 重用完整原始字幕：{asr_source_path.name}"
                     f"（cues={len(asr.get('cues') or [])}，"
                     f"outcome={asr.get('outcome')}）"
                 )
@@ -2577,6 +3034,8 @@ def process_full_video_from_grid(
                     video_stem,
                     moss_worker=moss_worker,
                     max_duration=analysis_limit_seconds,
+                    checkpoint_path=asr_source_path,
+                    state_path=state_path,
                 )
         elif not enable_asr:
             if enable_translation or enable_dialogue_trim:
@@ -2600,23 +3059,14 @@ def process_full_video_from_grid(
                 video_stem,
                 moss_worker=moss_worker,
                 max_duration=analysis_limit_seconds,
+                checkpoint_path=asr_source_path,
+                state_path=state_path,
             )
             asr["source_duration"] = duration
             try:
-                asr_cache.write_text(
-                    json.dumps(
-                        {
-                            "language": asr.get("language"),
-                            "original_srt": asr.get("original_srt"),
-                            "translated_srt": asr.get("translated_srt"),
-                            "outcome": asr.get("outcome"),
-                            "cues": asr.get("cues") or [],
-                            "source_duration": duration,
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
+                _atomic_write_json(
+                    asr_source_path,
+                    _source_asr_payload(asr, duration),
                 )
             except Exception:
                 pass
@@ -2651,18 +3101,43 @@ def process_full_video_from_grid(
                 )
                 try:
                     asr = (
-                        complete_three_phase_translation(asr, asr_cache)
+                        complete_three_phase_translation(
+                            asr,
+                            selection_path=selection_path,
+                            translation_path=translation_path,
+                            state_path=state_path,
+                        )
                         if enable_three_phase_selection
-                        else complete_cached_translation(asr, asr_cache, selective=True)
+                        else complete_cached_translation(
+                            asr,
+                            selective=True,
+                            translation_path=translation_path,
+                            state_path=state_path,
+                        )
                     )
                     selective_done = True
                 except Exception as exc:
-                    _log(f"  [!] 精選翻譯失敗，回退一般翻譯：{exc}")
-                    enable_selective_download = False
-                    enable_three_phase_selection = False
-                    asr.pop("selective_kept_ids", None)
-                    asr.pop("selective_is_full", None)
-                    asr.pop("plot_summary", None)
+                    saved_selection = _read_json_dict(selection_path)
+                    _update_pipeline_state(
+                        state_path,
+                        selection={
+                            "complete": saved_selection.get("complete") is True,
+                            "error": (
+                                None
+                                if saved_selection.get("complete") is True
+                                else str(exc)
+                            ),
+                            "publication_blocked": True,
+                        },
+                        translation={
+                            "complete": False,
+                            "error": str(exc),
+                        },
+                    )
+                    raise RuntimeError(
+                        "三段精選／翻譯失敗，已停止發布；"
+                        "不會回退成全日文對白成品。"
+                    ) from exc
         original_srt = asr.get("original_srt") or original_srt
         translated_srt = asr.get("translated_srt") or translated_srt
         outcome = asr.get("outcome") or outcome
@@ -2775,7 +3250,9 @@ def process_full_video_from_grid(
                     enable_translation and not selective_done
                 ),
                 enable_enhance=enable_enhance,
-                asr_cache=asr_cache,
+                asr_cache=None,
+                translation_path=translation_path,
+                state_path=state_path,
                 audio_worker=audio_worker,
                 audio_crossfade_seconds=(
                     THREE_PHASE_AUDIO_CROSSFADE
@@ -2849,8 +3326,16 @@ def process_full_video_from_grid(
         if archive_grid_on_done and source_is_grid and jpg_path.exists():
             archive_grid(jpg_path, archive_dir)
 
+    _update_pipeline_state(
+        state_path,
+        publication={
+            "complete": True,
+            "output": str(final_video),
+            "subtitle": str(final_srt) if export_subtitles else None,
+        },
+    )
     if not keep_proxy:
-        shutil.rmtree(work_dir, ignore_errors=True)
+        _cleanup_work_media_preserving_checkpoints(work_dir)
 
     _log(f"[DONE] {final_video}")
     return final_video
