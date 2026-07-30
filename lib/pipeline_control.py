@@ -97,7 +97,7 @@ STAGES = {
         "第二層：Shorts",
         SHORTS_DIR,
         "$$ 精準預算",
-        "內嵌翻譯直接抓最高畫質片段；僅 URL 則先分析前 9 分鐘 240P",
+        "前 9 分鐘 240P/MOSS → Grok 4.3 minimal 三段；純語音不足 30 秒保留前 9 分鐘",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
     "chosen": StageDefinition(
@@ -293,7 +293,7 @@ def resolve_stage_options(
         "dialogue_trim": True,
         # 所有層預設 ON：先精選翻譯，再依字幕時間軸規劃下載
         "selective_download": True,
-        "three_phase_selection": stage_name in {"video", "chosen"},
+        "three_phase_selection": stage_name in {"shorts", "video", "chosen"},
         # 停頓 ≥1.5s 剪掉；所有流程預設不做前後延伸
         "edge_padding": False,
         "enhance": True,
@@ -319,7 +319,7 @@ def resolve_stage_options(
         else default
         for name, default in defaults.items()
     }
-    if stage_name not in {"video", "chosen"}:
+    if stage_name not in {"shorts", "video", "chosen"}:
         values["three_phase_selection"] = False
     return replace(options, **values)
 
@@ -587,6 +587,7 @@ def _execute_stage(
                     enable_dialogue_trim=True,
                     enable_translation=options.translation,
                     enable_selective_download=options.selective_download,
+                    enable_three_phase_selection=options.three_phase_selection,
                     enable_edge_padding=options.edge_padding,
                     enable_metadata=options.metadata,
                     dialogue_trim_threshold=options.trim_threshold,
@@ -598,7 +599,7 @@ def _execute_stage(
                     audio_worker=audio_worker,
                     analysis_limit_seconds=540.0,
                     reuse_embedded_translation=True,
-                    always_download_subtitle_ranges=True,
+                    always_download_subtitle_ranges=False,
                     require_subtitle_ranges=True,
                     unlimited_high_quality=True,
                 )

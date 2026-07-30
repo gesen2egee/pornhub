@@ -81,7 +81,7 @@ def resolve_edge_padding_seconds(
 def three_phase_selection_enabled(
     environment: dict[str, str] | None = None,
 ) -> bool:
-    """30 秒三段模型精選開關；Video／Chosen 由控制器預設開啟。"""
+    """30 秒三段模型精選開關；Shorts／Video／Chosen 由控制器預設開啟。"""
     environment = os.environ if environment is None else environment
     value = environment.get("ENABLE_THREE_PHASE_SELECTION", "1").strip().casefold()
     return value not in {"0", "false", "no", "off"}
@@ -2834,9 +2834,10 @@ def process_full_video_from_grid(
     enable_enhance：是否允許音訊增強（預設讀 AUDIO_AUTO_ENHANCE）
     enable_dialogue_trim：是否依停頓門檻移除長停頓並分段下載
     enable_selective_download：精選下載——先劇情+選擇性翻譯，再只下載保留對白
-    enable_three_phase_selection：30 秒 N 三段精選；Video／Chosen 預設開啟
+    enable_three_phase_selection：30 秒 N 三段精選；Shorts／Video／Chosen 預設開啟
     segment_gap：相鄰對白停頓 ≥ 此秒數則剪開（預設 1.5）
     enable_edge_padding：對白前後 0.75s 延伸開關（預設關閉）
+    always_download_subtitle_ranges：舊呼叫相容參數，不再繞過純語音 30 秒保護
     """
     ensure_output_directories()
     jpg_path = Path(jpg_path).resolve()
@@ -2880,7 +2881,7 @@ def process_full_video_from_grid(
         enable_selective_download = selective_download_enabled()
     if enable_three_phase_selection is None:
         enable_three_phase_selection = (
-            pipeline_stage in {"video", "chosen"}
+            pipeline_stage in {"shorts", "video", "chosen"}
             and three_phase_selection_enabled()
         )
     if enable_three_phase_selection:
@@ -3077,6 +3078,25 @@ def process_full_video_from_grid(
     translated_srt = asr.get("translated_srt") or ""
     outcome = asr.get("outcome") or "empty"
 
+    # 先用完整原始 ASR 判斷兩個保護條件，不能拿模型刪句後的字幕重算。
+    source_cues = _cues_for_translation(asr)
+    source_entries = cues_to_entries(source_cues) if source_cues else []
+    source_net_dur = segment_cutter.calculate_net_dialogue_duration(source_entries)
+    source_budget: dict[str, Any] = {}
+    source_under_budget = False
+    if enable_three_phase_selection and source_cues:
+        from translate_srt_openrouter import three_phase_budget
+
+        source_budget = three_phase_budget(source_cues)
+        source_under_budget = len(source_cues) < int(source_budget["total"])
+    shorts_full_analysis_range = (
+        pipeline_stage == "shorts"
+        and embedded_asr is None
+        and analysis_limit_seconds is not None
+        and source_net_dur < dialogue_trim_threshold
+    )
+    speech_under_threshold = source_net_dur < dialogue_trim_threshold
+
     # 精選下載：必須先完成選擇性翻譯，才能依保留 id 規劃高畫質下載區段
     # （不能與下載平行）。歌詞由 LLM 改完整翻譯時 is_full=True。
     selective_done = embedded_asr is not None
@@ -3086,11 +3106,15 @@ def process_full_video_from_grid(
         and embedded_asr is None
     ):
         with _stage("02a_selective_translate"):
-            if (asr.get("translated_srt") or "").strip() and asr.get(
-                "selective_kept_ids"
-            ) is not None and (
-                not enable_three_phase_selection
-                or asr.get("selection_mode") == "three_phase_30s"
+            if (
+                not speech_under_threshold
+                and not source_under_budget
+                and (asr.get("translated_srt") or "").strip()
+                and asr.get("selective_kept_ids") is not None
+                and (
+                    not enable_three_phase_selection
+                    or asr.get("selection_mode") == "three_phase_30s"
+                )
             ):
                 _log("  [精選下載] 重用快取內已有精選翻譯結果")
                 selective_done = True
@@ -3102,21 +3126,71 @@ def process_full_video_from_grid(
                     else "  [精選下載] 先劇情整理 + 選擇性翻譯（歌詞則完整翻譯）…"
                 )
                 try:
-                    asr = (
-                        complete_three_phase_translation(
-                            asr,
-                            selection_path=selection_path,
+                    if enable_three_phase_selection and speech_under_threshold:
+                        analysis_label = (
+                            f"前{analysis_limit_seconds / 60:.0f}分鐘分析範圍"
+                            if analysis_limit_seconds is not None
+                            else "完整來源"
+                        )
+                        _log(
+                            f"  [三段精選保護] 原始純語音 {source_net_dur:.2f}s "
+                            f"< {dialogue_trim_threshold:.1f}s，完整翻譯{analysis_label}"
+                        )
+                        from translate_srt_openrouter import format_srt
+
+                        fresh_asr = dict(asr)
+                        fresh_asr["translated_srt"] = ""
+                        fresh_asr["cues"] = source_cues
+                        fresh_asr["source_cues"] = source_cues
+                        fresh_asr["original_srt"] = format_srt(source_cues)
+                        asr = complete_cached_translation(
+                            fresh_asr,
+                            selective=False,
                             translation_path=translation_path,
                             state_path=state_path,
                         )
-                        if enable_three_phase_selection
-                        else complete_cached_translation(
-                            asr,
-                            selective=True,
-                            translation_path=translation_path,
-                            state_path=state_path,
+                        all_ids = [int(cue["id"]) for cue in source_cues]
+                        asr["selection_mode"] = "three_phase_30s"
+                        asr["three_phase_selection_gate"] = "speech_under_30s"
+                        asr["three_phase_budget"] = source_budget
+                        asr["three_phase_budget_version"] = 2
+                        asr["selective_is_full"] = True
+                        asr["selective_kept_ids"] = all_ids
+                        asr["selective_dropped_ids"] = []
+                        if selection_path is not None:
+                            _atomic_write_json(
+                                selection_path,
+                                {
+                                    "schema": "selection_v1",
+                                    "complete": True,
+                                    "mode": "three_phase_30s",
+                                    "budget_version": 2,
+                                    "model": None,
+                                    "is_full": True,
+                                    "gate": "speech_under_30s",
+                                    "kept_ids": all_ids,
+                                    "dropped_ids": [],
+                                    "plot": "",
+                                    "phases": {},
+                                    "budget": source_budget,
+                                },
+                            )
+                    else:
+                        asr = (
+                            complete_three_phase_translation(
+                                asr,
+                                selection_path=selection_path,
+                                translation_path=translation_path,
+                                state_path=state_path,
+                            )
+                            if enable_three_phase_selection
+                            else complete_cached_translation(
+                                asr,
+                                selective=True,
+                                translation_path=translation_path,
+                                state_path=state_path,
+                            )
                         )
-                    )
                     selective_done = True
                 except Exception as exc:
                     saved_selection = _read_json_dict(selection_path)
@@ -3193,19 +3267,25 @@ def process_full_video_from_grid(
 
         any_enhanced = False
         segments: list[tuple[float, float]] | None = None
-        if require_subtitle_ranges and not entries:
+        if require_subtitle_ranges and not entries and not shorts_full_analysis_range:
             raise RuntimeError(
                 "Shorts 沒有可用的翻譯字幕時間軸，為避免誤抓完整高畫質影片已停止。"
             )
-        # 一律用「精選後（或完整）對白淨長」判斷是否 > 門檻再剪片／分段下載
-        if (
-            enable_dialogue_trim
-            and (
-                always_download_subtitle_ranges
-                or net_dur > dialogue_trim_threshold
+        # 原始純語音不足 30 秒時，Shorts 保留分析用前 9 分鐘，避免只輸出幾秒字幕。
+        if shorts_full_analysis_range:
+            full_end = min(
+                float(analysis_limit_seconds),
+                duration if duration > 0 else float(analysis_limit_seconds),
             )
-            and entries
-        ):
+            segments = [(0.0, full_end)] if full_end > 0 else None
+            trimmed = full_end
+            _log(
+                f"  [分段] 原始純語音 {source_net_dur:.1f}s < "
+                f"{dialogue_trim_threshold:.1f}s → Shorts 保留前 "
+                f"{full_end / 60:.1f} 分鐘"
+            )
+        # 一律用「精選後（或完整）對白淨長」判斷是否 > 門檻再剪片／分段下載
+        elif enable_dialogue_trim and net_dur > dialogue_trim_threshold and entries:
             segments = segment_cutter.build_continuous_segments(
                 entries,
                 max_gap=segment_gap,
