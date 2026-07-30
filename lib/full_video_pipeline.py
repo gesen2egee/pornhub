@@ -1259,6 +1259,7 @@ def complete_cached_translation(
     translation_path: Path | None = None,
     state_path: Path | None = None,
     reasoning_effort: str | None = None,
+    batch_size: int | None = None,
 ) -> dict[str, Any]:
     """翻譯既有 ASR；開關為 ON 卻缺 key/時間軸時明確失敗。
 
@@ -1309,12 +1310,17 @@ def complete_cached_translation(
                         asr["cues"] = filtered
                         asr["original_srt"] = format_srt(filtered)
             else:
+                translate_kwargs: dict[str, Any] = {
+                    "checkpoint_path": translation_path,
+                    "reasoning_effort": reasoning_effort,
+                }
+                if batch_size is not None:
+                    translate_kwargs["batch_size"] = batch_size
                 translated = translate_cues(
                     cues,
                     api_key,
                     model_name,
-                    checkpoint_path=translation_path,
-                    reasoning_effort=reasoning_effort,
+                    **translate_kwargs,
                 )
                 asr["translated_srt"] = format_srt(translated)
                 asr["outcome"] = "translated"
@@ -1391,8 +1397,8 @@ def complete_three_phase_translation(
         or "minimal"
     )
     translation_reasoning = (
-        os.getenv("THREE_PHASE_TRANSLATE_REASONING", "none").strip()
-        or "none"
+        os.getenv("THREE_PHASE_TRANSLATE_REASONING", "minimal").strip()
+        or "minimal"
     )
     budget = three_phase_budget(cues)
     source_fingerprint = _cues_fingerprint(cues)
@@ -1436,6 +1442,7 @@ def complete_three_phase_translation(
                     cues,
                     api_key,
                     model_name,
+                    batch_size=0,
                     checkpoint_path=translation_path,
                     reasoning_effort=translation_reasoning,
                 )
@@ -1573,6 +1580,7 @@ def complete_three_phase_translation(
                 candidate_kept,
                 api_key,
                 model_name,
+                batch_size=0,
                 checkpoint_path=translation_path,
                 reasoning_effort=translation_reasoning,
             )
@@ -3133,8 +3141,8 @@ def process_full_video_from_grid(
     )
     speech_under_threshold = source_net_dur < dialogue_trim_threshold
     three_phase_translation_reasoning = (
-        os.getenv("THREE_PHASE_TRANSLATE_REASONING", "none").strip()
-        or "none"
+        os.getenv("THREE_PHASE_TRANSLATE_REASONING", "minimal").strip()
+        or "minimal"
     )
 
     # 精選下載：必須先完成選擇性翻譯，才能依保留 id 規劃高畫質下載區段
@@ -3164,7 +3172,7 @@ def process_full_video_from_grid(
             else:
                 _log(
                     "  [三段精選] 等完整 240P/MOSS 後送 GLM 5.2 minimal 精選、"
-                    "Grok 4.3 none 翻譯（失敗改 Grok 4.5）："
+                    "Grok 4.3 minimal 一次翻譯（失敗改 Grok 4.5）："
                     "30 秒 N 三段、保留完整選段…"
                     if enable_three_phase_selection
                     else "  [精選下載] 先劇情整理 + 選擇性翻譯（歌詞則完整翻譯）…"
@@ -3193,6 +3201,7 @@ def process_full_video_from_grid(
                             translation_path=translation_path,
                             state_path=state_path,
                             reasoning_effort=three_phase_translation_reasoning,
+                            batch_size=0,
                         )
                         all_ids = [int(cue["id"]) for cue in source_cues]
                         asr["selection_mode"] = "three_phase_30s"

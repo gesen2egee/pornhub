@@ -483,7 +483,8 @@ def translate_cues(
         return translated_cues
 
     env_bs = os.getenv("TRANSLATE_BATCH_SIZE", "").strip()
-    if env_bs:
+    # 明確傳入 batch_size=0 時，代表呼叫端要求整份一次送出，優先於環境預設。
+    if env_bs and batch_size != 0:
         try:
             batch_size = int(env_bs)
         except ValueError:
