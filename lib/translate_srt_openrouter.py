@@ -18,8 +18,8 @@ import requests
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # 所有未指定層級的翻譯預設使用 Grok 4.3；失敗時由 Grok 4.5 作為後備。
 DEFAULT_MODEL = "x-ai/grok-4.3"
-# 預設每 60 條一批；設 0 或 TRANSLATE_BATCH_SIZE=0 則整份一次。
-DEFAULT_BATCH_SIZE = 60
+# 預設整份字幕一次送出；可用 TRANSLATE_BATCH_SIZE 改為分批。
+DEFAULT_BATCH_SIZE = 0
 THREE_PHASE_SOFT_OVERAGE = 2
 SPEAKER_LABEL_PATTERN = re.compile(r"^\s*\[S\d+\]\s*", re.IGNORECASE)
 # 扁平格式：每行「id|正文」（無 JSON 殼、無前後文）
@@ -452,12 +452,12 @@ def translate_cues(
     cues: list[dict[str, Any]],
     api_key: str,
     model: str = DEFAULT_MODEL,
-    batch_size: int = DEFAULT_BATCH_SIZE,
+    batch_size: int | None = None,
     *,
     checkpoint_path: Path | None = None,
     reasoning_effort: str | None = None,
 ) -> list[dict[str, Any]]:
-    """翻譯字幕。預設每 batch_size 條一批；batch_size<=0 則整份一次。
+    """翻譯字幕。預設整份一次；明確指定 batch_size>0 才分批。
 
     輸入輸出皆為扁平 id|text，無 JSON 殼、無前後文。
     用量寫入全域 LAST_TRANSLATE_STATS。
@@ -482,13 +482,14 @@ def translate_cues(
         }
         return translated_cues
 
-    env_bs = os.getenv("TRANSLATE_BATCH_SIZE", "").strip()
-    # 明確傳入 batch_size=0 時，代表呼叫端要求整份一次送出，優先於環境預設。
-    if env_bs and batch_size != 0:
-        try:
-            batch_size = int(env_bs)
-        except ValueError:
-            pass
+    if batch_size is None:
+        batch_size = DEFAULT_BATCH_SIZE
+        env_bs = os.getenv("TRANSLATE_BATCH_SIZE", "").strip()
+        if env_bs:
+            try:
+                batch_size = int(env_bs)
+            except ValueError:
+                pass
     step = len(translated_cues) if batch_size <= 0 else max(1, batch_size)
     single_shot = step >= len(translated_cues)
     requested_effort = (
