@@ -17,6 +17,7 @@
 /lib/moss/model-cache/
 /lib/whisper/
 /lib/confucius4_tts/
+/lib/mel_band_roformer_vocal/
 
 # 暫存檔與快取
 **/__pycache__/

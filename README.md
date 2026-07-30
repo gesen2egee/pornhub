@@ -2,6 +2,16 @@
 
 這是 Windows 專案，提供九宮格預覽、雙畫質下載、MOSS 字幕辨識、OpenRouter 繁中翻譯與音訊自動增強。下載與字幕使用不同程序：每支影片下載完成後會立刻進入字幕佇列，同時下載程序繼續處理下一支。
 
+### 選用：Mel-Band-Roformer 人聲分離
+
+執行 `04_setup_melband_roformer.bat` 可在既有 VENV 加入 KimberleyJensen 的 MIT 授權 Mel-Band-Roformer 人聲分離權重（首次下載約 871 MiB）。此安裝刻意不使用原專案完整 requirements，避免升級既有 MOSS 的 CUDA PyTorch。完成後可執行：
+
+```bat
+05_run_melband_roformer.bat "input.wav" "output\roformer"
+```
+
+會輸出 44.1 kHz 的 `*_vocals.wav` 與 `*_instrumental.wav`。這是獨立工具，尚未取代既有的 Demucs 管線。
+
 ## 根目錄入口
 
 根目錄只保留日常需要操作的檔案：
