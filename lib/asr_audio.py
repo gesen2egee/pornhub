@@ -40,6 +40,7 @@ def _roformer_device() -> str:
 
 def _prepare_roformer_audio(source: Path, work_dir: Path) -> Path:
     """抽取 WAV 後以 Mel-Band-RoFormer 產出人聲軌。"""
+    from asr_vad_roformer import gpu_inference_lock
     from mel_band_roformer_vocal import separate_file
 
     source_wav = work_dir / f"{source.stem}.asr-source.wav"
@@ -64,7 +65,8 @@ def _prepare_roformer_audio(source: Path, work_dir: Path) -> Path:
             f"  [RoFormer] 分離人聲 → {vocals_path.name}（{device}）",
             flush=True,
         )
-        vocals_path, _ = separate_file(source_wav, output_dir, device, overlap)
+        with gpu_inference_lock("Mel-Band-RoFormer"):
+            vocals_path, _ = separate_file(source_wav, output_dir, device, overlap)
     return vocals_path
 
 

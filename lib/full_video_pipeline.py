@@ -258,6 +258,7 @@ def _source_asr_payload(
         "outcome": "transcribed" if cues else "empty",
         "cues": cues,
         "source_duration": source_duration,
+        "singing_ranges": list(asr.get("singing_ranges") or []),
     }
 
 
@@ -1166,6 +1167,42 @@ def cues_to_entries(cues: list[dict[str, Any]]) -> list[dict]:
     return entries
 
 
+def _net_dialogue_excluding_singing(
+    entries: list[dict], singing_ranges: list[tuple[float, float]] | list[list[float]],
+) -> float:
+    """只計純對話：字幕與 AED 唱歌範圍的重疊時間不算 30 秒門檻。"""
+    if not entries:
+        return 0.0
+    dialogue = sorted(
+        (float(item["start"]), float(item["end"]))
+        for item in entries if float(item["end"]) > float(item["start"])
+    )
+    merged: list[tuple[float, float]] = []
+    for start, end in dialogue:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    raw_songs = sorted(
+        (float(start), float(end)) for start, end in singing_ranges if float(end) > float(start)
+    )
+    songs: list[tuple[float, float]] = []
+    for start, end in raw_songs:
+        if songs and start <= songs[-1][1]:
+            songs[-1] = (songs[-1][0], max(songs[-1][1], end))
+        else:
+            songs.append((start, end))
+    total = 0.0
+    for start, end in merged:
+        overlap = sum(
+            max(0.0, min(end, song_end) - max(start, song_start))
+            for song_start, song_end in songs
+            if song_start < end and song_end > start
+        )
+        total += max(0.0, end - start - overlap)
+    return total
+
+
 def entries_to_cues(entries: list[dict]) -> list[dict[str, Any]]:
     cues = []
     for idx, entry in enumerate(entries, 1):
@@ -1953,8 +1990,18 @@ def run_asr_only(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
     from asr_audio import prepare_asr_audio
     from asr_backends import selected_asr_backend_name
 
-    asr_audio = prepare_asr_audio(proxy_path, work_dir)
     backend_name = selected_asr_backend_name()
+    use_vad_roformer = (
+        backend_name == "moss"
+        and os.getenv("ENABLE_FIRERED_VAD", "1").strip().casefold()
+        not in {"0", "false", "no", "off"}
+        and os.getenv("ASR_VOCAL_SEPARATOR", "roformer").strip().casefold()
+        in {"roformer", "mel-band-roformer", "melbandroformer"}
+    )
+    if use_vad_roformer:
+        return _run_vad_roformer_moss(proxy_path, work_dir)
+
+    asr_audio = prepare_asr_audio(proxy_path, work_dir)
     current = Path(sys.executable).resolve()
     if backend_name in {"voxtral", "grok-stt", "whisper"}:
         return run_asr_only_local(asr_audio)
@@ -1987,6 +2034,75 @@ def run_asr_only(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
     payload = json.loads(result_path.read_text(encoding="utf-8"))
     result_path.unlink(missing_ok=True)
     return payload
+
+
+def _run_vad_roformer_moss(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
+    """將 VAD 人聲段分離後，按最多三分鐘送 MOSS 並回映原時間軸。"""
+    from asr_backends import asr_batch_size
+    from asr_vad_roformer import map_compact_time, prepare_vad_roformer_audio
+    from translate_srt_openrouter import format_srt
+
+    prepared = prepare_vad_roformer_audio(proxy_path, work_dir)
+    if not prepared.chunks:
+        return {
+            "language": "multilingual",
+            "original_srt": "",
+            "translated_srt": "",
+            "outcome": "empty",
+            "cues": [],
+            "singing_ranges": [list(item) for item in prepared.singing_ranges],
+            "speech_ranges": [list(item) for item in prepared.speech_ranges],
+        }
+    raw_results: list[dict[str, Any]] = []
+    chunk_size = asr_batch_size()
+    for start in range(0, len(prepared.chunks), chunk_size):
+        group = prepared.chunks[start:start + chunk_size]
+        _log(
+            f"  [MOSS] VAD/RoFormer 三分鐘音檔 {start + 1}-"
+            f"{start + len(group)}/{len(prepared.chunks)}"
+        )
+        raw_results.extend(
+            run_asr_audio_batch(
+                [Path(item["path"]) for item in group],
+                work_dir / f"moss-vad-{start + 1:03d}",
+            )
+        )
+    cues: list[dict[str, Any]] = []
+    languages: list[str] = []
+    for chunk, result in zip(prepared.chunks, raw_results, strict=True):
+        language = str(result.get("language") or "").strip()
+        if language and language not in languages:
+            languages.append(language)
+        for cue in result.get("cues") or []:
+            try:
+                start_text, end_text = str(cue["time"]).split("-->", 1)
+                compact_start = segment_cutter.parse_srt_time(start_text.strip())
+                compact_end = segment_cutter.parse_srt_time(end_text.strip())
+                original_start = map_compact_time(compact_start, chunk["mapping"])
+                original_end = map_compact_time(compact_end, chunk["mapping"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if original_end <= original_start:
+                continue
+            cues.append({
+                "id": len(cues) + 1,
+                "time": (
+                    f"{segment_cutter.format_srt_time(original_start)} --> "
+                    f"{segment_cutter.format_srt_time(original_end)}"
+                ),
+                "text": str(cue.get("text") or ""),
+            })
+    return {
+        "language": ",".join(languages) or "multilingual",
+        "original_srt": format_srt(cues) if cues else "",
+        "translated_srt": "",
+        "outcome": "transcribed" if cues else "empty",
+        "cues": cues,
+        "singing_ranges": [list(item) for item in prepared.singing_ranges],
+        "speech_ranges": [list(item) for item in prepared.speech_ranges],
+        "asr_audio_mode": "firered_vad_roformer_3min",
+        "asr_chunk_count": len(prepared.chunks),
+    }
 
 
 def run_asr_batch_local(proxy_paths: list[Path]) -> list[dict[str, Any]]:
@@ -2074,12 +2190,14 @@ class MossAsrWorker:
         _log("  [MOSS 常駐] 已啟動；後續 ASR 片段不會重載權重")
 
     def transcribe(self, audio_paths: list[Path]) -> list[dict[str, Any]]:
+        from asr_vad_roformer import gpu_inference_lock
+
         if self._closed or self._process.stdin is None or self._process.stdout is None:
             raise RuntimeError("MOSS 常駐程序已關閉")
         request = {"audio": [str(Path(path).resolve()) for path in audio_paths]}
         # self._lock 保護同一常駐程序的 stdin/stdout；全域鎖保證多支影片、
         # 甚至意外建立多個 worker 時，仍只會有一筆 MOSS 推理在執行。
-        with _MOSS_INFERENCE_LOCK, self._lock:
+        with gpu_inference_lock("MOSS"), _MOSS_INFERENCE_LOCK, self._lock:
             try:
                 self._process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
                 self._process.stdin.flush()
@@ -2214,7 +2332,9 @@ def run_asr_audio_batch(
         "moss" in str(current).casefold() and current.exists()
     ):
         if backend_name == "moss":
-            with _MOSS_INFERENCE_LOCK:
+            from asr_vad_roformer import gpu_inference_lock
+
+            with gpu_inference_lock("MOSS"), _MOSS_INFERENCE_LOCK:
                 return run_asr_batch_local(asr_audio)
         return run_asr_batch_local(asr_audio)
 
@@ -2239,7 +2359,9 @@ def run_asr_audio_batch(
     ]
     _log(f"  [2/5] 啟動 MOSS 子程序批次 ASR：BS={len(asr_audio)}")
     # 沒有常駐 worker 時也同樣要串列化，避免兩支影片各自啟動 MOSS 搶資源。
-    with _MOSS_INFERENCE_LOCK:
+    from asr_vad_roformer import gpu_inference_lock
+
+    with gpu_inference_lock("MOSS"), _MOSS_INFERENCE_LOCK:
         proc = subprocess.run(cmd, cwd=str(ROOT), env=env, check=False)
     if proc.returncode != 0 or not result_path.is_file():
         raise RuntimeError(f"MOSS 批次 ASR 子程序失敗，ExitCode={proc.returncode}")
@@ -3298,7 +3420,8 @@ def process_full_video_from_grid(
     # 先用完整原始 ASR 判斷兩個保護條件，不能拿模型刪句後的字幕重算。
     source_cues = _cues_for_translation(asr)
     source_entries = cues_to_entries(source_cues) if source_cues else []
-    source_net_dur = segment_cutter.calculate_net_dialogue_duration(source_entries)
+    singing_ranges = list(asr.get("singing_ranges") or [])
+    source_net_dur = _net_dialogue_excluding_singing(source_entries, singing_ranges)
     source_budget: dict[str, Any] = {}
     source_under_budget = False
     if enable_three_phase_selection and source_cues:
@@ -3472,7 +3595,7 @@ def process_full_video_from_grid(
 
     with _stage("03_segment_plan"):
         # 精選開啟時 entries 已是保留句（或歌詞完整句），用它算淨長再比 >30s
-        net_dur = segment_cutter.calculate_net_dialogue_duration(entries)
+        net_dur = _net_dialogue_excluding_singing(entries, singing_ranges)
         duration_source = (
             "精選對白"
             if (

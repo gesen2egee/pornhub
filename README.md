@@ -136,8 +136,8 @@ yt-dlp DEBUG 與下載百分比訊息。
 
 暫存位於 `output/00_temp/pipeline/`。Video 與 Chosen 預設分成兩個階段：
 
-1. 預設先完整下載一次 240P，再依序進行人聲處理與 MOSS；完成完整時間軸後才交給 GLM 5.2 minimal 精選，再一次送給 Grok 4.3 minimal 翻譯；翻譯失敗一次改用 Grok 4.5。需要邊下載邊辨識時才顯式開啟 `--asr-stream`。
-2. Shorts／Video／Chosen 預設啟用 30 秒三段：先排除時長不超過 1.5 秒的短句，以其餘句子的平均長度算 `N=ceil(30 秒／平均語音句長)`，固定選出情節 `N-1`、中段 `2N`、高潮 `3N`、可選結尾 `0.5N` 句（總上限 `6N-1+0.5N`）。短句不占 N 或精選額度、不送給選句模型，但仍會自動保留、翻譯並納入成品。先以完整原始 ASR 判斷：純語音不足 30 秒時，Shorts 保留前 9 分鐘分析範圍；原始長句數少於總上限時，完整翻譯對話、不精選；只有兩者都不符合才進行三段精選。每段完整保留模型選出的起訖，才按原片時間下載高畫質切塊。
+1. 預設先完整下載一次 240P，再以 FireRed VAD/AED 找出人聲與唱歌區段；僅把 VAD 人聲送進 Mel-Band-RoFormer，壓縮後每最多 180 秒組成一個 MOSS 音檔，字幕再映回原片時間軸。VAD/AED、RoFormer、MOSS 使用同一把跨程序 GPU 鎖，前一個模型完成即清除 VRAM 才載入下一個。完成完整時間軸後才交給 GLM 5.2 minimal 精選，再一次送給 Grok 4.3 minimal 翻譯；翻譯失敗一次改用 Grok 4.5。需要邊下載邊辨識時才顯式開啟 `--asr-stream`。
+2. Shorts／Video／Chosen 預設啟用 30 秒三段：先排除時長不超過 1.5 秒的短句，以其餘句子的平均長度算 `N=ceil(30 秒／平均語音句長)`，固定選出情節 `N-1`、中段 `2N`、高潮 `3N`、可選結尾 `0.5N` 句（總上限 `6N-1+0.5N`）。短句不占 N 或精選額度、不送給選句模型，但仍會自動保留、翻譯並納入成品。30 秒門檻只計「字幕與 AED 唱歌範圍不重疊」的純對話；MV／純唱歌不會因歌詞字幕而觸發剪片。先以完整原始 ASR 判斷：純對話不足 30 秒時，Shorts 保留前 9 分鐘分析範圍；原始長句數少於總上限時，完整翻譯對話、不精選；只有兩者都不符合才進行三段精選。每段完整保留模型選出的起訖，才按原片時間下載高畫質切塊。
 3. 高畫質切塊在全管線固定維持最多 5 個並行下載請求，新請求每秒錯開啟動；同一時間只會有一支影片處於高畫質下載階段。範圍下載優先選直接 HTTPS MP4，避開 HLS 分片名稱造成的 FFmpeg 錯誤；每段會先多抓 5 秒前置緩衝，再由本機精確重編碼，讓成品從新的關鍵影格開始，並完整解碼驗證；個別切塊失敗時會改為單線補下載，最後同步進行音訊判斷／`enhance` 與 0.08 秒**僅音訊** crossfade；畫面直接切換，字幕依畫面時間軸 retime。
 
 Shorts／Video／Chosen 預設可同時跑 2 支來源管線：前一支進入高畫質下載時，下一支可繼續 240P→人聲分離→MOSS→GLM／Grok；但抵達高畫質階段會等待前一支下載完成。240P 切塊完成就立刻排入人聲分離，不等待 MOSS；MOSS 推理全程序嚴格一次一筆。可用環境變數 `PIPELINE_SOURCE_WORKERS=1` 改回單支，最多可設為 4。
@@ -188,7 +188,7 @@ Chosen 有 URL 時不會拿既有高畫質成品接續，會重新下載規劃�
 若連 ASR 字幕快取也要重做，請加上 `--no-reuse-cache`。
 每支發布完成的影片 Metadata 都會寫入 `published_stage`（`preview`、`shorts`、`video` 或 `chosen`）。下次掃描同一層資料夾時，標示同層已發布的影片會列為既有成品、不再處理；需要明確重跑時使用 `--force`。
 剪片門檻與區段合併間隔可分別用 `--trim-threshold`、`--segment-gap` 調整；`--preview-seconds` 是 Preview 每次下載與 ASR 的片段長度，不再是總長度。
-`asr-stream` 預設關閉，因此 Video／Chosen 會先完整下載一次 240P 代理檔，再開始 ASR；不會按 180 秒重複分段請求。ASR 人聲分離預設使用已安裝的 Mel-Band-RoFormer；若因相容性要改回 Demucs，可設定 `ASR_VOCAL_SEPARATOR=demucs`。若明確加上 `--asr-stream`，才會每 180 秒分段下載，並累計滿 `--asr-batch-size`（預設 3）段才執行一次 MOSS BS ASR；影片尾端不足 BS 的批次仍會送出。
+`asr-stream` 預設關閉，因此 Video／Chosen 會先完整下載一次 240P 代理檔，再開始 ASR；不會按 180 秒重複分段請求。正式 MOSS 流程預設啟用 FireRed VAD/AED，並以 VAD 後的人聲時長切成最多三分鐘的 MOSS 音檔；這三分鐘不是原片牆鐘時間。ASR 人聲分離預設使用已安裝的 Mel-Band-RoFormer；若因相容性要改回 Demucs，可設定 `ASR_VOCAL_SEPARATOR=demucs`，或以 `ENABLE_FIRERED_VAD=0` 關閉 VAD/AED。若明確加上 `--asr-stream`，才會每 180 秒分段下載，並累計滿 `--asr-batch-size`（預設 3）段才執行一次 MOSS BS ASR；影片尾端不足 BS 的批次仍會送出。
 目前剪片規則是：停頓小於門檻時完整保留；停頓大於或等於門檻時切段，預設前後延伸為 0 秒。
 若需回到一般精選翻譯，對 Shorts、Video 或 Chosen 加上 `--no-three-phase-selection`。
 

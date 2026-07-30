@@ -207,15 +207,25 @@ def separate_file(input_path: Path, output_dir: Path, device: str, overlap: int)
     if not input_path.is_file():
         raise FileNotFoundError(f"找不到輸入音檔：{input_path}")
     model = _load_model(device)
-    mixture = _load_stereo_audio(input_path)
-    vocals = _separate(model, mixture, device, overlap)
-    instrumental = mixture[:, : vocals.shape[1]] - vocals
-    output_dir.mkdir(parents=True, exist_ok=True)
-    vocals_path = output_dir / f"{input_path.stem}_vocals.wav"
-    instrumental_path = output_dir / f"{input_path.stem}_instrumental.wav"
-    sf.write(vocals_path, vocals.T, SAMPLE_RATE, subtype="PCM_16")
-    sf.write(instrumental_path, instrumental.T, SAMPLE_RATE, subtype="PCM_16")
-    return vocals_path, instrumental_path
+    try:
+        mixture = _load_stereo_audio(input_path)
+        vocals = _separate(model, mixture, device, overlap)
+        instrumental = mixture[:, : vocals.shape[1]] - vocals
+        output_dir.mkdir(parents=True, exist_ok=True)
+        vocals_path = output_dir / f"{input_path.stem}_vocals.wav"
+        instrumental_path = output_dir / f"{input_path.stem}_instrumental.wav"
+        sf.write(vocals_path, vocals.T, SAMPLE_RATE, subtype="PCM_16")
+        sf.write(instrumental_path, instrumental.T, SAMPLE_RATE, subtype="PCM_16")
+        return vocals_path, instrumental_path
+    finally:
+        del model
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def main() -> int:
