@@ -25,6 +25,7 @@ from project_paths import LIB_DIR
 SAMPLE_RATE = 16_000
 DEFAULT_CHUNK_SECONDS = 180.0
 DEFAULT_GAP_SECONDS = 0.35
+DEFAULT_VAD_EDGE_PADDING_SECONDS = 0.5
 _THREAD_LOCK = Lock()
 
 
@@ -83,6 +84,28 @@ def _merge_ranges(ranges: list[tuple[float, float]], max_gap: float = 0.4) -> li
     return merged
 
 
+def _extend_ranges(
+    ranges: list[tuple[float, float]], duration: float, padding: float,
+) -> list[tuple[float, float]]:
+    """VAD 人聲段前後延伸，並在延伸後重新合併相鄰範圍。"""
+    return _merge_ranges([
+        (max(0.0, start - padding), min(duration, end + padding))
+        for start, end in ranges
+    ])
+
+
+def _vad_edge_padding_seconds() -> float:
+    try:
+        value = float(
+            os.getenv("VAD_EDGE_PADDING_SECONDS", DEFAULT_VAD_EDGE_PADDING_SECONDS)
+        )
+    except ValueError as exc:
+        raise ValueError("VAD_EDGE_PADDING_SECONDS 必須是非負秒數") from exc
+    if value < 0:
+        raise ValueError("VAD_EDGE_PADDING_SECONDS 必須是非負秒數")
+    return value
+
+
 def _extract_mono_16k(source: Path, work_dir: Path) -> Path:
     output = work_dir / f"{source.stem}.vad-16k.wav"
     if output.is_file() and output.stat().st_size > 0:
@@ -109,6 +132,10 @@ def _detect_events(source: Path, work_dir: Path) -> tuple[list[tuple[float, floa
     if not (model_root / "VAD").is_dir() or not (model_root / "AED").is_dir():
         raise RuntimeError("找不到 FireRedVAD 模型；請先執行其安裝流程。")
     audio = _extract_mono_16k(source, work_dir)
+    import soundfile as sf
+
+    source_duration = sf.info(audio).frames / SAMPLE_RATE
+    edge_padding = _vad_edge_padding_seconds()
     use_gpu = os.getenv("FIRERED_USE_GPU", "1").strip().casefold() not in {"0", "false", "no", "off"}
     with gpu_inference_lock("FireRed VAD/AED"):
         vad = FireRedVad.from_pretrained(
@@ -132,7 +159,11 @@ def _detect_events(source: Path, work_dir: Path) -> tuple[list[tuple[float, floa
         aed_result, _ = aed.detect(str(audio))
         del aed
         _release_cuda()
-    speech = _merge_ranges(list(vad_result.get("timestamps") or []))
+    speech = _extend_ranges(
+        _merge_ranges(list(vad_result.get("timestamps") or [])),
+        source_duration,
+        edge_padding,
+    )
     events = aed_result.get("event2timestamps") or {}
     singing = _merge_ranges(list(events.get("singing") or []))
     return speech, singing
@@ -157,10 +188,16 @@ def prepare_vad_roformer_audio(source: Path, work_dir: Path) -> VadRoformerAudio
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     cache_path = work_dir / "vad_roformer_manifest.json"
+    expected_padding = _vad_edge_padding_seconds()
     if cache_path.is_file():
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
         paths = [Path(item["path"]) for item in payload.get("chunks") or []]
-        if paths and all(path.is_file() and path.stat().st_size > 0 for path in paths):
+        if (
+            payload.get("schema") == "vad_roformer_v2"
+            and float(payload.get("edge_padding_seconds", -1)) == expected_padding
+            and paths
+            and all(path.is_file() and path.stat().st_size > 0 for path in paths)
+        ):
             return VadRoformerAudio(
                 chunks=list(payload["chunks"]),
                 singing_ranges=[tuple(item) for item in payload.get("singing_ranges") or []],
@@ -240,7 +277,8 @@ def prepare_vad_roformer_audio(source: Path, work_dir: Path) -> VadRoformerAudio
             _release_cuda()
 
     payload = {
-        "schema": "vad_roformer_v1",
+        "schema": "vad_roformer_v2",
+        "edge_padding_seconds": expected_padding,
         "chunks": chunks,
         "singing_ranges": singing_ranges,
         "speech_ranges": speech_ranges,
