@@ -18,6 +18,7 @@
 /lib/whisper/
 /lib/confucius4_tts/
 /lib/mel_band_roformer_vocal/
+/lib/fireredvad/
 
 # 暫存檔與快取
 **/__pycache__/
