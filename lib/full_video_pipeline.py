@@ -1570,7 +1570,7 @@ def complete_three_phase_translation(
     ).strip() or "z-ai/glm-5.2"
     selection_models = [selection_primary]
     selection_fallback = os.getenv(
-        "THREE_PHASE_SELECTION_FALLBACK_MODEL", ""
+        "THREE_PHASE_SELECTION_FALLBACK_MODEL", "x-ai/grok-4.5"
     ).strip()
     if (
         selection_fallback
@@ -1886,7 +1886,9 @@ def _complete_three_phase_with_preserved_short_cues(
         )
     else:
         selection_models = [selection_primary]
-        fallback = os.getenv("THREE_PHASE_SELECTION_FALLBACK_MODEL", "").strip()
+        fallback = os.getenv(
+            "THREE_PHASE_SELECTION_FALLBACK_MODEL", "x-ai/grok-4.5"
+        ).strip()
         if fallback and fallback.casefold() != selection_primary.casefold():
             selection_models.append(fallback)
         selected = None
