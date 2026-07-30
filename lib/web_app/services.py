@@ -546,6 +546,8 @@ class TaskManager:
 
     def start_profile(self, profile_id: str) -> dict[str, Any]:
         profile = get_profile(profile_id)
+        if not profile.get("enabled", True):
+            raise ValueError("此資料夾設定已停用")
         task_id = uuid.uuid4().hex[:12]
         record = TaskRecord(
             id=task_id,
@@ -568,6 +570,13 @@ class TaskManager:
         return self.start_profile("video")
 
     def _profile_command(self, profile: dict[str, Any]) -> list[str]:
+        if profile.get("config_file"):
+            return [
+                sys.executable,
+                str(Path(LIB_DIR) / "run_download.py"),
+                "--configs",
+                str(profile["id"]),
+            ]
         mode = profile["mode"]
         options = dict(profile["options"])
         command = [
@@ -622,22 +631,30 @@ class TaskManager:
 
     def _run_profile(self, task_id: str) -> None:
         with self._pipeline_lock:
-            with self._lock:
-                task = self._tasks[task_id]
-                if task.state == "cancelled":
-                    return
-                profile_id = task.profile_id
-            profile = get_profile(profile_id)
-            for key in ("inbox_dir", "output_dir", "grid_backup_dir"):
-                Path(profile[key]).mkdir(parents=True, exist_ok=True)
-            command = self._profile_command(profile)
-            self._run_process(
-                task_id,
-                command,
-                running_message=f"{profile['name']} 正在下載與處理",
-                done_message=f"{profile['name']} 已完成",
-            )
-            invalidate_catalog_cache()
+            try:
+                with self._lock:
+                    task = self._tasks[task_id]
+                    if task.state == "cancelled":
+                        return
+                    profile_id = task.profile_id
+                profile = get_profile(profile_id)
+                for key in ("inbox_dir", "output_dir", "grid_backup_dir"):
+                    Path(profile[key]).mkdir(parents=True, exist_ok=True)
+                command = self._profile_command(profile)
+                self._run_process(
+                    task_id,
+                    command,
+                    running_message=f"{profile['name']} 正在下載與處理",
+                    done_message=f"{profile['name']} 已完成",
+                )
+                invalidate_catalog_cache()
+            except Exception as exc:
+                self._update(
+                    task_id,
+                    state="failed",
+                    progress=100,
+                    message=str(exc),
+                )
 
     def _run_process(
         self,

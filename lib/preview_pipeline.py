@@ -276,6 +276,7 @@ def process_preview_from_grid(
     force: bool = False,
     moss_worker=None,
     audio_worker=None,
+    work_bucket: str = "02_preview_videos",
 ) -> Path:
     """單支預覽：3 分鐘低畫質 → MOSS → 精選翻譯 → 語音剪片 → enhance → 軟 SRT。"""
     import full_video_pipeline as fvp
@@ -359,7 +360,7 @@ def process_preview_from_grid(
     if not video_url:
         raise RuntimeError(f"來源沒有可用 URL：{jpg_path.name}")
 
-    work_dir = TEMP_DIR / "pipeline" / "02_preview_videos" / f"_work_{video_stem}"
+    work_dir = TEMP_DIR / "pipeline" / work_bucket / f"_work_{video_stem}"
     work_dir.mkdir(parents=True, exist_ok=True)
     clip_path = work_dir / f"{video_stem}.clip.mp4"
     cut_path = work_dir / f"{video_stem}.cut.mp4"

@@ -211,6 +211,7 @@ def process_chosen_grid(
     force: bool = False,
     moss_worker=None,
     audio_worker=None,
+    work_bucket: str = "05_chosen",
 ) -> Path:
     """九宮格：代理 → MOSS → 1080P（可分段）→ 判斷 enhance → 06_good，JPG→04。"""
     import full_video_pipeline
@@ -239,7 +240,8 @@ def process_chosen_grid(
         dialogue_trim_threshold=dialogue_trim_threshold,
         segment_gap=segment_gap,
         force=force,
-        work_bucket="05_chosen",
+        work_bucket=work_bucket,
+        pipeline_stage="chosen",
         archive_grid_on_done=archive_grid,
         moss_worker=moss_worker,
         audio_worker=audio_worker,
@@ -266,6 +268,7 @@ def process_chosen_video(
     force: bool = False,
     moss_worker=None,
     audio_worker=None,
+    work_bucket: str = "05_chosen",
 ) -> Path:
     """影片只作為 URL 載體；所有處理都重新走 Chosen 的高畫質管線。
 
@@ -371,7 +374,7 @@ def process_chosen_video(
     work = (
         Path(full_video_pipeline.TEMP_DIR)
         / "pipeline"
-        / "05_chosen"
+        / work_bucket
         / f"_work_{stem}"
     )
     work.mkdir(parents=True, exist_ok=True)

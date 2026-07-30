@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import math
 import os
 import re
 import sys
@@ -14,16 +15,27 @@ import download_maintenance as maintenance
 from download_maintenance import *  # noqa: F401,F403 - 保留舊工具的相容入口
 from pipeline_control import (
     FeatureSwitches,
+    bootstrap_folder_configs,
     feature_environment,
+    load_folder_configs,
     parse_stage_names,
-    print_stage_inventory,
+    pipeline_process_lock,
+    preflight_folder_configs,
+    print_folder_config_inventory,
     resolve_stage_options,
-    run_interactive,
+    run_folder_configs,
+    run_folder_configs_interactive,
     run_stage,
     run_stages,
+    select_folder_configs,
     validate_stage_options,
 )
-from project_paths import DOWNLOADED_DIR, VIDEOS_DIR, ensure_output_directories
+from project_paths import (
+    DOWNLOADED_DIR,
+    OUTPUT_ROOT,
+    VIDEOS_DIR,
+    ensure_output_directories,
+)
 
 WORK_TEMP_DIR = maintenance.WORK_TEMP_DIR
 
@@ -118,16 +130,20 @@ def run_download_process(
     stage_names: list[str] | None = None,
     options: FeatureSwitches | None = None,
 ) -> int:
-    """程式化入口；維護模式與四層流程明確分流。"""
+    """程式化入口；預設依 output/NN_*.json，明確 stage_names 保留舊 API。"""
     if retry_subtitles or repair_over_1080:
-        return maintenance.run_download_process(
-            retry_subtitles=retry_subtitles,
-            repair_over_1080=repair_over_1080,
-        )
-    failures = run_stages(
-        stage_names or ["preview", "shorts", "video", "chosen"],
-        options or FeatureSwitches(),
-    )
+        with pipeline_process_lock():
+            return maintenance.run_download_process(
+                retry_subtitles=retry_subtitles,
+                repair_over_1080=repair_over_1080,
+            )
+    switches = options or FeatureSwitches()
+    with pipeline_process_lock():
+        if stage_names is not None:
+            failures = run_stages(stage_names, switches)
+        else:
+            bootstrap_folder_configs()
+            failures = run_folder_configs(load_folder_configs(), switches)
     return 3 if failures else 0
 
 
@@ -142,7 +158,7 @@ def _boolean_switch(parser: argparse.ArgumentParser, name: str, help_text: str) 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Preview → Shorts → Video → Chosen 下載控制器"
+        description="依 output/NN_*.json 檔名順序執行的資料夾下載控制器"
     )
     parser.add_argument(
         "--interactive",
@@ -158,7 +174,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--stages",
         nargs="+",
         metavar="STAGE",
-        help="指定 preview、shorts、video、chosen；可用空白或逗號分隔",
+        help="只執行指定 Pipeline 類型；可用空白或逗號分隔",
+    )
+    parser.add_argument(
+        "--configs",
+        nargs="+",
+        metavar="CONFIG",
+        help="只執行指定設定 id 或 JSON 檔名；仍依檔名前綴排序",
     )
     parser.add_argument(
         "--source-dir",
@@ -355,6 +377,44 @@ def run_maintenance(args: argparse.Namespace) -> int | None:
     return None
 
 
+def _load_cli_folder_configs(args: argparse.Namespace):
+    """在目前鎖定時點重新載入並篩選設定，避免等待期間使用舊快照。"""
+    bootstrap_folder_configs()
+    stage_filter = (
+        set(parse_stage_names(args.stages))
+        if args.stages
+        else None
+    )
+    configs = load_folder_configs()
+    if not configs:
+        raise ValueError(
+            f"{OUTPUT_ROOT} 找不到 02 以上的 NN_*.json 資料夾設定"
+        )
+    if stage_filter is not None:
+        configs = [
+            config
+            for config in configs
+            if config.stage_name in stage_filter
+        ]
+    configs = select_folder_configs(configs, args.configs)
+    if not configs:
+        raise ValueError("沒有符合條件的資料夾設定")
+    return configs
+
+
+def _validate_scoped_overrides(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    selected_stages: set[str],
+) -> None:
+    if args.preview_seconds is not None and "preview" not in selected_stages:
+        parser.error("--preview-seconds 只能用於 preview Pipeline")
+    if args.video_height is not None and "video" not in selected_stages:
+        parser.error("--video-height 只能用於 video Pipeline")
+    if args.chosen_height is not None and "chosen" not in selected_stages:
+        parser.error("--chosen-height 只能用於 chosen Pipeline")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -369,22 +429,30 @@ def main(argv: list[str] | None = None) -> int:
         value = getattr(args, name)
         if value is not None and value <= 0:
             parser.error(f"--{name.replace('_', '-')} 必須大於 0")
-    if args.segment_gap is not None and args.segment_gap < 0:
-        parser.error("--segment-gap 不得小於 0")
+    if args.trim_threshold is not None and not math.isfinite(args.trim_threshold):
+        parser.error("--trim-threshold 必須是有限數字")
+    if args.segment_gap is not None and (
+        args.segment_gap < 0 or not math.isfinite(args.segment_gap)
+    ):
+        parser.error("--segment-gap 必須是有限數字且不得小於 0")
     if args.interactive and args.list:
         parser.error("--interactive 不能與 --list 同時使用")
     if args.retry_subtitles and args.repair_over_1080:
         parser.error("--retry-subtitles 不能與 --repair-over-1080 同時使用")
     if args.keep_proxy and not args.grid:
         parser.error("--keep-proxy 只能搭配 --grid")
-    if args.grid and (args.stages or args.interactive or args.list):
-        parser.error("--grid 不能混用 --stages、--interactive 或 --list")
+    if args.stages and args.configs:
+        parser.error("--stages 不能與 --configs 同時使用")
+    if args.grid and (args.stages or args.configs or args.interactive or args.list):
+        parser.error("--grid 不能混用 --stages、--configs、--interactive 或 --list")
     if args.grid and (args.source_dir or args.output_dir or args.archive_dir):
         parser.error("--grid 不能混用自訂 Profile 資料夾")
     if (args.output_dir or args.archive_dir) and not args.source_dir:
         parser.error("--output-dir、--archive-dir 必須搭配 --source-dir")
     if args.source_dir and (args.interactive or args.list):
         parser.error("自訂 Profile 資料夾不能搭配 --interactive 或 --list")
+    if args.source_dir and args.configs:
+        parser.error("--source-dir 不能搭配 --configs")
     if args.list and any(
         getattr(args, name) is not None
         for name in (
@@ -422,6 +490,7 @@ def main(argv: list[str] | None = None) -> int:
         or args.output_dir
         or args.archive_dir
         or args.stages
+        or args.configs
         or args.interactive
         or args.list
         or any(
@@ -455,24 +524,39 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
     ):
-        parser.error("維護模式不能混用四層流程或功能開關")
-    maintenance_exit = run_maintenance(args)
+        parser.error("維護模式不能混用資料夾流程或功能開關")
+    maintenance_mode = bool(
+        args.grid or args.retry_subtitles or args.repair_over_1080
+    )
+    maintenance_exit = (
+        run_maintenance(args)
+        if not maintenance_mode
+        else None
+    )
+    if maintenance_mode:
+        with pipeline_process_lock():
+            maintenance_exit = run_maintenance(args)
     if maintenance_exit is not None:
         return maintenance_exit
 
+    configs = None
+    stages = None
     try:
-        stages = parse_stage_names(args.stages)
+        if args.source_dir:
+            stages = parse_stage_names(args.stages)
+            if len(stages) != 1 or not args.stages:
+                parser.error("--source-dir 必須明確指定單一 --stages")
+            _validate_scoped_overrides(parser, args, set(stages))
+        elif args.list:
+            configs = _load_cli_folder_configs(args)
+            _validate_scoped_overrides(
+                parser,
+                args,
+                {config.stage_name for config in configs},
+            )
     except ValueError as exc:
-        print(f"錯誤：{exc}", file=sys.stderr)
+        print(f"設定錯誤：{exc}", file=sys.stderr)
         return 2
-    if args.source_dir and len(stages) != 1:
-        parser.error("--source-dir 必須明確指定單一 --stages")
-    if args.preview_seconds is not None and "preview" not in stages:
-        parser.error("--preview-seconds 只能用於 preview 層")
-    if args.video_height is not None and "video" not in stages:
-        parser.error("--video-height 只能用於 video 層")
-    if args.chosen_height is not None and "chosen" not in stages:
-        parser.error("--chosen-height 只能用於 chosen 層")
     options = FeatureSwitches(
         asr=args.asr,
         demucs_asr=args.demucs_asr,
@@ -501,24 +585,38 @@ def main(argv: list[str] | None = None) -> int:
         asr_batch_size=args.asr_batch_size,
     )
     if args.list:
-        for stage in stages:
-            print_stage_inventory(stage)
+        assert configs is not None
+        try:
+            preflight_folder_configs(configs, options)
+            for config in configs:
+                print_folder_config_inventory(config)
+        except ValueError as exc:
+            print(f"設定錯誤：{exc}", file=sys.stderr)
+            return 2
         return 0
     try:
-        if args.source_dir:
-            failures = run_stage(
-                stages[0],
-                options,
-                source_dir=args.source_dir.resolve(),
-                final_dir=args.output_dir.resolve() if args.output_dir else None,
-                archive_dir=args.archive_dir.resolve() if args.archive_dir else None,
-            )
-        else:
-            failures = (
-                run_interactive(options, stages)
-                if args.interactive
-                else run_stages(stages, options)
-            )
+        with pipeline_process_lock():
+            if args.source_dir:
+                assert stages is not None
+                failures = run_stage(
+                    stages[0],
+                    options,
+                    source_dir=args.source_dir.resolve(),
+                    final_dir=args.output_dir.resolve() if args.output_dir else None,
+                    archive_dir=args.archive_dir.resolve() if args.archive_dir else None,
+                )
+            else:
+                configs = _load_cli_folder_configs(args)
+                _validate_scoped_overrides(
+                    parser,
+                    args,
+                    {config.stage_name for config in configs},
+                )
+                failures = (
+                    run_folder_configs_interactive(configs, options)
+                    if args.interactive
+                    else run_folder_configs(configs, options)
+                )
     except ValueError as exc:
         print(f"設定錯誤：{exc}", file=sys.stderr)
         return 2

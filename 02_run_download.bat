@@ -25,8 +25,8 @@ if /i "%~1"=="--check" (
     exit /b 0
 )
 
-echo [INFO] Three budget layers: Preview ^($^) -^> Video ^($$^) -^> Chosen ^($$$^)
-echo [INFO] Each layer scans its folder and runs only when matching images or videos exist.
+echo [INFO] Folder pipelines are loaded from output\02_*.json through output\99_*.json.
+echo [INFO] The numeric filename prefix controls execution order; disabled or empty folders are skipped.
 echo [INFO] Use --help for all feature switches and arguments.
 
 if "%~1"=="" (

@@ -32,27 +32,117 @@ requirements.txt
 
 ```text
 output/
-├── 00_temp/             下載、字幕與 FFmpeg 暫存
-├── 01_preview_images/   01_run_capture.bat 產生的 5×5 宮格
-├── 02_preview_videos/   前 3 分鐘低畫質 → Whisper 語音剪片 + 軟 SRT，不硬字幕/不 enhance
-├── 02_shorts/           內嵌翻譯時間軸直抓最高畫質片段；僅 URL 先分析前 9 分鐘 240P
-├── 03_videos/           30 秒三段精選後的 480P + 軟字幕 + 判斷 enhance／crossfade
-├── 04_downloaded/       已完成九宮格歸檔
-├── 05_chosen/           精選輸入（可丟九宮格或含 URL 的影片）
-└── 06_good/             精選成品：三段精選後的 1080P + 判斷 enhance／crossfade
+├── 00_temp/              下載、字幕與 FFmpeg 暫存
+├── 01_preview_images/    01_run_capture.bat 產生的 5×5 宮格
+├── 02_preview.json       第 1 個執行的資料夾設定
+├── 03_shorts.json        第 2 個執行的資料夾設定
+├── 04_video.json         第 3 個執行的資料夾設定
+├── 05_chosen.json        第 4 個執行的資料夾設定
+├── 02_preview_videos/    Preview 輸入兼成品
+├── 02_shorts/            Shorts 輸入兼成品
+├── 03_videos/            Video 輸入兼成品
+├── 04_downloaded/        已完成九宮格歸檔
+├── 05_chosen/            Chosen 輸入
+└── 06_good/              Chosen 高畫質成品
 ```
 
 ### 四條流程
 
 | 流程 | 放入 | 畫質 | 字幕 | enhance | 輸出 |
 |------|------|------|------|---------|------|
-| 預覽 | `02_preview_videos` 九宮格或含 URL 影片 | 一次下載 BS 段低畫質（預設 3×3 分鐘）；語音>30s 剪片否則全留 | Mel-Band-RoFormer 人聲 → 批次 MOSS → 一次 Grok 4.3 minimal（失敗改 Grok 4.5 minimal）精選翻譯 | 否 | 同目錄 |
+| 預覽 | `02_preview_videos` 九宮格或含 URL 影片 | 一次下載 BS 段低畫質（預設 3×3 分鐘）；語音>30s 剪片否則全留 | Mel-Band-RoFormer 人聲 → 批次 MOSS → 一次 Grok 4.3 minimal（失敗改 Grok 4.5 minimal）精選翻譯 | 判斷 | 同目錄 |
 | Shorts | `02_shorts` 九宮格或含 URL 影片 | 先分析前 9 分鐘 240P；純語音不足 30 秒保留前 9 分鐘，否則依三段精選抓來源最高畫質片段 | MOSS → GLM 5.2 minimal 三段精選 → Grok 4.3 minimal 一次翻譯（失敗改 Grok 4.5）；原字幕少於 7.5N 直接完整翻譯 | 判斷 | 同目錄 |
 | 標準全片 | `03_videos` 九宮格或含 URL 影片 | 240P 分析後依選段抓 480P | 240P/MOSS → **GLM 5.2 minimal 精選、Grok 4.3 minimal 一次翻譯（失敗改 Grok 4.5）30 秒三段** → enhance＋crossfade | 判斷 | `03_videos` |
 | 精選 | `05_chosen` 九宮格或影片 | 240P 分析後依選段抓 1080P | 240P/MOSS → **GLM 5.2 minimal 精選、Grok 4.3 minimal 一次翻譯（失敗改 Grok 4.5）30 秒三段** → enhance＋crossfade | 判斷 | `06_good` |
 | 歸檔 | （自動） | — | — | — | 九宮格→`04_downloaded`；chosen 來源影片刪除 |
 
-可用 `PORN_OUTPUT_DIR` 環境變數整體改寫 `output/` 位置，程式內的子目錄名稱由 `lib/project_paths.py` 統一管理。
+### 統一資料夾設定
+
+下載流程只讀取 `output` 根目錄中檔名符合 `02_*.json`～`99_*.json` 的設定。兩位數前綴就是執行順序，必須唯一；要調整順序只需重新命名 JSON，不必修改程式。`00_*`、`01_*` 永遠不會被當成下載設定。
+
+`04_downloaded` 與 `06_good` 是歸檔／成品目的地，由其他設定的 `archive_dir`、`output_dir` 引用，所以不需另外建立可執行 JSON。未來要新增一個資料夾流程，可複製既有設定為 `07_自訂名稱.json`，保留唯一 `id`，再修改路徑與 `pipeline`。
+
+```json
+{
+  "version": 1,
+  "id": "custom-video",
+  "name": "自訂收藏",
+  "description": "可自由填寫",
+  "color": "#d6ff3f",
+  "enabled": true,
+  "pipeline": "video",
+  "route_mode": "copy",
+  "source_dir": "07_custom_inbox",
+  "output_dir": "07_custom_videos",
+  "archive_dir": "04_downloaded",
+  "settings": {
+    "asr": true,
+    "subtitles": true,
+    "translation": true,
+    "dialogue_trim": true,
+    "selective_download": true,
+    "three_phase_selection": true,
+    "metadata": true,
+    "video_height": 480
+  }
+}
+```
+
+基本欄位：
+
+| 欄位 | 用途 |
+|------|------|
+| `version` | 目前固定為整數 `1` |
+| `id` | 穩定且唯一的小寫英數／`-`／`_` ID；改執行順序時不要改它 |
+| `name`、`description` | 顯示名稱與說明 |
+| `color` | Muse 顯示色，格式為 `#RRGGBB` |
+| `enabled` | `false` 時保留設定但跳過執行 |
+| `pipeline` | 共用處理引擎：`preview`、`shorts`、`video`、`chosen` |
+| `route_mode` | Muse 手動路由宮格時使用 `copy` 或 `move`；不改變 BAT Pipeline |
+| `source_dir` | Inbox；相對路徑以 `output` 為基準，也可填絕對路徑、`~` 或 `%ENV%`／`$ENV` |
+| `output_dir` | 成品資料夾 |
+| `archive_dir` | 完成後宮格歸檔資料夾 |
+| `settings` | 下列 Pipeline 客製化設定 |
+
+所有可用 `settings`：
+
+| 欄位 | 類型／範圍 | 用途 | 預設 |
+|------|-------------|------|------|
+| `asr` | Boolean | 執行語音辨識 | `true` |
+| `demucs_asr` | Boolean | ASR 前先做人聲分離 | `true` |
+| `asr_stream` | Boolean | 使用分段下載／ASR 串流 | `false` |
+| `subtitles` | Boolean | 輸出外掛 SRT | `true` |
+| `translation` | Boolean | 翻譯辨識結果 | `true` |
+| `dialogue_trim` | Boolean | 依對白時間軸剪片 | `true` |
+| `selective_download` | Boolean | 先精選，再只下載需要的高畫質片段 | `true` |
+| `three_phase_selection` | Boolean | 使用 30 秒 N 三段精選 | Preview：`false`；其餘：`true` |
+| `edge_padding` | Boolean | 對白片段前後延伸 0.75 秒 | `false` |
+| `enhance` | Boolean | 自動判斷並執行音訊增強 | `true` |
+| `metadata` | Boolean | 寫入 MP4／JPG Metadata | `true` |
+| `archive` | Boolean | 完成後歸檔來源宮格 | Preview：`false`；其餘：`true` |
+| `keep_work` | Boolean | 保留 Pipeline 工作檔 | `false` |
+| `reuse_cache` | Boolean | 重用已存在的 ASR／翻譯快取 | `true` |
+| `force` | Boolean | 即使已有成品也強制重跑 | `false` |
+| `preview_seconds` | 大於 0 的整數 | Preview 下載秒數 | `180` |
+| `video_height` | 大於 0 的整數 | Video 成品高度 | `480` |
+| `chosen_height` | 大於 0 的整數 | Chosen 成品高度 | `1080` |
+| `asr_backend` | `whisper`／`moss`／`voxtral`／`grok-stt` | ASR Backend | `moss` |
+| `translation_model` | 非空字串 | OpenRouter 翻譯 Model | `x-ai/grok-4.3` |
+| `reasoning_effort` | `none`／`minimal`／`low`／`medium`／`high` | 翻譯推理強度 | `minimal` |
+| `trim_threshold` | 大於 0 的數字 | 啟動對白剪片所需淨對白秒數 | `30.0` |
+| `segment_gap` | 大於或等於 0 的數字 | 超過多少秒的停頓會被剪掉 | `1.5` |
+| `asr_chunk_seconds` | 大於 0 的整數 | 串流 ASR 每區段秒數 | `180` |
+| `asr_batch_size` | 大於 0 的整數 | MOSS 每批處理區段數 | `3` |
+
+未填的 setting 使用該 `pipeline` 的預設值；CLI 明確傳入的開關會暫時覆寫 JSON，但不改寫檔案。未知欄位、錯誤型別、重複順序／ID、相依設定衝突或兩個來源會寫到同一成品時，程式會在任何下載前停止並指出設定檔。
+
+`three_phase_selection=true` 需要同時開啟 `selective_download`、`dialogue_trim` 與 `translation`。來源與成品使用同一資料夾時必須保留 `metadata=true`，才能在下一輪分辨已發布成品；開啟 `archive` 時，`archive_dir` 不可等於 `source_dir`，避免宮格留在 Inbox 內反覆改名與重跑。資料夾之間依 JSON 前綴嚴格依序執行；同一 Video／Chosen 資料夾內預設仍可同時處理 2 個來源，若需要逐檔嚴格完成順序，可設定環境變數 `PIPELINE_SOURCE_WORKERS=1`。
+
+BAT、Muse 與多個 Muse 視窗共用跨程序 Pipeline 鎖；同一個 `output` 不會被兩個下載流程同時改寫，後啟動者會等待前一個流程完成。
+
+Muse 的「處理資料夾」與 `02_run_download.bat` 共用這些 JSON；在 Muse 新增、修改或刪除自訂 Profile，也會更新對應 JSON。Capture、收藏、垃圾桶與隱私等非 Pipeline 偏好仍保存在已忽略的 `tasks/muse/settings.json`。
+
+可用 `PORN_OUTPUT_DIR` 環境變數整體改寫 `output/` 位置。自訂位置第一次執行時會複製四份預設 JSON；已有任一設定時不會覆寫。
 
 ## 第一次安裝或更新
 
@@ -107,7 +197,7 @@ Muse 會在瀏覽器開啟 `http://127.0.0.1:8765/`，所有操作與偏好都�
 4. **下載工作：** 查看擷取與處理佇列、即時 Log、取消失敗工作或重新執行。
 5. **影片庫：** 直接播放本機影片與軟字幕，一鍵移動到自訂收藏資料夾；不要的影片先移至可復原垃圾桶。
 
-宮格送入 Profile 時預設使用「複製」，因此原始宮格庫不會因下載、影片移動或刪除而消失。Profile 可設定 Preview 片段秒數、畫質、ASR Backend、翻譯 Model、字幕、剪片、Selective Download、Enhance、Metadata、封存、快取與強制重跑等選項。設定頁可新增不同收藏資料夾、修改垃圾桶位置與隱私偏好。關閉 `03_open_muse.bat` 的命令視窗即可停止本機介面。
+宮格送入 Profile 時預設使用「複製」，因此原始宮格庫不會因下載、影片移動或刪除而消失。Profile 的路徑與 Pipeline 開關會直接讀寫 `output/NN_*.json`，因此 Muse 與 BAT 不再維護兩套設定。設定頁仍可新增收藏資料夾、修改垃圾桶位置與隱私偏好。關閉 `03_open_muse.bat` 的命令視窗即可停止本機介面。
 
 ### 1. 產生 5×5 宮格
 
@@ -128,11 +218,9 @@ output/01_preview_images/
 
 ### 3. 下載與字幕
 
-雙擊 `02_run_download.bat`。程式會依序掃描 `02_preview_videos`、
-`02_shorts`、`03_videos`、`05_chosen`；每層只要找到符合該層條件的九宮格圖片或影片就直接執行，
-找不到則印出 `[SKIP]` 後繼續下一層，沒有逐層確認。四層依序為 Preview、Shorts、Video、Chosen，
-不會因為只跑其中一層而先啟動其他昂貴流程。下載時只顯示本程式的階段進度，不顯示
-yt-dlp DEBUG 與下載百分比訊息。
+雙擊 `02_run_download.bat`。程式會先完整驗證所有啟用的 `NN_*.json`，再依檔名前綴逐一掃描與執行；
+空資料夾或 `enabled=false` 會印出 `[SKIP]` 後繼續，不會因後段設定錯誤而先跑完前段半套流程。
+下載時只顯示本程式的階段進度，不顯示 yt-dlp DEBUG 與下載百分比訊息。
 
 暫存位於 `output/00_temp/pipeline/`。Video 與 Chosen 預設分成兩個階段：
 
@@ -152,19 +240,26 @@ Preview 每段預設 180 秒，一次先下載 `--asr-batch-size` 段（預設 3
 02_run_download.bat --list
 ```
 
-直接指定預算層級：
+只執行指定 JSON（可用穩定 `id`、檔名 stem 或完整檔名）：
+
+```bat
+02_run_download.bat --configs preview
+02_run_download.bat --configs 04_video
+02_run_download.bat --configs 07_custom.json
+```
+
+也可依共用 Pipeline 類型篩選；若未來有多份 `video` 設定，會全部依 JSON 順序執行：
 
 ```bat
 02_run_download.bat --stages preview
-02_run_download.bat --stages shorts
-02_run_download.bat --stages preview video
+02_run_download.bat --stages shorts video
 02_run_download.bat --stages chosen
 ```
 
 所有主要功能都有正反開關與 args：
 
 ```bat
-02_run_download.bat --stages video --no-translation --no-dialogue-trim
+02_run_download.bat --stages video --no-three-phase-selection --no-selective-download --no-translation --no-dialogue-trim
 02_run_download.bat --stages chosen --subtitles --enhance --metadata --archive
 02_run_download.bat --stages preview --preview-seconds 90 --no-keep-work
 02_run_download.bat --stages video --video-height 480 --asr-backend moss
@@ -173,12 +268,12 @@ Preview 每段預設 180 秒，一次先下載 `--asr-batch-size` 段（預設 3
 02_run_download.bat --stages chosen --chosen-height 1080 --translation-model x-ai/grok-4.3 --reasoning-effort minimal
 ```
 
-可控制項目包含：`asr`、`demucs-asr`、`asr-stream`、`subtitles`、`translation`、`dialogue-trim`、`three-phase-selection`、`enhance`、
-`metadata`、`archive`、`keep-work`、`reuse-cache`、`force`。每個布林項目都可使用
-`--功能` 或 `--no-功能`；完整說明請執行 `02_run_download.bat --help`。
+JSON 的所有欄位已整理在「統一資料夾設定」；同名 CLI 布林項目可使用 `--功能` 或
+`--no-功能` 暫時覆寫。完整參數說明請執行 `02_run_download.bat --help`。
 
-這些開關彼此獨立：`--no-subtitles` 只停止輸出外掛 SRT，不會關閉 ASR、
-翻譯或剪片；`--no-translation` 也不會關閉 ASR。若關閉 ASR 但仍開啟翻譯
+一般開關不會偷偷連動：`--no-subtitles` 只停止輸出外掛 SRT，不會關閉 ASR、
+翻譯或剪片；`--no-translation` 也不會關閉 ASR。只有明確相依的組合會在下載前報錯，
+例如三段精選需要精選下載、翻譯與對白剪片。若關閉 ASR 但仍開啟翻譯
 或剪片，程式只會使用既有 ASR 快取；沒有快取時會明確報錯，不會偷偷替你
 開啟 ASR 或順帶關閉其他功能。每層開始前都會印出實際 ON/OFF 設定。
 `demucs-asr` 預設開啟，會在 ASR 前分離 vocals 人聲；它和最終成品的
@@ -204,7 +299,7 @@ Chosen 有 URL 時不會拿既有高畫質成品接續，會重新下載規劃�
 長影片預設以 **3 分鐘（180 秒）**下載 240P 片段；每片段先經 Demucs，再獨立辨識，合併成完整時間軸後才一次送到 OpenRouter。若單段發生 CUDA OOM，ASR 仍會自動二分到最低 90 秒。
 
 - `output/03_videos/`：保留原始畫面，輸出 UTF-8 BOM、CRLF、移除 `[Sxx]` 標籤的播放器相容 SRT。
-- `output/02_preview_videos/`：使用 FFmpeg 燒錄繁中硬字幕。
+- `output/02_preview_videos/`：保留原始畫面並輸出同名軟 SRT。
 - MP4 Meta 同時保存完整 `ORIGINAL_SRT`、`TRANSLATED_SRT` 與 `[S01]`、`[S02]` 說話者標籤。
 - 已有完整 Meta 但缺少正式影片外掛 SRT 時，會由 Meta 補建，不重新執行 ASR 或翻譯。
 

@@ -1,5 +1,6 @@
-# 產出與工作資料
-/output/
+# 產出與工作資料；只版本化 output 根目錄的流程設定
+/output/*
+!/output/[0-9][0-9]_*.json
 /tasks/
 /.temp/
 *.log

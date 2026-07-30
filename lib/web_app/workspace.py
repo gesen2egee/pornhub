@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -20,6 +21,16 @@ from typing import Any, Iterable
 from PIL import Image
 
 import video_meta
+from pipeline_control import (
+    FOLDER_CONFIG_SETTING_TO_OPTION,
+    FeatureSwitches,
+    FolderConfig,
+    bootstrap_folder_configs,
+    load_folder_configs,
+    resolve_stage_options,
+    validate_folder_paths,
+    validate_stage_options,
+)
 from project_paths import (
     CHOSEN_DIR,
     DOWNLOADED_DIR,
@@ -46,7 +57,7 @@ GRID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm", ".m4v"}
 SIDE_CAR_EXTENSIONS = {".srt", ".vtt", ".json", ".jpg", ".jpeg", ".png", ".webp"}
 PROFILE_MODES = {"preview", "shorts", "video", "chosen"}
-PROFILE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+PROFILE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,79}$")
 _CACHE_LOCK = threading.RLock()
 _SETTINGS_LOCK = threading.RLock()
 _THUMBNAIL_SEMAPHORE = threading.BoundedSemaphore(2)
@@ -92,7 +103,7 @@ def _atomic_json_write(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
     temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
+        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False),
         encoding="utf-8",
     )
     os.replace(temporary, path)
@@ -100,40 +111,31 @@ def _atomic_json_write(path: Path, payload: Any) -> None:
 
 def _read_json(path: Path, fallback: Any) -> Any:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return fallback
     return value
 
 
 def default_pipeline_options(mode: str) -> dict[str, Any]:
-    return {
-        "asr": True,
-        "demucs_asr": True,
-        "asr_stream": False,
-        "subtitles": True,
-        "translation": True,
-        "dialogue_trim": True,
-        "selective_download": True,
-        "three_phase_selection": mode in {"video", "chosen"},
-        "edge_padding": False,
-        "enhance": True,
-        "metadata": True,
-        "archive": mode != "preview",
-        "keep_work": False,
-        "reuse_cache": True,
-        "force": False,
-        "preview_seconds": 180,
-        "video_height": 480,
-        "chosen_height": 1080,
-        "asr_backend": "moss",
-        "translation_model": "x-ai/grok-4.3",
-        "reasoning_effort": "minimal",
-        "trim_threshold": 30.0,
-        "segment_gap": 1.5,
-        "asr_chunk_seconds": 180,
-        "asr_batch_size": 3,
-    }
+    resolved = resolve_stage_options(mode, FeatureSwitches())
+    values = dict(vars(resolved))
+    values["archive"] = values.pop("archive_grid")
+    return values
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    return bool(default)
 
 
 def _profile(
@@ -163,49 +165,86 @@ def _profile(
     }
 
 
+def _profile_from_folder_config(config: FolderConfig) -> dict[str, Any]:
+    profile = _profile(
+        config.id,
+        config.name,
+        config.stage_name,
+        config.source_dir,
+        config.output_dir,
+        config.archive_dir,
+        system=config.id in {"preview", "shorts", "video", "chosen"},
+        color=config.color,
+    )
+    options = resolve_stage_options(config.stage_name, config.options)
+    profile.update(
+        {
+            "enabled": config.enabled,
+            "description": config.description,
+            "config_file": str(config.config_path),
+            "route_mode": config.route_mode,
+            "options": {
+                **dict(vars(options)),
+                "archive": options.archive_grid,
+            },
+        }
+    )
+    profile["options"].pop("archive_grid", None)
+    return profile
+
+
+def _default_profiles() -> list[dict[str, Any]]:
+    bootstrap_folder_configs(OUTPUT_ROOT)
+    configs = load_folder_configs(OUTPUT_ROOT)
+    if configs:
+        return [_profile_from_folder_config(config) for config in configs]
+    # 相容尚未建立 JSON 的舊工作區；儲存後會遷移成獨立設定檔。
+    return [
+        _profile(
+            "preview",
+            "快速預覽",
+            "preview",
+            PREVIEW_VIDEOS_DIR,
+            PREVIEW_VIDEOS_DIR,
+            DOWNLOADED_DIR,
+            color="#38d6c7",
+        ),
+        _profile(
+            "shorts",
+            "精準短片",
+            "shorts",
+            SHORTS_DIR,
+            SHORTS_DIR,
+            DOWNLOADED_DIR,
+            color="#ffbb4d",
+        ),
+        _profile(
+            "video",
+            "標準影片",
+            "video",
+            VIDEOS_DIR,
+            VIDEOS_DIR,
+            DOWNLOADED_DIR,
+            color="#7c8cff",
+        ),
+        _profile(
+            "chosen",
+            "高畫質精選",
+            "chosen",
+            CHOSEN_DIR,
+            GOOD_DIR,
+            DOWNLOADED_DIR,
+            color="#ff6f91",
+        ),
+    ]
+
+
 def default_settings() -> dict[str, Any]:
     ensure_output_directories()
     return {
         "version": 2,
         "output_root": str(Path(OUTPUT_ROOT).resolve()),
-        "profiles": [
-            _profile(
-                "preview",
-                "快速預覽",
-                "preview",
-                PREVIEW_VIDEOS_DIR,
-                PREVIEW_VIDEOS_DIR,
-                DOWNLOADED_DIR,
-                color="#38d6c7",
-            ),
-            _profile(
-                "shorts",
-                "精準短片",
-                "shorts",
-                SHORTS_DIR,
-                SHORTS_DIR,
-                DOWNLOADED_DIR,
-                color="#ffbb4d",
-            ),
-            _profile(
-                "video",
-                "標準影片",
-                "video",
-                VIDEOS_DIR,
-                VIDEOS_DIR,
-                DOWNLOADED_DIR,
-                color="#7c8cff",
-            ),
-            _profile(
-                "chosen",
-                "高畫質精選",
-                "chosen",
-                CHOSEN_DIR,
-                GOOD_DIR,
-                DOWNLOADED_DIR,
-                color="#ff6f91",
-            ),
-        ],
+        "profiles": _default_profiles(),
         "favorite_folders": [
             {
                 "id": "favorites",
@@ -252,8 +291,14 @@ def _merge_profile(raw: dict[str, Any], base: dict[str, Any] | None = None) -> d
         "id": profile_id,
         "mode": mode,
         "name": str(raw.get("name") or defaults.get("name") or profile_id)[:80],
-        "enabled": bool(raw.get("enabled", defaults.get("enabled", True))),
-        "system": bool(defaults.get("system", raw.get("system", False))),
+        "enabled": _coerce_bool(
+            raw.get("enabled"),
+            bool(defaults.get("enabled", True)),
+        ),
+        "system": _coerce_bool(
+            defaults.get("system"),
+            bool(raw.get("system", False)),
+        ),
         "inbox_dir": str(_resolve_path(raw.get("inbox_dir"), defaults["inbox_dir"])),
         "output_dir": str(_resolve_path(raw.get("output_dir"), defaults["output_dir"])),
         "grid_backup_dir": str(
@@ -265,7 +310,10 @@ def _merge_profile(raw: dict[str, Any], base: dict[str, Any] | None = None) -> d
             in {"copy", "move"}
             else "copy"
         ),
-        "auto_run": bool(raw.get("auto_run", defaults.get("auto_run", False))),
+        "auto_run": _coerce_bool(
+            raw.get("auto_run"),
+            bool(defaults.get("auto_run", False)),
+        ),
         "options": _validate_options(options, mode),
     }
     return merged
@@ -302,20 +350,47 @@ def _validate_options(options: dict[str, Any], mode: str) -> dict[str, Any]:
     for name, default in defaults.items():
         value = options.get(name, default)
         if name in boolean_fields:
-            result[name] = bool(value)
+            if isinstance(value, bool):
+                result[name] = value
+            elif isinstance(value, str) and value.strip().casefold() in {
+                "true",
+                "1",
+                "yes",
+                "on",
+            }:
+                result[name] = True
+            elif isinstance(value, str) and value.strip().casefold() in {
+                "false",
+                "0",
+                "no",
+                "off",
+            }:
+                result[name] = False
+            else:
+                result[name] = default
         elif name in positive_ints:
             try:
                 result[name] = max(1, int(value))
-            except (TypeError, ValueError):
+            except (OverflowError, TypeError, ValueError):
                 result[name] = default
         elif name in positive_floats:
             try:
-                result[name] = max(0.1, float(value))
+                parsed = float(value)
+                result[name] = (
+                    max(0.1, parsed)
+                    if math.isfinite(parsed)
+                    else default
+                )
             except (TypeError, ValueError):
                 result[name] = default
         elif name == "segment_gap":
             try:
-                result[name] = max(0.0, float(value))
+                parsed = float(value)
+                result[name] = (
+                    max(0.0, parsed)
+                    if math.isfinite(parsed)
+                    else default
+                )
             except (TypeError, ValueError):
                 result[name] = default
         else:
@@ -324,7 +399,7 @@ def _validate_options(options: dict[str, Any], mode: str) -> dict[str, Any]:
         result["asr_backend"] = "moss"
     if result["reasoning_effort"] not in {"none", "minimal", "low", "medium", "high"}:
         result["reasoning_effort"] = "minimal"
-    if mode not in {"video", "chosen"}:
+    if mode not in {"shorts", "video", "chosen"}:
         result["three_phase_selection"] = False
     return result
 
@@ -335,20 +410,34 @@ def get_settings() -> dict[str, Any]:
         raw = _read_json(SETTINGS_FILE, {})
         if not isinstance(raw, dict):
             raw = {}
-        system_defaults = {item["id"]: item for item in defaults["profiles"]}
+        config_defaults = {item["id"]: item for item in defaults["profiles"]}
+        raw_profiles = {
+            str(item.get("id") or "").casefold(): item
+            for item in list(raw.get("profiles") or [])
+            if isinstance(item, dict)
+        }
         profiles: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for item in list(raw.get("profiles") or []):
-            if not isinstance(item, dict):
+        for profile_id, profile in config_defaults.items():
+            # Pipeline、路徑與開關以 output JSON 為唯一來源；tasks 只留 UI 偏好。
+            ui = raw_profiles.pop(profile_id, {})
+            merged = dict(profile)
+            for key in ("auto_run",):
+                if key in ui:
+                    merged[key] = _coerce_bool(
+                        ui[key],
+                        bool(merged.get(key, False)),
+                    )
+            profiles.append(merged)
+            seen.add(profile_id)
+        # 相容舊版尚未遷移的自訂 Profile；下次儲存會建立 output JSON。
+        for item in raw_profiles.values():
+            if "mode" not in item and "inbox_dir" not in item:
                 continue
-            profile_id = str(item.get("id") or "").casefold()
-            merged = _merge_profile(item, system_defaults.get(profile_id))
+            merged = _merge_profile(item)
             if merged["id"] not in seen:
                 profiles.append(merged)
                 seen.add(merged["id"])
-        for profile_id, profile in system_defaults.items():
-            if profile_id not in seen:
-                profiles.append(profile)
         favorites = []
         for item in list(raw.get("favorite_folders") or defaults["favorite_folders"]):
             if not isinstance(item, dict):
@@ -374,32 +463,212 @@ def get_settings() -> dict[str, Any]:
         return settings
 
 
+def _portable_output_path(value: str | Path) -> str:
+    path = Path(value).resolve()
+    try:
+        return path.relative_to(Path(OUTPUT_ROOT).resolve()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _next_folder_config_path(
+    existing: Iterable[Path],
+    profile_id: str,
+) -> Path:
+    paths = list(existing)
+    used = {
+        int(path.name[:2])
+        for path in paths
+        if re.fullmatch(r"\d{2}_.+\.json", path.name, flags=re.IGNORECASE)
+    }
+    start = max(used, default=1) + 1
+    for order in list(range(start, 100)) + list(range(2, start)):
+        if order not in used:
+            return Path(OUTPUT_ROOT) / f"{order:02d}_{profile_id}.json"
+    raise ValueError("資料夾設定順序 02–99 已用完")
+
+
+def _profile_feature_switches(profile: dict[str, Any]) -> FeatureSwitches:
+    options = dict(profile["options"])
+    values = {
+        option_name: options[config_name]
+        for config_name, option_name in FOLDER_CONFIG_SETTING_TO_OPTION.items()
+        if config_name in options
+    }
+    return FeatureSwitches(**values)
+
+
+def _folder_config_payload(
+    profile: dict[str, Any],
+    existing: FolderConfig | None = None,
+) -> dict[str, Any]:
+    options = dict(profile["options"])
+    defaults = resolve_stage_options(profile["mode"], FeatureSwitches())
+    settings: dict[str, Any] = {}
+    for config_name, option_name in FOLDER_CONFIG_SETTING_TO_OPTION.items():
+        if config_name not in options:
+            continue
+        original = (
+            getattr(existing.options, option_name)
+            if existing is not None and existing.stage_name == profile["mode"]
+            else None
+        )
+        if (
+            existing is not None
+            and original is None
+            and options[config_name] == getattr(defaults, option_name)
+        ):
+            continue
+        settings[config_name] = options[config_name]
+    paths = {
+        "source_dir": _portable_output_path(profile["inbox_dir"]),
+        "output_dir": _portable_output_path(profile["output_dir"]),
+        "archive_dir": _portable_output_path(profile["grid_backup_dir"]),
+    }
+    if existing is not None:
+        raw_existing = _read_json(existing.config_path, {})
+        if isinstance(raw_existing, dict):
+            for config_name, profile_name, attribute_name in (
+                ("source_dir", "inbox_dir", "source_dir"),
+                ("output_dir", "output_dir", "output_dir"),
+                ("archive_dir", "grid_backup_dir", "archive_dir"),
+            ):
+                raw_path = raw_existing.get(config_name)
+                if not isinstance(raw_path, str):
+                    continue
+                profile_path = Path(profile[profile_name]).resolve()
+                existing_path = getattr(existing, attribute_name).resolve()
+                if os.path.normcase(str(profile_path)) == os.path.normcase(
+                    str(existing_path)
+                ):
+                    # 未在 Muse 改路徑時保留 ~、%ENV% 與原相對寫法。
+                    paths[config_name] = raw_path
+    return {
+        "version": 1,
+        "id": profile["id"],
+        "name": profile["name"],
+        "description": str(profile.get("description") or ""),
+        "color": str(profile.get("color") or "#d6ff3f"),
+        "enabled": bool(profile["enabled"]),
+        "pipeline": profile["mode"],
+        "route_mode": profile.get("route_mode", "copy"),
+        **paths,
+        "settings": settings,
+    }
+
+
 def save_settings(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("設定格式錯誤")
     with _SETTINGS_LOCK:
         current = get_settings()
+        stored = _read_json(SETTINGS_FILE, {})
+        if not isinstance(stored, dict):
+            stored = {}
         merged = {**current, **payload}
-        profiles = payload.get("profiles", current["profiles"])
-        if not isinstance(profiles, list) or not profiles:
-            raise ValueError("至少需要一個處理資料夾 Profile")
-        if len(profiles) > 32:
-            raise ValueError("處理資料夾 Profile 最多 32 個")
-        system_defaults = {
-            item["id"]: item for item in default_settings()["profiles"]
-        }
-        normalized_profiles = []
-        seen = set()
-        for raw in profiles:
-            if not isinstance(raw, dict):
-                continue
-            profile_id = str(raw.get("id") or "").casefold()
-            normalized = _merge_profile(raw, system_defaults.get(profile_id))
-            if normalized["id"] in seen:
-                raise ValueError(f"Profile ID 重複：{normalized['id']}")
-            seen.add(normalized["id"])
-            normalized_profiles.append(normalized)
-        merged["profiles"] = normalized_profiles
+        if "profiles" in payload:
+            profiles = payload["profiles"]
+            if not isinstance(profiles, list) or not profiles:
+                raise ValueError("至少需要一個處理資料夾 Profile")
+            if len(profiles) > 98:
+                raise ValueError("處理資料夾 Profile 最多 98 個")
+            system_defaults = {
+                item["id"]: item for item in default_settings()["profiles"]
+            }
+            normalized_profiles = []
+            seen = set()
+            for raw in profiles:
+                if not isinstance(raw, dict):
+                    raise ValueError("Profile 必須是 JSON 物件")
+                profile_id = str(raw.get("id") or "").casefold()
+                normalized = _merge_profile(raw, system_defaults.get(profile_id))
+                if normalized["id"] in seen:
+                    raise ValueError(f"Profile ID 重複：{normalized['id']}")
+                route_mode = normalized.get("route_mode", "copy")
+                if route_mode not in {"copy", "move"}:
+                    raise ValueError(
+                        f"{normalized['name']}：route_mode 必須是 copy 或 move"
+                    )
+                color = str(normalized.get("color") or "")
+                if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+                    raise ValueError(
+                        f"{normalized['name']}：color 必須是 #RRGGBB 色碼"
+                    )
+                normalized["color"] = color.casefold()
+                seen.add(normalized["id"])
+                normalized_profiles.append(normalized)
+
+            enabled_sources: dict[str, dict[str, Any]] = {}
+            for profile in normalized_profiles:
+                if not profile["enabled"]:
+                    continue
+                source_key = os.path.normcase(
+                    str(Path(profile["inbox_dir"]).resolve())
+                )
+                previous = enabled_sources.get(source_key)
+                if previous is not None:
+                    raise ValueError(
+                        "啟用的 Profile 不可共用 Inbox："
+                        f"{previous['name']}、{profile['name']}"
+                    )
+                enabled_sources[source_key] = profile
+
+            existing_configs = load_folder_configs(OUTPUT_ROOT)
+            existing_by_id = {config.id: config for config in existing_configs}
+            config_paths = [config.config_path for config in existing_configs]
+            pending_config_writes: list[tuple[Path, dict[str, Any]]] = []
+            for profile in normalized_profiles:
+                options = resolve_stage_options(
+                    profile["mode"],
+                    _profile_feature_switches(profile),
+                )
+                try:
+                    validate_stage_options(profile["mode"], options)
+                except ValueError as exc:
+                    raise ValueError(f"{profile['name']}：{exc}") from exc
+                validate_folder_paths(
+                    profile["name"],
+                    profile["inbox_dir"],
+                    profile["output_dir"],
+                    profile["grid_backup_dir"],
+                    options,
+                )
+                existing = existing_by_id.get(profile["id"])
+                if existing is not None:
+                    config_path = existing.config_path
+                else:
+                    config_path = _next_folder_config_path(
+                        config_paths,
+                        profile["id"],
+                    )
+                    config_paths.append(config_path)
+                profile["config_file"] = str(config_path)
+                config_payload = _folder_config_payload(
+                    profile,
+                    existing=existing,
+                )
+                if _read_json(config_path, None) != config_payload:
+                    pending_config_writes.append((config_path, config_payload))
+
+            for config_path, config_payload in pending_config_writes:
+                _atomic_json_write(config_path, config_payload)
+            for config in existing_configs:
+                if (
+                    config.id not in seen
+                    and config.id not in {"preview", "shorts", "video", "chosen"}
+                ):
+                    config.config_path.unlink(missing_ok=True)
+            # Pipeline 細節已寫入 output JSON；tasks 只保留 UI 偏好。
+            merged["profiles"] = [
+                {
+                    "id": profile["id"],
+                    "auto_run": bool(profile.get("auto_run", False)),
+                }
+                for profile in normalized_profiles
+            ]
+        else:
+            # 隱私、收藏等局部儲存不可改寫或鎖住 Pipeline JSON。
+            merged["profiles"] = list(stored.get("profiles") or [])
         favorites = payload.get("favorite_folders", current["favorite_folders"])
         if not isinstance(favorites, list) or len(favorites) > 24:
             raise ValueError("收藏資料夾設定錯誤")
@@ -939,6 +1208,7 @@ def profile_inventory() -> list[dict[str, Any]]:
         pending = list_sources_in_directory(
             profile["mode"],
             inbox,
+            output_dir=output_dir,
             include_published=bool(profile["options"].get("force")),
         )
         videos = _walk_files([output_dir], VIDEO_EXTENSIONS)

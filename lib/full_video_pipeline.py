@@ -3251,6 +3251,7 @@ def process_full_video_from_grid(
     enable_edge_padding: bool | None = None,
     force: bool = False,
     work_bucket: str = "03_videos",
+    pipeline_stage: str | None = None,
     archive_grid_on_done: bool = True,
     moss_worker: MossAsrWorker | None = None,
     audio_worker=None,
@@ -3277,10 +3278,12 @@ def process_full_video_from_grid(
     jpg_path = Path(jpg_path).resolve()
     source_suffix = jpg_path.suffix.casefold()
     source_is_grid = source_suffix in {".jpg", ".jpeg", ".png"}
-    pipeline_stage = {
+    pipeline_stage = pipeline_stage or {
         "02_shorts": "shorts",
         "05_chosen": "chosen",
     }.get(work_bucket, "video")
+    if pipeline_stage not in {"shorts", "video", "chosen"}:
+        raise ValueError(f"不支援的 Pipeline 類型：{pipeline_stage}")
     final_dir = Path(final_dir or VIDEOS_DIR).resolve()
     archive_dir = Path(archive_dir or DOWNLOADED_DIR).resolve()
     final_dir.mkdir(parents=True, exist_ok=True)
