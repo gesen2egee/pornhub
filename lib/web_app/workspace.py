@@ -110,7 +110,7 @@ def default_pipeline_options(mode: str) -> dict[str, Any]:
     return {
         "asr": True,
         "demucs_asr": True,
-        "asr_stream": True,
+        "asr_stream": False,
         "subtitles": True,
         "translation": True,
         "dialogue_trim": True,

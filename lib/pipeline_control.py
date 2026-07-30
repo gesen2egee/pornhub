@@ -287,7 +287,7 @@ def resolve_stage_options(
     defaults = {
         "asr": True,
         "demucs_asr": True,
-        "asr_stream": True,
+        "asr_stream": False,
         "subtitles": True,
         "translation": True,
         "dialogue_trim": True,

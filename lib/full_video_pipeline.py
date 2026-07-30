@@ -793,7 +793,8 @@ def remote_duration(video_url: str) -> float | None:
 
 def asr_stream_enabled(environment: dict[str, str] | None = None) -> bool:
     environment = os.environ if environment is None else environment
-    value = environment.get("ENABLE_ASR_STREAM", "1").strip().casefold()
+    # 預設先完整下載一次 240P；只有明確開啟時才使用分段串流。
+    value = environment.get("ENABLE_ASR_STREAM", "0").strip().casefold()
     if value in {"1", "true", "yes", "on"}:
         return True
     if value in {"0", "false", "no", "off"}:
@@ -1358,6 +1359,12 @@ def complete_three_phase_translation(
     state_path: Path | None = None,
 ) -> dict[str, Any]:
     """30 秒三段規劃、嚴格選句後，再將保留句翻成繁中。"""
+    short_limit = _three_phase_short_cue_limit()
+    if short_limit > 0:
+        return _complete_three_phase_with_preserved_short_cues(
+            asr, short_limit, cache_path=cache_path, selection_path=selection_path,
+            translation_path=translation_path, state_path=state_path,
+        )
     if (
         (asr.get("translated_srt") or "").strip()
         and asr.get("selection_mode") == "three_phase_30s"
@@ -1638,6 +1645,172 @@ def complete_three_phase_translation(
     return asr
 
 
+def _three_phase_short_cue_limit() -> float:
+    """回傳不計入三段精選額度、但仍保留的短句秒數。"""
+    try:
+        value = float(os.getenv("THREE_PHASE_SHORT_CUE_SECONDS", "1.5"))
+    except ValueError as exc:
+        raise ValueError("THREE_PHASE_SHORT_CUE_SECONDS 必須是秒數") from exc
+    if value < 0:
+        raise ValueError("THREE_PHASE_SHORT_CUE_SECONDS 不可小於 0")
+    return value
+
+
+def _complete_three_phase_with_preserved_short_cues(
+    asr: dict[str, Any], short_limit: float, *, cache_path: Path | None,
+    selection_path: Path | None, translation_path: Path | None,
+    state_path: Path | None,
+) -> dict[str, Any]:
+    """短句不占 N 額度，但仍保留、翻譯並交給成品剪輯。"""
+    api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY")
+    if not api_key:
+        raise RuntimeError("三段精選已開啟，但找不到 OPENROUTER_API_KEY")
+    from translate_srt_openrouter import (
+        DEFAULT_MODEL,
+        _cue_duration_seconds,
+        format_srt,
+        select_cues_three_phase,
+        three_phase_budget,
+        translate_cues,
+    )
+    cues = _cues_for_translation(asr)
+    if not cues:
+        raise RuntimeError("三段精選需要帶時間軸的 ASR cues")
+    short_cues = [
+        cue for cue in cues if _cue_duration_seconds(cue) <= short_limit
+    ]
+    short_ids = {int(cue["id"]) for cue in short_cues}
+    candidates = [cue for cue in cues if int(cue["id"]) not in short_ids]
+    if not candidates:
+        candidates, short_cues = cues, []
+    budget = three_phase_budget(candidates)
+    selection_primary = (
+        os.getenv("THREE_PHASE_SELECTION_MODEL", "z-ai/glm-5.2").strip()
+        or "z-ai/glm-5.2"
+    )
+    selection_reasoning = (
+        os.getenv("THREE_PHASE_SELECTION_REASONING", "minimal").strip()
+        or "minimal"
+    )
+    if len(candidates) < int(budget["total"]):
+        selected = {
+            "kept_cues": candidates,
+            "plot": "",
+            "phases": {},
+            "budget": budget,
+        }
+        selection_model: str | None = None
+        _log(
+            f"  [三段精選] 長句 {len(candidates)} 條 < 總上限 "
+            f"{budget['total']} 條，長句也完整保留"
+        )
+    else:
+        selection_models = [selection_primary]
+        fallback = os.getenv("THREE_PHASE_SELECTION_FALLBACK_MODEL", "").strip()
+        if fallback and fallback.casefold() != selection_primary.casefold():
+            selection_models.append(fallback)
+        selected = None
+        selection_model = selection_primary
+        for attempt, candidate_model in enumerate(selection_models):
+            try:
+                selected = select_cues_three_phase(
+                    candidates,
+                    api_key,
+                    candidate_model,
+                    reasoning_effort=selection_reasoning,
+                )
+                selection_model = candidate_model
+                break
+            except Exception as exc:
+                if attempt + 1 >= len(selection_models):
+                    raise RuntimeError(f"三段精選失敗：{exc}") from exc
+                _log_translation_fallback(candidate_model, selection_models[attempt + 1], exc)
+        if selected is None:
+            raise RuntimeError("三段精選沒有產生結果")
+    selected_ids = {int(cue["id"]) for cue in selected["kept_cues"]}
+    final_cues = [
+        cue for cue in cues
+        if int(cue["id"]) in selected_ids or int(cue["id"]) in short_ids
+    ]
+    model = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
+    translation_reasoning = (
+        os.getenv("THREE_PHASE_TRANSLATE_REASONING", "minimal").strip()
+        or "minimal"
+    )
+    translation_models = _translation_model_candidates(model)
+    translated = None
+    fallback_used = False
+    for attempt, candidate_model in enumerate(translation_models):
+        try:
+            translated = translate_cues(
+                final_cues,
+                api_key,
+                candidate_model,
+                batch_size=0,
+                checkpoint_path=translation_path,
+                reasoning_effort=translation_reasoning,
+            )
+            model = candidate_model
+            fallback_used = attempt > 0
+            break
+        except Exception as exc:
+            if attempt + 1 >= len(translation_models):
+                raise RuntimeError(f"精選字幕翻譯失敗：{exc}") from exc
+            _log_translation_fallback(candidate_model, translation_models[attempt + 1], exc)
+    if translated is None:
+        raise RuntimeError("精選字幕翻譯沒有產生結果")
+    result = dict(asr)
+    final_ids = {int(cue["id"]) for cue in final_cues}
+    result.update({
+        "cues": final_cues,
+        "source_cues": cues,
+        "original_srt": format_srt(final_cues),
+        "translated_srt": format_srt(translated),
+        "plot_summary": selected.get("plot") or "",
+        "three_phase_design": "",
+        "three_phase_selection": selected.get("phases") or {},
+        "three_phase_budget": budget,
+        "three_phase_budget_version": 5,
+        "selection_mode": "three_phase_short_cues_preserved",
+        "selective_kept_ids": [int(cue["id"]) for cue in final_cues],
+        "selective_dropped_ids": [
+            int(cue["id"]) for cue in cues if int(cue["id"]) not in final_ids
+        ],
+        "selective_is_full": len(final_cues) == len(cues),
+        "short_cues_preserved": len(short_cues),
+        "short_cue_seconds": short_limit,
+        "selection_model": selection_model,
+        "translation_model": model,
+        "translation_fallback_used": fallback_used,
+        "outcome": "translated",
+    })
+    if selection_path is not None:
+        _atomic_write_json(selection_path, {
+            "schema": "selection_v1",
+            "complete": True,
+            "mode": result["selection_mode"],
+            "budget_version": 5,
+            "budget": budget,
+            "model": selection_model,
+            "reasoning_effort": selection_reasoning,
+            "selected_long_ids": sorted(selected_ids),
+            "preserved_short_ids": sorted(short_ids),
+            "kept_ids": sorted(final_ids),
+            "dropped_ids": result["selective_dropped_ids"],
+            "is_full": result["selective_is_full"],
+            "plot": result["plot_summary"],
+            "phases": result["three_phase_selection"],
+        })
+    if cache_path is not None:
+        _atomic_write_json(cache_path, result)
+    _update_pipeline_state(
+        state_path,
+        selection={"complete": True, "model": selection_model, "kept": len(final_cues)},
+        translation={"complete": True, "model": model, "cue_count": len(final_cues)},
+    )
+    return result
+
+
 def run_asr_translate_local(proxy_path: Path) -> dict[str, Any]:
     """在目前 Python 環境執行 ASR + 翻譯（原始時間軸，不 retime）。"""
     import run_subtitle
@@ -1776,7 +1949,7 @@ def run_asr_only_local(proxy_path: Path) -> dict[str, Any]:
 
 
 def run_asr_only(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
-    """先 Demucs 後 ASR，不在此階段呼叫 OpenRouter。"""
+    """先分離人聲後 ASR，不在此階段呼叫 OpenRouter。"""
     from asr_audio import prepare_asr_audio
     from asr_backends import selected_asr_backend_name
 
@@ -3129,10 +3302,17 @@ def process_full_video_from_grid(
     source_budget: dict[str, Any] = {}
     source_under_budget = False
     if enable_three_phase_selection and source_cues:
-        from translate_srt_openrouter import three_phase_budget
+        from translate_srt_openrouter import _cue_duration_seconds, three_phase_budget
 
-        source_budget = three_phase_budget(source_cues)
-        source_under_budget = len(source_cues) < int(source_budget["total"])
+        short_limit = _three_phase_short_cue_limit()
+        long_cues = [
+            cue for cue in source_cues
+            if _cue_duration_seconds(cue) > short_limit
+        ]
+        # 全部都是短句時仍需有可用基準，避免空清單無法計算預算。
+        budget_cues = long_cues or source_cues
+        source_budget = three_phase_budget(budget_cues)
+        source_under_budget = len(budget_cues) < int(source_budget["total"])
     shorts_full_analysis_range = (
         pipeline_stage == "shorts"
         and embedded_asr is None
@@ -3162,8 +3342,8 @@ def process_full_video_from_grid(
                 and (
                     not enable_three_phase_selection
                     or (
-                        asr.get("selection_mode") == "three_phase_30s"
-                        and asr.get("three_phase_budget_version") == 4
+                        asr.get("selection_mode") == "three_phase_short_cues_preserved"
+                        and asr.get("three_phase_budget_version") == 5
                     )
                 )
             ):
@@ -3204,10 +3384,10 @@ def process_full_video_from_grid(
                             batch_size=0,
                         )
                         all_ids = [int(cue["id"]) for cue in source_cues]
-                        asr["selection_mode"] = "three_phase_30s"
+                        asr["selection_mode"] = "three_phase_short_cues_preserved"
                         asr["three_phase_selection_gate"] = "speech_under_30s"
                         asr["three_phase_budget"] = source_budget
-                        asr["three_phase_budget_version"] = 4
+                        asr["three_phase_budget_version"] = 5
                         asr["selective_is_full"] = True
                         asr["selective_kept_ids"] = all_ids
                         asr["selective_dropped_ids"] = []
@@ -3217,8 +3397,8 @@ def process_full_video_from_grid(
                                 {
                                     "schema": "selection_v1",
                                     "complete": True,
-                                    "mode": "three_phase_30s",
-                                    "budget_version": 4,
+                                    "mode": "three_phase_short_cues_preserved",
+                                    "budget_version": 5,
                                     "model": None,
                                     "is_full": True,
                                     "gate": "speech_under_30s",

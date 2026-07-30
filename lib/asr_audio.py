@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""ASR 共用音訊前處理：Demucs 分離人聲後才交給辨識器。"""
+"""ASR 共用音訊前處理：預設以 Mel-Band-RoFormer 分離人聲。"""
 
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 
@@ -30,13 +31,62 @@ def _demucs_device(torch_module) -> str:
     return requested
 
 
+def _roformer_device() -> str:
+    requested = os.getenv("ROFORMER_DEVICE", "auto").strip() or "auto"
+    from mel_band_roformer_vocal import _resolve_device
+
+    return _resolve_device(requested)
+
+
+def _prepare_roformer_audio(source: Path, work_dir: Path) -> Path:
+    """抽取 WAV 後以 Mel-Band-RoFormer 產出人聲軌。"""
+    from mel_band_roformer_vocal import separate_file
+
+    source_wav = work_dir / f"{source.stem}.asr-source.wav"
+    output_dir = work_dir / "roformer"
+    vocals_path = output_dir / f"{source_wav.stem}_vocals.wav"
+    if not vocals_path.is_file() or vocals_path.stat().st_size == 0:
+        source_wav.unlink(missing_ok=True)
+        print(f"  [RoFormer] 抽取音訊 → {source_wav.name}", flush=True)
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(source), "-vn", "-ac", "2", "-ar", "44100",
+                "-c:a", "pcm_s16le", str(source_wav),
+            ],
+            check=True,
+        )
+        if not source_wav.is_file() or source_wav.stat().st_size == 0:
+            raise RuntimeError("RoFormer 前處理沒有產出有效 WAV")
+        device = _roformer_device()
+        overlap = int(os.getenv("ROFORMER_OVERLAP", "2"))
+        print(
+            f"  [RoFormer] 分離人聲 → {vocals_path.name}（{device}）",
+            flush=True,
+        )
+        vocals_path, _ = separate_file(source_wav, output_dir, device, overlap)
+    return vocals_path
+
+
 def prepare_asr_audio(source: Path, work_dir: Path) -> Path:
-    """將來源媒體分離為 vocals.wav；關閉開關時原樣回傳。"""
+    """將來源媒體分離為 vocals.wav；關閉開關時原樣回傳。
+
+    預設使用 Mel-Band-RoFormer，保留 `ASR_VOCAL_SEPARATOR=demucs` 做舊流程
+    相容；`ENABLE_DEMUCS_ASR` 是既有 UI 開關名稱，語意為是否進行人聲分離。
+    """
     source = Path(source).resolve()
     if not demucs_asr_enabled():
         return source
     if not source.is_file():
         raise RuntimeError(f"ASR 來源不存在：{source}")
+
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    separator_kind = os.getenv("ASR_VOCAL_SEPARATOR", "roformer").strip().casefold()
+    if separator_kind in {"roformer", "mel-band-roformer", "melbandroformer"}:
+        return _prepare_roformer_audio(source, work_dir)
+    if separator_kind != "demucs":
+        raise ValueError("ASR_VOCAL_SEPARATOR 只能是 roformer 或 demucs")
 
     try:
         import torch
@@ -56,8 +106,6 @@ def prepare_asr_audio(source: Path, work_dir: Path) -> Path:
     if not 0.0 <= overlap < 1.0:
         raise ValueError("DEMUCS_OVERLAP 必須大於等於 0 且小於 1")
 
-    work_dir = Path(work_dir)
-    work_dir.mkdir(parents=True, exist_ok=True)
     output = work_dir / f"{source.stem}.asr-vocals.wav"
     temporary = output.with_name(f".{output.stem}.tmp{output.suffix}")
     output.unlink(missing_ok=True)
