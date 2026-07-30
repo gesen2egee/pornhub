@@ -1355,7 +1355,7 @@ def complete_three_phase_translation(
     if (
         (asr.get("translated_srt") or "").strip()
         and asr.get("selection_mode") == "three_phase_30s"
-        and asr.get("three_phase_budget_version") == 3
+        and asr.get("three_phase_budget_version") == 4
     ):
         return asr
     api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY")
@@ -1413,7 +1413,7 @@ def complete_three_phase_translation(
                     "complete": True,
                     "source_fingerprint": source_fingerprint,
                     "mode": "three_phase_30s",
-                    "budget_version": 3,
+                    "budget_version": 4,
                     "model": None,
                     "is_full": True,
                     "kept_ids": all_ids,
@@ -1458,7 +1458,7 @@ def complete_three_phase_translation(
         asr["three_phase_design"] = ""
         asr["three_phase_selection"] = {}
         asr["three_phase_budget"] = budget
-        asr["three_phase_budget_version"] = 3
+        asr["three_phase_budget_version"] = 4
         asr["selective_kept_ids"] = all_ids
         asr["selective_dropped_ids"] = []
         asr["selective_is_full"] = True
@@ -1487,7 +1487,7 @@ def complete_three_phase_translation(
             saved.get("schema") == "selection_v1"
             and saved.get("complete") is True
             and saved.get("source_fingerprint") == source_fingerprint
-            and saved.get("budget_version") == 3
+            and saved.get("budget_version") == 4
             and saved.get("model") == selection_primary
             and saved.get("reasoning_effort") == selection_reasoning
         ):
@@ -1535,7 +1535,7 @@ def complete_three_phase_translation(
                             "complete": True,
                             "source_fingerprint": source_fingerprint,
                             "mode": "three_phase_30s",
-                            "budget_version": 3,
+                            "budget_version": 4,
                             "model": model_name,
                             "reasoning_effort": selection_reasoning,
                             "is_full": len(kept_ids) == len(cues),
@@ -1601,7 +1601,7 @@ def complete_three_phase_translation(
     asr["three_phase_design"] = ""
     asr["three_phase_selection"] = selected["phases"]
     asr["three_phase_budget"] = selected["budget"]
-    asr["three_phase_budget_version"] = 3
+    asr["three_phase_budget_version"] = 4
     asr["selective_kept_ids"] = kept_ids
     asr["selective_dropped_ids"] = sorted(
         int(cue["id"]) for cue in cues if int(cue["id"]) not in set(kept_ids)
@@ -3155,7 +3155,7 @@ def process_full_video_from_grid(
                     not enable_three_phase_selection
                     or (
                         asr.get("selection_mode") == "three_phase_30s"
-                        and asr.get("three_phase_budget_version") == 3
+                        and asr.get("three_phase_budget_version") == 4
                     )
                 )
             ):
@@ -3198,7 +3198,7 @@ def process_full_video_from_grid(
                         asr["selection_mode"] = "three_phase_30s"
                         asr["three_phase_selection_gate"] = "speech_under_30s"
                         asr["three_phase_budget"] = source_budget
-                        asr["three_phase_budget_version"] = 3
+                        asr["three_phase_budget_version"] = 4
                         asr["selective_is_full"] = True
                         asr["selective_kept_ids"] = all_ids
                         asr["selective_dropped_ids"] = []
@@ -3209,7 +3209,7 @@ def process_full_video_from_grid(
                                     "schema": "selection_v1",
                                     "complete": True,
                                     "mode": "three_phase_30s",
-                                    "budget_version": 3,
+                                    "budget_version": 4,
                                     "model": None,
                                     "is_full": True,
                                     "gate": "speech_under_30s",

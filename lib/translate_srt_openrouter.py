@@ -116,7 +116,7 @@ def _cue_duration_seconds(cue: dict[str, Any]) -> float:
 
 
 def three_phase_budget(cues: list[dict[str, Any]]) -> dict[str, int | float]:
-    """以 30 秒／平均句長計算 N，回傳三篇加固定結尾篇的句數上限。"""
+    """以 30 秒／平均句長計算 N，回傳三篇與可選結尾篇的句數上限。"""
     if not cues:
         raise ValueError("三段精選需要至少一條字幕")
     total = sum(_cue_duration_seconds(cue) for cue in cues)
@@ -130,9 +130,9 @@ def three_phase_budget(cues: list[dict[str, Any]]) -> dict[str, int | float]:
         "average_seconds": average,
         "plot": n - 1,
         "middle": 2 * n,
-        "climax": 4 * n,
+        "climax": 3 * n,
         "ending": ending,
-        "total": 7 * n - 1 + ending,
+        "total": 6 * n - 1 + ending,
     }
 
 
@@ -888,29 +888,27 @@ def select_cues_three_phase(
     by_id = {int(cue["id"]): cue for cue in prepared}
     flat = _format_flat_lines(prepared)
     system = (
-        "你是精通蒙太奇與動態剪輯的成人影片精選剪輯師。完整閱讀原文後，"
-        "先梳理劇情，再規劃並選出可承接的三篇："
-        "情節篇、中段精華篇、高潮篇。所有說明、人物姓名、動名詞與專有稱呼"
-        "都必須嚴格使用繁體中文，禁止任何英文、日文、韓文、簡體或其他外語殘留。\n\n"
+        "你是精通蒙太奇與動態剪輯的成人影片精選剪輯師。完整閱讀所有 id|原文，"
+        "先梳理劇情，再規劃並選出可承接的三篇：情節篇、中段精華篇、高潮篇。\n\n"
+        "情節篇只用最少句數交代必要背景、人物關係；中段篇是自由剪取全片最有吸引力的精華，"
+        "可混合任何能挑動觀看者慾望的內容；高潮篇以最激烈節奏的精華集中爆發並收尾；"
+        "結尾篇只在需要時補上結尾前後呼應。\n\n"
         f"句數限制：情節篇最多 {budget['plot']} 句；中段篇最多 {budget['middle']} 句；"
-        f"高潮篇最多 {budget['climax']} 句；結尾篇固定使用、最多 {budget['ending']} 句；"
+        f"高潮篇最多 {budget['climax']} 句；可選結尾篇最多 {budget['ending']} 句；"
         f"情節＋中段合計最多 {budget['plot'] + budget['middle']} 句；全部最多 {budget['total']} 句。"
-        "結尾篇不可留空，請在需要交代結尾、前後呼應或餘韻的位置選取；若前段不足，優先以後段可承接內容補足，"
-        "盡量不要超過上限。"
+        "結尾篇不一定要，只有原片有交代結尾、前後呼應時才使用。\n\n"
+        "若前段不足，優先以後段可承接內容補足，盡量不要超過上限。"
         "每個 id 只能選一次，各篇合併後 id 必須嚴格遞增。\n\n"
-        "情節篇只用最少句數交代必要背景、人物關係、衝突與契約起點；"
-        "中段篇是自由剪取全片最有吸引力的精華，可混合任何能挑動觀看者慾望的內容；"
-        "高潮篇以最激烈節奏的精華集中爆發並收尾；結尾篇只在需要時補上結尾前後呼應。\n\n"
         "你精通蒙太奇與動態剪輯，必須刪除不必要支線與重複句，安排鏡頭節奏，"
-        "只讓留下的整篇劇情發展是能自圓其說、前後呼應。\n\n"
-        "整個剪輯重點不是完整呈現劇情，而是挑動觀看者慾望曲線，最後把慾望集中推到高潮。\n\n"
+        "只讓留下的整篇劇情發展是能自圓其說、前後呼應。整個剪輯重點不是完整呈現劇情，"
+        "而是挑動觀看者慾望曲線，最後把慾望集中推到高潮。\n\n"
         "你會看到依原片順序排列的 id|原文，請依 id 與上下文判斷連續性。\n\n"
-        "輸出格式完全固定，不要 Markdown、JSON 或額外說明；不要輸出劇情摘要、設計稿或任何篇章標題。\n"
+        "輸出格式完全固定，不要 Markdown、JSON 或額外說明：\n\n"
         "===SELECTION===\n"
         f"PLOT|最多 {budget['plot']} 個逗號分隔 id\n"
         f"MIDDLE|最多 {budget['middle']} 個逗號分隔 id\n"
         f"CLIMAX|最多 {budget['climax']} 個逗號分隔 id\n"
-        f"ENDING|最多 {budget['ending']} 個逗號分隔 id；結尾篇固定使用，不可留空"
+        f"ENDING|最多 {budget['ending']} 個逗號分隔 id；若不需要請留空"
     )
     effort = (
         reasoning_effort
@@ -946,7 +944,7 @@ def select_cues_three_phase(
     ids = [item for name in ("plot", "middle", "climax", "ending") for item in phases[name]]
     cumulative_middle = actual["plot"] + actual["middle"]
     if (
-        not all(actual[name] for name in ("plot", "middle", "climax", "ending"))
+        not all(actual[name] for name in ("plot", "middle", "climax"))
         or actual["plot"] > expected["plot"] + THREE_PHASE_SOFT_OVERAGE
         or actual["middle"] > expected["middle"] + THREE_PHASE_SOFT_OVERAGE
         or actual["climax"] > expected["climax"] + THREE_PHASE_SOFT_OVERAGE
