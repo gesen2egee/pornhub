@@ -102,7 +102,7 @@ HIGH_RANGE_KEYFRAME_PREROLL_SECONDS = 5.0
 HIGH_RANGE_KEYFRAME_POSTROLL_SECONDS = 1.0
 HIGH_RANGE_CONCURRENT_FRAGMENTS = 1
 ASR_STREAM_CHUNK_SECONDS = 180.0
-MOSS_CUE_MERGE_VERSION = 1
+MOSS_CUE_MERGE_VERSION = 2
 MOSS_DUPLICATE_CUE_GAP_SECONDS = 0.2
 
 # 多支來源管線可同時進入高畫質階段；此鎖使五條限制套用到整個程序，
@@ -1206,12 +1206,7 @@ def _make_merged_cue(items: list[dict[str, Any]], *, keep_first_text: bool = Fal
 
 
 def merge_moss_cues(cues: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """三階段整理 MOSS 小字幕，於精選前降低短句碎片化。
-
-    1. 連續的相同句只留一份文字、合併時間。
-    2. 連續短句（間隔 < 1.5 秒、無長句中斷）合併，文字以空格連接。
-    3. 短句群與最近長句相距 < 1.5 秒時併入長句，文字同樣以空格連接。
-    """
+    """只合併連續重複的 MOSS 字幕；短句完整保留交給三段精選。"""
     parsed: list[dict[str, Any]] = []
     for cue in cues:
         interval = _cue_interval(cue)
@@ -1238,74 +1233,14 @@ def merge_moss_cues(cues: list[dict[str, Any]]) -> list[dict[str, Any]]:
         else:
             deduplicated.append(item)
 
-    short_limit = _three_phase_short_cue_limit()
-    # 2. 短句群：只有上一項也是短句時才可延續，因此長句一定會中斷群組。
-    grouped: list[dict[str, Any]] = []
-    short_group: list[dict[str, Any]] = []
-    short_groups_merged = 0
-
-    def flush_short_group() -> None:
-        nonlocal short_group, short_groups_merged
-        if not short_group:
-            return
-        if len(short_group) > 1:
-            short_groups_merged += len(short_group) - 1
-        grouped.append(_make_merged_cue(short_group))
-        short_group = []
-
-    for item in deduplicated:
-        is_short = item["end"] - item["start"] <= short_limit
-        if (
-            is_short
-            and short_group
-            and item["start"] - short_group[-1]["end"] <= short_limit
-        ):
-            short_group.append(item)
-        elif is_short:
-            flush_short_group()
-            short_group = [item]
-        else:
-            flush_short_group()
-            grouped.append(item)
-    flush_short_group()
-
-    # 3. 把仍是短句的群併到時間上最近、且相距 < 1.5 秒的長句。
-    long_indices = [
-        index for index, item in enumerate(grouped)
-        if item["end"] - item["start"] > short_limit
-    ]
-    attached: dict[int, list[dict[str, Any]]] = {index: [] for index in long_indices}
-    unattached: list[dict[str, Any]] = []
-    for item in grouped:
-        if item["end"] - item["start"] > short_limit:
-            continue
-        nearby = []
-        for index in long_indices:
-            candidate = grouped[index]
-            distance = max(candidate["start"] - item["end"], item["start"] - candidate["end"], 0.0)
-            if distance <= short_limit:
-                nearby.append((distance, index))
-        if nearby:
-            _, nearest = min(nearby)
-            attached[nearest].append(item)
-        else:
-            unattached.append(item)
-
-    final_items: list[dict[str, Any]] = list(unattached)
-    attached_count = 0
-    for index in long_indices:
-        members = [grouped[index], *attached[index]]
-        attached_count += len(attached[index])
-        final_items.append(_make_merged_cue(sorted(members, key=lambda item: item["start"])))
-    final_items.sort(key=lambda item: (item["start"], item["end"]))
     result: list[dict[str, Any]] = []
-    for index, item in enumerate(final_items, 1):
+    for index, item in enumerate(deduplicated, 1):
         cue = dict(item["cue"])
         cue["id"] = index
         result.append(cue)
     _log(
         f"  [MOSS 字幕合併] {len(cues)} → {len(result)}；"
-        f"重複={duplicate_links}、短句群={short_groups_merged}、併長句={attached_count}"
+        f"連續重複={duplicate_links}；短句完整保留供三段精選"
     )
     return result
 
@@ -1826,9 +1761,9 @@ def complete_three_phase_translation(
 
 
 def _three_phase_short_cue_limit() -> float:
-    """回傳不計入三段精選額度、但仍保留的短句秒數。"""
+    """回傳要排除三段精選額度的短句秒數；預設 0=全部送入精選。"""
     try:
-        value = float(os.getenv("THREE_PHASE_SHORT_CUE_SECONDS", "1.5"))
+        value = float(os.getenv("THREE_PHASE_SHORT_CUE_SECONDS", "0"))
     except ValueError as exc:
         raise ValueError("THREE_PHASE_SHORT_CUE_SECONDS 必須是秒數") from exc
     if value < 0:
@@ -3514,13 +3449,30 @@ def process_full_video_from_grid(
             try:
                 asr = _read_json_dict(asr_source_path)
                 if asr.get("moss_cue_merge_version") != MOSS_CUE_MERGE_VERSION:
-                    from translate_srt_openrouter import format_srt
+                    previous_merge = asr.get("moss_cue_merge_version")
+                    if previous_merge is not None:
+                        # v1 已把短句併入其他字幕，無法由其輸出還原；必須從
+                        # MOSS 原始結果重跑，才能讓全部短句進入新三段精選規則。
+                        _log("  [ASR] 舊字幕已合併短句，重新 MOSS 以還原完整短句")
+                        asr, duration = run_streamed_asr(
+                            video_url,
+                            work_dir,
+                            video_stem,
+                            moss_worker=moss_worker,
+                            max_duration=analysis_limit_seconds,
+                            checkpoint_path=asr_source_path,
+                            state_path=state_path,
+                        )
+                        asr["source_duration"] = duration
+                        _atomic_write_json(asr_source_path, _source_asr_payload(asr, duration))
+                    else:
+                        from translate_srt_openrouter import format_srt
 
-                    asr["cues"] = merge_moss_cues(asr.get("cues") or [])
-                    asr["original_srt"] = format_srt(asr["cues"])
-                    asr["moss_cue_merge_version"] = MOSS_CUE_MERGE_VERSION
-                    _atomic_write_json(asr_source_path, asr)
-                    _log("  [ASR] 已將舊 MOSS 字幕套用三階段合併")
+                        asr["cues"] = merge_moss_cues(asr.get("cues") or [])
+                        asr["original_srt"] = format_srt(asr["cues"])
+                        asr["moss_cue_merge_version"] = MOSS_CUE_MERGE_VERSION
+                        _atomic_write_json(asr_source_path, asr)
+                        _log("  [ASR] 已將舊 MOSS 字幕套用重複句合併")
                 if not enable_translation:
                     asr["translated_srt"] = ""
                     asr["outcome"] = "transcribed"

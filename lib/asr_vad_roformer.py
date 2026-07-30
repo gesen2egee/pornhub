@@ -179,7 +179,7 @@ def _time_map(compact_start: float, compact_end: float, start: float, end: float
 
 
 def prepare_vad_roformer_audio(source: Path, work_dir: Path) -> VadRoformerAudio:
-    """只分離 VAD 人聲範圍，組成不超過三分鐘「VAD 後」時長的 MOSS 音檔。"""
+    """先合併 VAD 人聲，再對每個最多三分鐘音檔做一次 RoFormer 分離。"""
     import librosa
     import soundfile as sf
     from mel_band_roformer_vocal import SAMPLE_RATE as ROFORMER_RATE, _load_model, _resolve_device, _separate
@@ -193,7 +193,7 @@ def prepare_vad_roformer_audio(source: Path, work_dir: Path) -> VadRoformerAudio
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
         paths = [Path(item["path"]) for item in payload.get("chunks") or []]
         if (
-            payload.get("schema") == "vad_roformer_v2"
+            payload.get("schema") == "vad_roformer_v3"
             and float(payload.get("edge_padding_seconds", -1)) == expected_padding
             and paths
             and all(path.is_file() and path.stat().st_size > 0 for path in paths)
@@ -217,7 +217,7 @@ def prepare_vad_roformer_audio(source: Path, work_dir: Path) -> VadRoformerAudio
         raise ValueError("MOSS_CHUNK_SECONDS 必須為正數，VAD_COMPACT_GAP_SECONDS 不可小於 0")
     output_dir = work_dir / "vad-roformer-moss"
     output_dir.mkdir(parents=True, exist_ok=True)
-    chunks: list[dict[str, Any]] = []
+    raw_chunks: list[dict[str, Any]] = []
     parts: list[np.ndarray] = []
     mapping: list[dict[str, float]] = []
     compact_duration = 0.0
@@ -226,58 +226,72 @@ def prepare_vad_roformer_audio(source: Path, work_dir: Path) -> VadRoformerAudio
         nonlocal parts, mapping, compact_duration
         if not parts:
             return
-        path = output_dir / f"speech-{len(chunks) + 1:03d}.wav"
+        path = output_dir / f"compact-{len(raw_chunks) + 1:03d}.source.wav"
         merged = np.concatenate(parts)
         sf.write(path, merged, SAMPLE_RATE, subtype="PCM_16")
-        chunks.append({"path": str(path), "duration": round(len(merged) / SAMPLE_RATE, 6), "mapping": mapping})
+        raw_chunks.append({
+            "source_path": path,
+            "duration": round(len(merged) / SAMPLE_RATE, 6),
+            "mapping": mapping,
+        })
         parts, mapping, compact_duration = [], [], 0.0
 
+    # 先按 VAD 後時長組成最多三分鐘的原始人聲範圍；RoFormer 不在此階段
+    # 逐小段載入，避免小段邊界讓分離結果與 MOSS 上下文破碎。
+    for speech_start, speech_end in speech_ranges:
+        start = speech_start
+        while start < speech_end - 0.001:
+            gap = gap_seconds if parts else 0.0
+            capacity = chunk_seconds - compact_duration - gap
+            if capacity <= 0.01:
+                flush()
+                continue
+            end = min(speech_end, start + capacity)
+            source_piece = audio[round(start * SAMPLE_RATE):round(end * SAMPLE_RATE)]
+            if not len(source_piece):
+                start = end
+                continue
+            if gap:
+                parts.append(np.zeros(round(gap * SAMPLE_RATE), dtype=np.float32))
+                compact_duration += gap
+            compact_start = compact_duration
+            parts.append(source_piece)
+            compact_duration += len(source_piece) / SAMPLE_RATE
+            mapping.append(_time_map(compact_start, compact_duration, start, end))
+            start = end
+    flush()
+
+    chunks: list[dict[str, Any]] = []
     device = _resolve_device(os.getenv("ROFORMER_DEVICE", "auto").strip() or "auto")
     overlap = int(os.getenv("ROFORMER_OVERLAP", "2"))
     with gpu_inference_lock("Mel-Band-RoFormer"):
         model = _load_model(device)
         try:
-            for speech_start, speech_end in speech_ranges:
-                # 單一 VAD 段也不可突破三分鐘「壓縮後音檔」上限。
-                start = speech_start
-                while start < speech_end - 0.001:
-                    gap = gap_seconds if parts else 0.0
-                    capacity = chunk_seconds - compact_duration - gap
-                    if capacity <= 0.01:
-                        flush()
-                        continue
-                    end = min(speech_end, start + capacity)
-                    source_piece = audio[round(start * SAMPLE_RATE):round(end * SAMPLE_RATE)]
-                    if not len(source_piece):
-                        start = end
-                        continue
-                    stereo = librosa.resample(
-                        np.repeat(source_piece[None, :], 2, axis=0),
-                        orig_sr=SAMPLE_RATE, target_sr=ROFORMER_RATE, axis=-1,
-                    ).astype(np.float32, copy=False)
-                    vocals = _separate(model, stereo, device, overlap=overlap)
-                    vocals_16k = librosa.resample(
-                        vocals.mean(axis=0), orig_sr=ROFORMER_RATE, target_sr=SAMPLE_RATE,
-                    ).astype(np.float32, copy=False)
-                    duration = len(vocals_16k) / SAMPLE_RATE
-                    if parts and compact_duration + gap + duration > chunk_seconds + 0.001:
-                        flush()
-                        continue
-                    if gap:
-                        parts.append(np.zeros(round(gap * SAMPLE_RATE), dtype=np.float32))
-                        compact_duration += gap
-                    compact_start = compact_duration
-                    parts.append(vocals_16k)
-                    compact_duration += duration
-                    mapping.append(_time_map(compact_start, compact_duration, start, end))
-                    start = end
-            flush()
+            for raw_chunk in raw_chunks:
+                compact, source_rate = sf.read(raw_chunk["source_path"], dtype="float32")
+                if source_rate != SAMPLE_RATE:
+                    raise RuntimeError(f"VAD 合併音檔採樣率不符：{source_rate}")
+                stereo = librosa.resample(
+                    np.repeat(compact[None, :], 2, axis=0),
+                    orig_sr=SAMPLE_RATE, target_sr=ROFORMER_RATE, axis=-1,
+                ).astype(np.float32, copy=False)
+                vocals = _separate(model, stereo, device, overlap=overlap)
+                vocals_16k = librosa.resample(
+                    vocals.mean(axis=0), orig_sr=ROFORMER_RATE, target_sr=SAMPLE_RATE,
+                ).astype(np.float32, copy=False)
+                path = output_dir / f"speech-{len(chunks) + 1:03d}.wav"
+                sf.write(path, vocals_16k, SAMPLE_RATE, subtype="PCM_16")
+                chunks.append({
+                    "path": str(path),
+                    "duration": round(len(vocals_16k) / SAMPLE_RATE, 6),
+                    "mapping": raw_chunk["mapping"],
+                })
         finally:
             del model
             _release_cuda()
 
     payload = {
-        "schema": "vad_roformer_v2",
+        "schema": "vad_roformer_v3",
         "edge_padding_seconds": expected_padding,
         "chunks": chunks,
         "singing_ranges": singing_ranges,
