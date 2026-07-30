@@ -102,6 +102,8 @@ HIGH_RANGE_KEYFRAME_PREROLL_SECONDS = 5.0
 HIGH_RANGE_KEYFRAME_POSTROLL_SECONDS = 1.0
 HIGH_RANGE_CONCURRENT_FRAGMENTS = 1
 ASR_STREAM_CHUNK_SECONDS = 180.0
+MOSS_CUE_MERGE_VERSION = 1
+MOSS_DUPLICATE_CUE_GAP_SECONDS = 0.2
 
 # 多支來源管線可同時進入高畫質階段；此鎖使五條限制套用到整個程序，
 # 而非每支影片各自五條而意外放大。
@@ -259,6 +261,7 @@ def _source_asr_payload(
         "cues": cues,
         "source_duration": source_duration,
         "singing_ranges": list(asr.get("singing_ranges") or []),
+        "moss_cue_merge_version": asr.get("moss_cue_merge_version"),
     }
 
 
@@ -1167,6 +1170,146 @@ def cues_to_entries(cues: list[dict[str, Any]]) -> list[dict]:
     return entries
 
 
+def _cue_interval(cue: dict[str, Any]) -> tuple[float, float] | None:
+    try:
+        start_text, end_text = str(cue["time"]).split("-->", 1)
+        start = segment_cutter.parse_srt_time(start_text.strip())
+        end = segment_cutter.parse_srt_time(end_text.strip())
+    except (KeyError, ValueError):
+        return None
+    return (start, end) if end > start else None
+
+
+def _normalise_cue_text(text: Any) -> str:
+    """供重複句比對使用；保留原文字於實際輸出。"""
+    without_speaker = re.sub(r"\[[^\]]+\]", "", str(text or ""))
+    return re.sub(r"[^\w\u3040-\u30ff\u3400-\u9fff]", "", without_speaker).casefold()
+
+
+def _join_cue_texts(items: list[dict[str, Any]]) -> str:
+    """依時間順序把多條字幕接為一條，符合精選／翻譯輸入格式。"""
+    texts = [re.sub(r"\s+", " ", str(item["text"] or "")).strip() for item in items]
+    return " ".join(text for text in texts if text)
+
+
+def _make_merged_cue(items: list[dict[str, Any]], *, keep_first_text: bool = False) -> dict[str, Any]:
+    first = items[0]
+    start = min(float(item["start"]) for item in items)
+    end = max(float(item["end"]) for item in items)
+    cue = dict(first["cue"])
+    cue["time"] = (
+        f"{segment_cutter.format_srt_time(start)} --> "
+        f"{segment_cutter.format_srt_time(end)}"
+    )
+    cue["text"] = str(first["text"] or "") if keep_first_text else _join_cue_texts(items)
+    return {"cue": cue, "start": start, "end": end, "text": cue["text"]}
+
+
+def merge_moss_cues(cues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """三階段整理 MOSS 小字幕，於精選前降低短句碎片化。
+
+    1. 連續的相同句只留一份文字、合併時間。
+    2. 連續短句（間隔 < 1.5 秒、無長句中斷）合併，文字以空格連接。
+    3. 短句群與最近長句相距 < 1.5 秒時併入長句，文字同樣以空格連接。
+    """
+    parsed: list[dict[str, Any]] = []
+    for cue in cues:
+        interval = _cue_interval(cue)
+        if interval is None:
+            continue
+        start, end = interval
+        parsed.append({"cue": dict(cue), "start": start, "end": end, "text": str(cue.get("text") or "")})
+    parsed.sort(key=lambda item: (item["start"], item["end"]))
+    if not parsed:
+        return []
+
+    # 1. 同一句連續重複：保留第一份文字，時間擴展到最後一次。
+    deduplicated: list[dict[str, Any]] = []
+    duplicate_links = 0
+    for item in parsed:
+        if (
+            deduplicated
+            and _normalise_cue_text(item["text"])
+            and _normalise_cue_text(item["text"]) == _normalise_cue_text(deduplicated[-1]["text"])
+            and item["start"] - deduplicated[-1]["end"] <= MOSS_DUPLICATE_CUE_GAP_SECONDS
+        ):
+            deduplicated[-1] = _make_merged_cue([deduplicated[-1], item], keep_first_text=True)
+            duplicate_links += 1
+        else:
+            deduplicated.append(item)
+
+    short_limit = _three_phase_short_cue_limit()
+    # 2. 短句群：只有上一項也是短句時才可延續，因此長句一定會中斷群組。
+    grouped: list[dict[str, Any]] = []
+    short_group: list[dict[str, Any]] = []
+    short_groups_merged = 0
+
+    def flush_short_group() -> None:
+        nonlocal short_group, short_groups_merged
+        if not short_group:
+            return
+        if len(short_group) > 1:
+            short_groups_merged += len(short_group) - 1
+        grouped.append(_make_merged_cue(short_group))
+        short_group = []
+
+    for item in deduplicated:
+        is_short = item["end"] - item["start"] <= short_limit
+        if (
+            is_short
+            and short_group
+            and item["start"] - short_group[-1]["end"] <= short_limit
+        ):
+            short_group.append(item)
+        elif is_short:
+            flush_short_group()
+            short_group = [item]
+        else:
+            flush_short_group()
+            grouped.append(item)
+    flush_short_group()
+
+    # 3. 把仍是短句的群併到時間上最近、且相距 < 1.5 秒的長句。
+    long_indices = [
+        index for index, item in enumerate(grouped)
+        if item["end"] - item["start"] > short_limit
+    ]
+    attached: dict[int, list[dict[str, Any]]] = {index: [] for index in long_indices}
+    unattached: list[dict[str, Any]] = []
+    for item in grouped:
+        if item["end"] - item["start"] > short_limit:
+            continue
+        nearby = []
+        for index in long_indices:
+            candidate = grouped[index]
+            distance = max(candidate["start"] - item["end"], item["start"] - candidate["end"], 0.0)
+            if distance <= short_limit:
+                nearby.append((distance, index))
+        if nearby:
+            _, nearest = min(nearby)
+            attached[nearest].append(item)
+        else:
+            unattached.append(item)
+
+    final_items: list[dict[str, Any]] = list(unattached)
+    attached_count = 0
+    for index in long_indices:
+        members = [grouped[index], *attached[index]]
+        attached_count += len(attached[index])
+        final_items.append(_make_merged_cue(sorted(members, key=lambda item: item["start"])))
+    final_items.sort(key=lambda item: (item["start"], item["end"]))
+    result: list[dict[str, Any]] = []
+    for index, item in enumerate(final_items, 1):
+        cue = dict(item["cue"])
+        cue["id"] = index
+        result.append(cue)
+    _log(
+        f"  [MOSS 字幕合併] {len(cues)} → {len(result)}；"
+        f"重複={duplicate_links}、短句群={short_groups_merged}、併長句={attached_count}"
+    )
+    return result
+
+
 def _net_dialogue_excluding_singing(
     entries: list[dict], singing_ranges: list[tuple[float, float]] | list[list[float]],
 ) -> float:
@@ -2006,7 +2149,13 @@ def run_asr_only(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
     if backend_name in {"voxtral", "grok-stt", "whisper"}:
         return run_asr_only_local(asr_audio)
     if "moss" in str(current).casefold() and current.exists():
-        return run_asr_only_local(asr_audio)
+        payload = run_asr_only_local(asr_audio)
+        payload["cues"] = merge_moss_cues(payload.get("cues") or [])
+        from translate_srt_openrouter import format_srt
+
+        payload["original_srt"] = format_srt(payload["cues"])
+        payload["moss_cue_merge_version"] = MOSS_CUE_MERGE_VERSION
+        return payload
 
     moss_python = Path(os.getenv("MOSS_PYTHON", str(DEFAULT_MOSS_PYTHON)))
     if not moss_python.is_file():
@@ -2033,6 +2182,11 @@ def run_asr_only(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
         raise RuntimeError(f"MOSS ASR 子程序失敗，ExitCode={proc.returncode}")
     payload = json.loads(result_path.read_text(encoding="utf-8"))
     result_path.unlink(missing_ok=True)
+    payload["cues"] = merge_moss_cues(payload.get("cues") or [])
+    from translate_srt_openrouter import format_srt
+
+    payload["original_srt"] = format_srt(payload["cues"])
+    payload["moss_cue_merge_version"] = MOSS_CUE_MERGE_VERSION
     return payload
 
 
@@ -2092,6 +2246,7 @@ def _run_vad_roformer_moss(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
                 ),
                 "text": str(cue.get("text") or ""),
             })
+    cues = merge_moss_cues(cues)
     return {
         "language": ",".join(languages) or "multilingual",
         "original_srt": format_srt(cues) if cues else "",
@@ -2102,6 +2257,7 @@ def _run_vad_roformer_moss(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
         "speech_ranges": [list(item) for item in prepared.speech_ranges],
         "asr_audio_mode": "firered_vad_roformer_3min",
         "asr_chunk_count": len(prepared.chunks),
+        "moss_cue_merge_version": MOSS_CUE_MERGE_VERSION,
     }
 
 
@@ -2471,6 +2627,7 @@ def run_streamed_asr(
                 "end": ranges[index - 1][1],
                 "result": result,
             }
+        merged = merge_moss_cues(merged)
         return {
             "schema": "asr_source_v1",
             "complete": complete,
@@ -2484,6 +2641,7 @@ def run_streamed_asr(
             "total_chunks": len(ranges),
             "completed_chunks": sorted(completed),
             "chunks": chunks,
+            "moss_cue_merge_version": MOSS_CUE_MERGE_VERSION,
         }
 
     def persist_asr_checkpoint() -> None:
@@ -3353,6 +3511,14 @@ def process_full_video_from_grid(
         ):
             try:
                 asr = _read_json_dict(asr_source_path)
+                if asr.get("moss_cue_merge_version") != MOSS_CUE_MERGE_VERSION:
+                    from translate_srt_openrouter import format_srt
+
+                    asr["cues"] = merge_moss_cues(asr.get("cues") or [])
+                    asr["original_srt"] = format_srt(asr["cues"])
+                    asr["moss_cue_merge_version"] = MOSS_CUE_MERGE_VERSION
+                    _atomic_write_json(asr_source_path, asr)
+                    _log("  [ASR] 已將舊 MOSS 字幕套用三階段合併")
                 if not enable_translation:
                     asr["translated_srt"] = ""
                     asr["outcome"] = "transcribed"
