@@ -2,7 +2,7 @@
 """02_preview_videos 預覽管線。
 
 每次下載 3 分鐘低畫質 → MOSS ASR；累計對話達 30 秒才剪片，否則繼續取下一段。
-若影片結束仍未達門檻則發布完整影片 → Grok 4.5 minimal 翻譯 → 自動 enhance → 軟 SRT。
+若影片結束仍未達門檻則發布完整影片 → Grok 4.3 minimal（失敗改 Grok 4.5 minimal）翻譯 → 自動 enhance → 軟 SRT。
 """
 
 from __future__ import annotations
@@ -33,11 +33,15 @@ def _apply_preview_env() -> None:
     )
     os.environ.setdefault(
         "OPENROUTER_MODEL",
-        os.getenv("PREVIEW_OPENROUTER_MODEL", "x-ai/grok-4.5"),
+        os.getenv("PREVIEW_OPENROUTER_MODEL", "x-ai/grok-4.3"),
     )
     os.environ.setdefault(
         "TRANSLATE_REASONING_EFFORT",
         os.getenv("PREVIEW_TRANSLATE_REASONING", "minimal"),
+    )
+    os.environ.setdefault(
+        "TRANSLATE_FALLBACK_MODEL",
+        os.getenv("PREVIEW_TRANSLATE_FALLBACK_MODEL", "x-ai/grok-4.5"),
     )
 
 

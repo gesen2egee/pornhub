@@ -1237,7 +1237,9 @@ def _filter_cues_by_ids(
 def _translation_model_candidates(primary: str) -> list[str]:
     """回傳主要模型與至多一個失敗後備模型。"""
     models = [primary]
-    fallback = os.getenv("TRANSLATE_FALLBACK_MODEL", "").strip()
+    fallback = os.getenv(
+        "TRANSLATE_FALLBACK_MODEL", "x-ai/grok-4.5"
+    ).strip()
     if fallback and fallback.casefold() != primary.casefold():
         models.append(fallback)
     return models
@@ -3094,7 +3096,7 @@ def process_full_video_from_grid(
                 selective_done = True
             else:
                 _log(
-                    "  [三段精選] 等完整 240P/MOSS 後送 Grok 4.5（失敗改 Step 3.7 Flash）："
+                    "  [三段精選] 等完整 240P/MOSS 後送 Grok 4.3 minimal（失敗改 Grok 4.5 minimal）："
                     "30 秒 N 三段、保留完整選段…"
                     if enable_three_phase_selection
                     else "  [精選下載] 先劇情整理 + 選擇性翻譯（歌詞則完整翻譯）…"

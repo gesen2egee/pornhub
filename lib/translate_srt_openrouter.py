@@ -16,8 +16,8 @@ import requests
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-# 所有未指定層級的翻譯預設使用 Grok 4.5；各層可改用 Step 3.7 Flash 作為後備。
-DEFAULT_MODEL = "x-ai/grok-4.5"
+# 所有未指定層級的翻譯預設使用 Grok 4.3；失敗時由 Grok 4.5 作為後備。
+DEFAULT_MODEL = "x-ai/grok-4.3"
 # 預設每 60 條一批；設 0 或 TRANSLATE_BATCH_SIZE=0 則整份一次。
 DEFAULT_BATCH_SIZE = 60
 THREE_PHASE_SOFT_OVERAGE = 2

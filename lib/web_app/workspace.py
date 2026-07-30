@@ -127,7 +127,7 @@ def default_pipeline_options(mode: str) -> dict[str, Any]:
         "video_height": 480,
         "chosen_height": 1080,
         "asr_backend": "moss",
-        "translation_model": "x-ai/grok-4.5",
+        "translation_model": "x-ai/grok-4.3",
         "reasoning_effort": "minimal",
         "trim_threshold": 30.0,
         "segment_gap": 1.5,
