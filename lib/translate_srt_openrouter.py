@@ -302,10 +302,14 @@ def _translate_batch(
     model: str,
     session: requests.Session,
     stats_sink: list[dict[str, Any]] | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict[int, str]:
     items = [{"id": cue["id"], "text": cue["text"]} for cue in cues]
     max_tokens = int(os.getenv("TRANSLATE_MAX_TOKENS", "32000"))
-    effort = os.getenv("TRANSLATE_REASONING_EFFORT", "minimal").strip() or "minimal"
+    effort = (
+        reasoning_effort
+        or os.getenv("TRANSLATE_REASONING_EFFORT", "minimal")
+    ).strip() or "minimal"
     body_template = {
         "model": model,
         "messages": [
@@ -451,6 +455,7 @@ def translate_cues(
     batch_size: int = DEFAULT_BATCH_SIZE,
     *,
     checkpoint_path: Path | None = None,
+    reasoning_effort: str | None = None,
 ) -> list[dict[str, Any]]:
     """翻譯字幕。預設每 batch_size 條一批；batch_size<=0 則整份一次。
 
@@ -485,6 +490,10 @@ def translate_cues(
             pass
     step = len(translated_cues) if batch_size <= 0 else max(1, batch_size)
     single_shot = step >= len(translated_cues)
+    requested_effort = (
+        reasoning_effort
+        or os.getenv("TRANSLATE_REASONING_EFFORT", "minimal")
+    ).strip() or "minimal"
     stats_sink: list[dict[str, Any]] = []
     t_all = time.perf_counter()
     fingerprint = _cue_fingerprint(cues)
@@ -496,6 +505,7 @@ def translate_cues(
                 checkpoint.get("schema") == "translation_v1"
                 and checkpoint.get("source_fingerprint") == fingerprint
                 and checkpoint.get("model") == model
+                and checkpoint.get("reasoning_effort") == requested_effort
             ):
                 saved_translations = {
                     int(cue_id): str(text)
@@ -516,12 +526,15 @@ def translate_cues(
                 if int(cue["id"]) not in saved_translations
             ]
             if missing_batch:
+                batch_kwargs: dict[str, Any] = {"stats_sink": stats_sink}
+                if reasoning_effort is not None:
+                    batch_kwargs["reasoning_effort"] = reasoning_effort
                 translations = _translate_batch(
                     missing_batch,
                     api_key,
                     model,
                     session,
-                    stats_sink=stats_sink,
+                    **batch_kwargs,
                 )
                 saved_translations.update(translations)
                 if checkpoint_path is not None:
@@ -531,6 +544,7 @@ def translate_cues(
                             "schema": "translation_v1",
                             "source_fingerprint": fingerprint,
                             "model": model,
+                            "reasoning_effort": requested_effort,
                             "complete": len(saved_translations)
                             >= len(translated_cues),
                             "completed_ids": sorted(saved_translations),
@@ -574,7 +588,7 @@ def translate_cues(
     cost_sum = sum(float(c) for c in costs) if costs else None
     LAST_TRANSLATE_STATS = {
         "model": model,
-        "reasoning_effort": os.getenv("TRANSLATE_REASONING_EFFORT", "minimal"),
+        "reasoning_effort": requested_effort,
         "format": "flat_id_pipe",
         "batch_size": 0 if single_shot else step,
         "cues": len(cues),
@@ -840,7 +854,7 @@ def translate_cues_selective(
 
 
 def _parse_three_phase_selection(raw: str) -> tuple[str, dict[str, list[int]]]:
-    """解析模型的三段設計稿與固定數量選句。"""
+    """解析模型的三段選句；相容舊版可能帶有的設計稿。"""
     plot_match = re.search(
         r"===PLOT===\s*(.*?)(?====SELECTION===|\Z)",
         raw or "",
@@ -864,8 +878,10 @@ def select_cues_three_phase(
     cues: list[dict[str, Any]],
     api_key: str,
     model: str = DEFAULT_MODEL,
+    *,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
-    """先由模型寫三段設計，再依 30 秒 N 預算選出連續可承接字幕。"""
+    """依 30 秒 N 預算選出連續可承接字幕，只要求固定選句格式。"""
     global LAST_TRANSLATE_STATS
     budget = three_phase_budget(cues)
     prepared = strip_speaker_labels(cues)
@@ -889,17 +905,17 @@ def select_cues_three_phase(
         "只讓留下的整篇劇情發展是能自圓其說、前後呼應。\n\n"
         "整個剪輯重點不是完整呈現劇情，而是挑動觀看者慾望曲線，最後把慾望集中推到高潮。\n\n"
         "你會看到依原片順序排列的 id|原文，請依 id 與上下文判斷連續性。\n\n"
-        "輸出格式完全固定，不要 Markdown、JSON 或額外說明：\n"
-        "===PLOT===\n"
-        "以繁體中文寫設計稿，依序為【情節篇設計】、【中段精華篇設計】、【高潮篇設計】；"
-        "必須寫【結尾篇設計】。每段 80–150 字，說明該段如何服務慾望、節奏與前後承接。\n"
+        "輸出格式完全固定，不要 Markdown、JSON 或額外說明；不要輸出劇情摘要、設計稿或任何篇章標題。\n"
         "===SELECTION===\n"
         f"PLOT|最多 {budget['plot']} 個逗號分隔 id\n"
         f"MIDDLE|最多 {budget['middle']} 個逗號分隔 id\n"
         f"CLIMAX|最多 {budget['climax']} 個逗號分隔 id\n"
         f"ENDING|最多 {budget['ending']} 個逗號分隔 id；結尾篇固定使用，不可留空"
     )
-    effort = os.getenv("TRANSLATE_REASONING_EFFORT", "minimal").strip() or "minimal"
+    effort = (
+        reasoning_effort
+        or os.getenv("THREE_PHASE_SELECTION_REASONING", "minimal")
+    ).strip() or "minimal"
     if effort == "none" and "grok-4.5" in model.casefold():
         effort = "minimal"
     body = {
@@ -948,13 +964,21 @@ def select_cues_three_phase(
     LAST_TRANSLATE_STATS = {
         "model": data.get("model") or model,
         "mode": "three_phase_30s",
+        "reasoning_effort": effort,
         "n": budget["n"],
         "phase_counts": actual,
         "kept": len(ids),
         "api_calls": 1,
         "usage": usage,
     }
-    return {"plot": plot, "phases": phases, "kept_cues": [by_id[item] for item in ids], "raw": raw, "budget": budget, "usage": usage}
+    return {
+        "plot": "",
+        "phases": phases,
+        "kept_cues": [by_id[item] for item in ids],
+        "raw": raw,
+        "budget": budget,
+        "usage": usage,
+    }
 
 
 def main() -> None:

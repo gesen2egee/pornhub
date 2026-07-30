@@ -37,9 +37,9 @@ output/
 | 流程 | 放入 | 畫質 | 字幕 | enhance | 輸出 |
 |------|------|------|------|---------|------|
 | 預覽 | `02_preview_videos` 九宮格或含 URL 影片 | 一次下載 BS 段低畫質（預設 3×3 分鐘）；語音>30s 剪片否則全留 | Demucs 人聲 → 批次 MOSS → 一次 Grok 4.3 minimal（失敗改 Grok 4.5 minimal）精選翻譯 | 否 | 同目錄 |
-| Shorts | `02_shorts` 九宮格或含 URL 影片 | 先分析前 9 分鐘 240P；純語音不足 30 秒保留前 9 分鐘，否則依三段精選抓來源最高畫質片段 | MOSS → Grok 4.3 minimal 三段（失敗改 Grok 4.5 minimal）；原字幕少於 7.5N 直接完整翻譯 | 判斷 | 同目錄 |
-| 標準全片 | `03_videos` 九宮格或含 URL 影片 | 240P 分析後依選段抓 480P | 240P/MOSS → **Grok 4.3 minimal（失敗改 Grok 4.5 minimal）30 秒三段** → enhance＋crossfade | 判斷 | `03_videos` |
-| 精選 | `05_chosen` 九宮格或影片 | 240P 分析後依選段抓 1080P | 240P/MOSS → **Grok 4.3 minimal（失敗改 Grok 4.5 minimal）30 秒三段** → enhance＋crossfade | 判斷 | `06_good` |
+| Shorts | `02_shorts` 九宮格或含 URL 影片 | 先分析前 9 分鐘 240P；純語音不足 30 秒保留前 9 分鐘，否則依三段精選抓來源最高畫質片段 | MOSS → GLM 5.2 minimal 三段精選 → Grok 4.3 none 翻譯（失敗改 Grok 4.5）；原字幕少於 7.5N 直接完整翻譯 | 判斷 | 同目錄 |
+| 標準全片 | `03_videos` 九宮格或含 URL 影片 | 240P 分析後依選段抓 480P | 240P/MOSS → **GLM 5.2 minimal 精選、Grok 4.3 none 翻譯（失敗改 Grok 4.5）30 秒三段** → enhance＋crossfade | 判斷 | `03_videos` |
+| 精選 | `05_chosen` 九宮格或影片 | 240P 分析後依選段抓 1080P | 240P/MOSS → **GLM 5.2 minimal 精選、Grok 4.3 none 翻譯（失敗改 Grok 4.5）30 秒三段** → enhance＋crossfade | 判斷 | `06_good` |
 | 歸檔 | （自動） | — | — | — | 九宮格→`04_downloaded`；chosen 來源影片刪除 |
 
 可用 `PORN_OUTPUT_DIR` 環境變數整體改寫 `output/` 位置，程式內的子目錄名稱由 `lib/project_paths.py` 統一管理。
@@ -114,7 +114,7 @@ output/01_preview_images/
 - `output/02_preview_videos/`：九宮格**或含 URL 的影片** → 每次下載 **3 分鐘低畫質**並以 **MOSS** 辨識；累計對話未達 30 秒就續抓下一段，影片結束仍不足則保留完整影片。達門檻後依字幕剪片、自動判斷 **enhance**，輸出軟 SRT。
 - `output/02_shorts/`：若影片已有內嵌翻譯字幕，會依 `preview_trimmed_segments`／`trimmed_segments` 將剪輯後字幕反向映射回原片時間，再下載來源最高畫質片段；只有 URL 時則先分析前 9 分鐘 240P。
 - `output/03_videos/`：九宮格**或含 URL 的影片** → **480P**，**MOSS** 字幕並據此剪片（對白淨長 >30s），高畫質切塊下載完成就排入自動 **enhance**，輸出同名軟 SRT。
-- `output/05_chosen/`：九宮格**或含 URL 的影片**（影片只作 URL 載體）→ **1080P + MOSS + Grok 4.3 minimal（失敗改 Grok 4.5 minimal）**，**判斷 enhance**；先用低畫質分析，再只下載需要的高畫質區段，完成進 `06_good`；九宮格歸檔 `04_downloaded`，來源影片刪除。
+- `output/05_chosen/`：九宮格**或含 URL 的影片**（影片只作 URL 載體）→ **1080P + MOSS + GLM 5.2 minimal 精選 + Grok 4.3 none 翻譯（失敗改 Grok 4.5）**，**判斷 enhance**；先用低畫質分析，再只下載需要的高畫質區段，完成進 `06_good`；九宮格歸檔 `04_downloaded`，來源影片刪除。
 
 ### 3. 下載與字幕
 
@@ -126,11 +126,11 @@ yt-dlp DEBUG 與下載百分比訊息。
 
 暫存位於 `output/00_temp/pipeline/`。Video 與 Chosen 預設分成兩個階段：
 
-1. 以 240P 每 180 秒下載一段；每段一就緒就立刻排入 `Demucs → MOSS`，不等待湊滿 BS。全部 240P 與 MOSS 完成後，才把完整時間軸交給 Grok 4.3 minimal；失敗一次改用 Grok 4.5 minimal。
+1. 以 240P 每 180 秒下載一段；每段一就緒就立刻排入 `Demucs → MOSS`，不等待湊滿 BS。全部 240P 與 MOSS 完成後，才把完整時間軸交給 GLM 5.2 minimal 精選，再用 Grok 4.3 none 翻譯；翻譯失敗一次改用 Grok 4.5。
 2. Shorts／Video／Chosen 預設啟用 30 秒三段：`N=ceil(30 秒／平均語音句長)`，固定選出情節 `N-1`、中段 `2N`、高潮 `4N`、結尾 `0.5N` 句（總上限 `7N-1+0.5N`）。先以完整原始 ASR 判斷：純語音不足 30 秒時，Shorts 保留前 9 分鐘分析範圍；原始字幕句數少於總上限時，完整翻譯對話、不精選；只有兩者都不符合才進行三段精選。每段完整保留模型選出的起訖，才按原片時間下載高畫質切塊。
 3. 高畫質切塊在全管線固定維持最多 5 個並行下載請求，新請求每秒錯開啟動；同一時間只會有一支影片處於高畫質下載階段。範圍下載優先選直接 HTTPS MP4，避開 HLS 分片名稱造成的 FFmpeg 錯誤；每段會先多抓 5 秒前置緩衝，再由本機精確重編碼，讓成品從新的關鍵影格開始，並完整解碼驗證；個別切塊失敗時會改為單線補下載，最後同步進行音訊判斷／`enhance` 與 0.08 秒**僅音訊** crossfade；畫面直接切換，字幕依畫面時間軸 retime。
 
-Shorts／Video／Chosen 預設可同時跑 2 支來源管線：前一支進入高畫質下載時，下一支可繼續 240P→人聲分離→MOSS→Grok 4.3；但抵達高畫質階段會等待前一支下載完成。240P 切塊完成就立刻排入人聲分離，不等待 MOSS；MOSS 推理全程序嚴格一次一筆。可用環境變數 `PIPELINE_SOURCE_WORKERS=1` 改回單支，最多可設為 4。
+Shorts／Video／Chosen 預設可同時跑 2 支來源管線：前一支進入高畫質下載時，下一支可繼續 240P→人聲分離→MOSS→GLM／Grok；但抵達高畫質階段會等待前一支下載完成。240P 切塊完成就立刻排入人聲分離，不等待 MOSS；MOSS 推理全程序嚴格一次一筆。可用環境變數 `PIPELINE_SOURCE_WORKERS=1` 改回單支，最多可設為 4。
 
 高畫質切塊並行數預設為 5，可用 `HIGH_SEGMENT_DOWNLOAD_WORKERS=1` 暫時改回單線；為避免來源站點限流，最高仍固定為 5。新請求預設每 1 秒啟動，可用 `HIGH_SEGMENT_DOWNLOAD_START_INTERVAL_SECONDS=0` 取消錯開。範圍下載每條預設只有 1 個 yt-dlp fragment；若來源穩定才可用 `HIGH_RANGE_CONCURRENT_FRAGMENTS` 增加。
 

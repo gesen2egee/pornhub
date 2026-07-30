@@ -1258,6 +1258,7 @@ def complete_cached_translation(
     selective: bool | None = None,
     translation_path: Path | None = None,
     state_path: Path | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     """翻譯既有 ASR；開關為 ON 卻缺 key/時間軸時明確失敗。
 
@@ -1313,6 +1314,7 @@ def complete_cached_translation(
                     api_key,
                     model_name,
                     checkpoint_path=translation_path,
+                    reasoning_effort=reasoning_effort,
                 )
                 asr["translated_srt"] = format_srt(translated)
                 asr["outcome"] = "translated"
@@ -1353,7 +1355,7 @@ def complete_three_phase_translation(
     if (
         (asr.get("translated_srt") or "").strip()
         and asr.get("selection_mode") == "three_phase_30s"
-        and asr.get("three_phase_budget_version") == 2
+        and asr.get("three_phase_budget_version") == 3
     ):
         return asr
     api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY")
@@ -1370,8 +1372,28 @@ def complete_three_phase_translation(
     cues = _cues_for_translation(asr)
     if not cues:
         raise RuntimeError("三段精選需要帶時間軸的 ASR cues")
-    primary_model = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
-    models = _translation_model_candidates(primary_model)
+    selection_primary = os.getenv(
+        "THREE_PHASE_SELECTION_MODEL", "z-ai/glm-5.2"
+    ).strip() or "z-ai/glm-5.2"
+    selection_models = [selection_primary]
+    selection_fallback = os.getenv(
+        "THREE_PHASE_SELECTION_FALLBACK_MODEL", ""
+    ).strip()
+    if (
+        selection_fallback
+        and selection_fallback.casefold() != selection_primary.casefold()
+    ):
+        selection_models.append(selection_fallback)
+    translation_primary = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
+    translation_models = _translation_model_candidates(translation_primary)
+    selection_reasoning = (
+        os.getenv("THREE_PHASE_SELECTION_REASONING", "minimal").strip()
+        or "minimal"
+    )
+    translation_reasoning = (
+        os.getenv("THREE_PHASE_TRANSLATE_REASONING", "none").strip()
+        or "none"
+    )
     budget = three_phase_budget(cues)
     source_fingerprint = _cues_fingerprint(cues)
 
@@ -1391,7 +1413,7 @@ def complete_three_phase_translation(
                     "complete": True,
                     "source_fingerprint": source_fingerprint,
                     "mode": "three_phase_30s",
-                    "budget_version": 2,
+                    "budget_version": 3,
                     "model": None,
                     "is_full": True,
                     "kept_ids": all_ids,
@@ -1406,22 +1428,25 @@ def complete_three_phase_translation(
             selection={"complete": True, "kept": len(all_ids), "is_full": True},
         )
         translated = None
-        used_model = primary_model
+        used_model = translation_primary
         fallback_used = False
-        for attempt, model_name in enumerate(models):
+        for attempt, model_name in enumerate(translation_models):
             try:
                 translated = translate_cues(
                     cues,
                     api_key,
                     model_name,
                     checkpoint_path=translation_path,
+                    reasoning_effort=translation_reasoning,
                 )
                 used_model = model_name
                 fallback_used = attempt > 0
                 break
             except Exception as exc:
-                if attempt + 1 < len(models):
-                    _log_translation_fallback(primary_model, models[attempt + 1], exc)
+                if attempt + 1 < len(translation_models):
+                    _log_translation_fallback(
+                        translation_primary, translation_models[attempt + 1], exc
+                    )
                 else:
                     raise RuntimeError(f"全片翻譯失敗：{exc}") from exc
         asr = dict(asr)
@@ -1433,7 +1458,7 @@ def complete_three_phase_translation(
         asr["three_phase_design"] = ""
         asr["three_phase_selection"] = {}
         asr["three_phase_budget"] = budget
-        asr["three_phase_budget_version"] = 2
+        asr["three_phase_budget_version"] = 3
         asr["selective_kept_ids"] = all_ids
         asr["selective_dropped_ids"] = []
         asr["selective_is_full"] = True
@@ -1455,14 +1480,16 @@ def complete_three_phase_translation(
 
     selected = None
     translated = None
-    selection_model = primary_model
+    selection_model = selection_primary
     if selection_path is not None and selection_path.is_file():
         saved = _read_json_dict(selection_path)
         if (
             saved.get("schema") == "selection_v1"
             and saved.get("complete") is True
             and saved.get("source_fingerprint") == source_fingerprint
-            and saved.get("budget_version") == 2
+            and saved.get("budget_version") == 3
+            and saved.get("model") == selection_primary
+            and saved.get("reasoning_effort") == selection_reasoning
         ):
             kept_ids = {int(value) for value in saved.get("kept_ids") or []}
             kept_cues = _filter_cues_by_ids(cues, kept_ids)
@@ -1473,7 +1500,7 @@ def complete_three_phase_translation(
                     "phases": dict(saved.get("phases") or {}),
                     "budget": dict(saved.get("budget") or budget),
                 }
-                selection_model = str(saved.get("model") or primary_model)
+                selection_model = str(saved.get("model") or selection_primary)
                 _log(
                     f"  [三段精選 checkpoint] 重用 {len(kept_cues)} 條選句"
                 )
@@ -1487,9 +1514,14 @@ def complete_three_phase_translation(
                     },
                 )
     if selected is None:
-        for attempt, model_name in enumerate(models):
+        for attempt, model_name in enumerate(selection_models):
             try:
-                selected = select_cues_three_phase(cues, api_key, model_name)
+                selected = select_cues_three_phase(
+                    cues,
+                    api_key,
+                    model_name,
+                    reasoning_effort=selection_reasoning,
+                )
                 selection_model = model_name
                 if selection_path is not None:
                     kept_ids = [
@@ -1503,8 +1535,9 @@ def complete_three_phase_translation(
                             "complete": True,
                             "source_fingerprint": source_fingerprint,
                             "mode": "three_phase_30s",
-                            "budget_version": 2,
+                            "budget_version": 3,
                             "model": model_name,
+                            "reasoning_effort": selection_reasoning,
                             "is_full": len(kept_ids) == len(cues),
                             "kept_ids": kept_ids,
                             "dropped_ids": [
@@ -1527,27 +1560,30 @@ def complete_three_phase_translation(
                 )
                 break
             except Exception as exc:
-                if attempt + 1 < len(models):
+                if attempt + 1 < len(selection_models):
                     _log_translation_fallback(
-                        primary_model, models[attempt + 1], exc
+                        selection_primary, selection_models[attempt + 1], exc
                     )
                 else:
                     raise RuntimeError(f"三段精選失敗：{exc}") from exc
     candidate_kept = selected["kept_cues"] if selected is not None else []
-    for attempt, model_name in enumerate(models):
+    for attempt, model_name in enumerate(translation_models):
         try:
             translated = translate_cues(
                 candidate_kept,
                 api_key,
                 model_name,
                 checkpoint_path=translation_path,
+                reasoning_effort=translation_reasoning,
             )
             used_model = model_name
             fallback_used = attempt > 0
             break
         except Exception as exc:
-            if attempt + 1 < len(models):
-                _log_translation_fallback(primary_model, models[attempt + 1], exc)
+            if attempt + 1 < len(translation_models):
+                _log_translation_fallback(
+                    translation_primary, translation_models[attempt + 1], exc
+                )
             else:
                 raise RuntimeError(f"精選字幕翻譯失敗：{exc}") from exc
     if selected is None or translated is None:
@@ -1561,11 +1597,11 @@ def complete_three_phase_translation(
     asr["source_cues"] = cues
     asr["original_srt"] = format_srt(kept)
     asr["translated_srt"] = format_srt(translated)
-    asr["plot_summary"] = selected["plot"]
-    asr["three_phase_design"] = selected["plot"]
+    asr["plot_summary"] = ""
+    asr["three_phase_design"] = ""
     asr["three_phase_selection"] = selected["phases"]
     asr["three_phase_budget"] = selected["budget"]
-    asr["three_phase_budget_version"] = 2
+    asr["three_phase_budget_version"] = 3
     asr["selective_kept_ids"] = kept_ids
     asr["selective_dropped_ids"] = sorted(
         int(cue["id"]) for cue in cues if int(cue["id"]) not in set(kept_ids)
@@ -3096,6 +3132,10 @@ def process_full_video_from_grid(
         and source_net_dur < dialogue_trim_threshold
     )
     speech_under_threshold = source_net_dur < dialogue_trim_threshold
+    three_phase_translation_reasoning = (
+        os.getenv("THREE_PHASE_TRANSLATE_REASONING", "none").strip()
+        or "none"
+    )
 
     # 精選下載：必須先完成選擇性翻譯，才能依保留 id 規劃高畫質下載區段
     # （不能與下載平行）。歌詞由 LLM 改完整翻譯時 is_full=True。
@@ -3113,14 +3153,18 @@ def process_full_video_from_grid(
                 and asr.get("selective_kept_ids") is not None
                 and (
                     not enable_three_phase_selection
-                    or asr.get("selection_mode") == "three_phase_30s"
+                    or (
+                        asr.get("selection_mode") == "three_phase_30s"
+                        and asr.get("three_phase_budget_version") == 3
+                    )
                 )
             ):
                 _log("  [精選下載] 重用快取內已有精選翻譯結果")
                 selective_done = True
             else:
                 _log(
-                    "  [三段精選] 等完整 240P/MOSS 後送 Grok 4.3 minimal（失敗改 Grok 4.5 minimal）："
+                    "  [三段精選] 等完整 240P/MOSS 後送 GLM 5.2 minimal 精選、"
+                    "Grok 4.3 none 翻譯（失敗改 Grok 4.5）："
                     "30 秒 N 三段、保留完整選段…"
                     if enable_three_phase_selection
                     else "  [精選下載] 先劇情整理 + 選擇性翻譯（歌詞則完整翻譯）…"
@@ -3148,12 +3192,13 @@ def process_full_video_from_grid(
                             selective=False,
                             translation_path=translation_path,
                             state_path=state_path,
+                            reasoning_effort=three_phase_translation_reasoning,
                         )
                         all_ids = [int(cue["id"]) for cue in source_cues]
                         asr["selection_mode"] = "three_phase_30s"
                         asr["three_phase_selection_gate"] = "speech_under_30s"
                         asr["three_phase_budget"] = source_budget
-                        asr["three_phase_budget_version"] = 2
+                        asr["three_phase_budget_version"] = 3
                         asr["selective_is_full"] = True
                         asr["selective_kept_ids"] = all_ids
                         asr["selective_dropped_ids"] = []
@@ -3164,7 +3209,7 @@ def process_full_video_from_grid(
                                     "schema": "selection_v1",
                                     "complete": True,
                                     "mode": "three_phase_30s",
-                                    "budget_version": 2,
+                                    "budget_version": 3,
                                     "model": None,
                                     "is_full": True,
                                     "gate": "speech_under_30s",
