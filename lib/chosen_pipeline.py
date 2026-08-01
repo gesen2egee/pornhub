@@ -428,7 +428,10 @@ def process_chosen_video(
         edge_padding=edge_pad,
     )
     if three_phase_enabled and segments is not None:
-        _log("  [三段精選] 保留選段完整起訖；僅音訊 crossfade 0.08 秒")
+        _log(
+            "  [三段精選] 保留選段完整起訖；"
+            "僅音訊段內淡化 0.08 秒（時間軸不壓縮）"
+        )
     high, original, translated, enhanced = full_video_pipeline.run_parallel_delivery_phase(
         url,
         work,

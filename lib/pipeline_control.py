@@ -259,7 +259,7 @@ STAGES = {
         "第三層：Video",
         VIDEOS_DIR,
         "$$ 中預算",
-        "240P/MOSS 串流→GLM 5.2 minimal 精選、Grok 4.3 minimal 一次翻譯（失敗改 Grok 4.5）30秒三段→關鍵格安全高畫質切塊、音訊判斷 enhance＋crossfade",
+        "240P/MOSS 串流→GLM 5.2 minimal 精選、Grok 4.3 minimal 一次翻譯（失敗改 Grok 4.5）30秒三段→關鍵格安全高畫質切塊、音訊判斷 enhance＋等長段內淡化",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
     "shorts": StageDefinition(
@@ -275,7 +275,7 @@ STAGES = {
         "第四層：Chosen",
         CHOSEN_DIR,
         "$$$ 高預算",
-        "240P/MOSS 串流→GLM 5.2 minimal 精選、Grok 4.3 minimal 一次翻譯（失敗改 Grok 4.5）30秒三段→關鍵格安全 1080P 切塊、音訊判斷 enhance＋crossfade",
+        "240P/MOSS 串流→GLM 5.2 minimal 精選、Grok 4.3 minimal 一次翻譯（失敗改 Grok 4.5）30秒三段→關鍵格安全 1080P 切塊、音訊判斷 enhance＋等長段內淡化",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
 }

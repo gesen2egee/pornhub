@@ -58,7 +58,12 @@ DIALOGUE_TRIM_THRESHOLD = 30.0
 SEGMENT_GAP = 1.5
 # 可選的前後延伸秒數；所有流程預設關閉，明確開啟才使用 0.75s
 SEGMENT_EDGE_PADDING = 0.75
+# 切段接縫音訊柔化秒數：段內 afade，不縮短時間軸（勿再用 acrossfade+尾端靜音）。
 THREE_PHASE_AUDIO_CROSSFADE = 0.08
+AUDIO_JUNCTION_FADE_SECONDS = THREE_PHASE_AUDIO_CROSSFADE
+# 單段／成品允許的 |audio−video| 秒數；超過則對齊或以重編碼串接。
+# AAC 幀長約 21ms，但允許累積到串接邊界會造成可見漂移，因此只容許 5ms。
+AV_DURATION_TOLERANCE_SECONDS = 0.005
 
 
 def edge_padding_enabled(environment: dict[str, str] | None = None) -> bool:
@@ -565,6 +570,216 @@ def probe_duration(path: Path) -> float | None:
     return None
 
 
+def probe_stream_duration(path: Path, codec_type: str) -> float | None:
+    """回傳指定流（video/audio）時長秒數。"""
+    selector = "v:0" if codec_type.startswith("v") else "a:0"
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                selector,
+                "-show_entries",
+                "stream=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except (FileNotFoundError, subprocess.SubprocessError, ValueError):
+        pass
+    return None
+
+
+def probe_stream_start_time(path: Path, codec_type: str) -> float | None:
+    """回傳指定流（video/audio）的起始時間秒數。"""
+    selector = "v:0" if codec_type.startswith("v") else "a:0"
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                selector,
+                "-show_entries",
+                "stream=start_time",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except (FileNotFoundError, subprocess.SubprocessError, ValueError):
+        pass
+    return None
+
+
+def has_audio_stream(path: Path) -> bool | None:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "default=nw=1:nk=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    return result.returncode == 0 and "audio" in result.stdout.split()
+
+
+def align_av_durations(
+    path: Path,
+    *,
+    tolerance: float = AV_DURATION_TOLERANCE_SECONDS,
+) -> Path:
+    """以畫面時長為準，修剪或補靜音使音訊等長（就地覆寫）。"""
+    if not path.is_file():
+        return path
+    if has_audio_stream(path) is not True:
+        return path
+    video_duration = probe_stream_duration(path, "video")
+    audio_duration = probe_stream_duration(path, "audio")
+    video_start = probe_stream_start_time(path, "video")
+    audio_start = probe_stream_start_time(path, "audio")
+    if video_duration is None or audio_duration is None:
+        return path
+    duration_needs_alignment = abs(audio_duration - video_duration) > tolerance
+    timestamp_needs_alignment = (
+        video_start is not None
+        and audio_start is not None
+        and abs(video_start - audio_start) > tolerance
+    )
+    if (
+        video_duration <= 0
+        or (
+            not duration_needs_alignment
+            and not timestamp_needs_alignment
+        )
+    ):
+        return path
+
+    temporary = path.with_name(f".{path.stem}.avalign{path.suffix}")
+    temporary.unlink(missing_ok=True)
+    # 畫面為主時間軸：音訊過長則 atrim，過短則 apad 後再 atrim。
+    audio_filter = (
+        f"[0:a]apad=whole_dur={video_duration:.6f},"
+        f"atrim=0:{video_duration:.6f},asetpts=PTS-STARTPTS[a]"
+    )
+    video_filter = (
+        "[0:v]setpts=PTS-STARTPTS[v]"
+        if timestamp_needs_alignment
+        else None
+    )
+    command = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(path),
+        "-filter_complex",
+        f"{video_filter + ';' if video_filter else ''}{audio_filter}",
+        "-map",
+        "[v]" if video_filter else "0:v:0",
+        "-map",
+        "[a]",
+    ]
+    if video_filter:
+        command.extend([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+    else:
+        command.extend(["-c:v", "copy"])
+    command.extend([
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
+        str(temporary),
+    ])
+    result = subprocess.run(
+        command, capture_output=True, text=True, timeout=7200
+    )
+    if (
+        result.returncode != 0
+        or not temporary.is_file()
+        or has_video_stream(temporary) is not True
+    ):
+        temporary.unlink(missing_ok=True)
+        _log(
+            f"  [A/V align] 對齊失敗，保留原檔：{path.name} "
+            f"(v={video_duration:.3f}s a={audio_duration:.3f}s; "
+            f"v_start={video_start!s} a_start={audio_start!s})"
+        )
+        return path
+    temporary.replace(path)
+    _log(
+        f"  [A/V align] {path.name}：音訊 "
+        f"{audio_duration:.3f}s → {video_duration:.3f}s（跟畫面）；"
+        f"起始時間 {video_start!s}/{audio_start!s}"
+    )
+    return path
+
+
+def _parts_safe_for_stream_copy(
+    parts: list[Path],
+    *,
+    tolerance: float = AV_DURATION_TOLERANCE_SECONDS,
+) -> bool:
+    """各段 A/V 時長與起始時間都在容差內才允許 concat demuxer copy。"""
+    for part in parts:
+        if has_video_stream(part) is not True:
+            return False
+        if has_audio_stream(part) is not True:
+            return False
+        video_duration = probe_stream_duration(part, "video")
+        audio_duration = probe_stream_duration(part, "audio")
+        video_start = probe_stream_start_time(part, "video")
+        audio_start = probe_stream_start_time(part, "audio")
+        if video_duration is None or audio_duration is None:
+            return False
+        if video_start is None or audio_start is None:
+            return False
+        if abs(audio_duration - video_duration) > tolerance:
+            return False
+        if abs(video_start - audio_start) > tolerance:
+            return False
+    return True
+
+
 def has_video_stream(path: Path) -> bool | None:
     try:
         result = subprocess.run(
@@ -928,19 +1143,34 @@ def _reencode_keyframe_safe_range(
     local_start: float,
     duration: float,
 ) -> Path:
-    """從前置緩衝素材精確切出片段，輸出第一影格固定為新的關鍵影格。"""
+    """從前置緩衝素材精確切出片段，輸出第一影格固定為新的關鍵影格。
+
+    音訊以 apad/atrim 對齊輸出時長，避免 AAC 幀邊界造成 a>v 累積。
+    """
     out_path.unlink(missing_ok=True)
+    duration = max(0.05, float(duration))
+    has_audio = has_audio_stream(source_path) is True
     command = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", str(source_path),
         # -ss 放在輸入後，會完整解碼到切點，避免快速 seek 落在中間影格。
-        "-ss", f"{local_start:.3f}", "-t", f"{duration:.3f}",
-        "-map", "0:v:0", "-map", "0:a?",
+        "-ss", f"{local_start:.3f}",
+        "-t", f"{duration:.3f}",
+        "-map", "0:v:0",
+    ]
+    if has_audio:
+        command.extend(["-map", "0:a:0"])
+    command.extend([
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
         "-force_key_frames", "0", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-movflags", "+faststart",
-        str(out_path),
-    ]
+    ])
+    if has_audio:
+        # whole_dur 確保音訊至少與請求時長等長；-t 再裁到同一上限。
+        command.extend([
+            "-af", f"apad=whole_dur={duration:.6f}",
+            "-c:a", "aac", "-b:a", "192k",
+        ])
+    command.extend(["-movflags", "+faststart", str(out_path)])
     result = subprocess.run(
         command,
         capture_output=True,
@@ -956,6 +1186,8 @@ def _reencode_keyframe_safe_range(
         raise RuntimeError(
             f"高畫質片段重編碼／完整解碼驗證失敗：{(result.stderr or '')[-800:]}"
         )
+    # 以實際畫面時長為準再對齊一次（影格邊界可能略短於請求秒數）。
+    align_av_durations(out_path)
     return out_path
 
 
@@ -1028,6 +1260,73 @@ def download_high_range(
         source_path.unlink(missing_ok=True)
 
 
+def _concat_videos_reencode(parts: list[Path], out_path: Path) -> Path:
+    """重編碼串接：每段音訊先對齊該段畫面時長，再 concat（總長 = ΣV）。"""
+    n = len(parts)
+    filter_parts: list[str] = []
+    maps: list[str] = []
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+    for part in parts:
+        cmd.extend(["-i", str(part)])
+    for index, part in enumerate(parts):
+        video_duration = (
+            probe_stream_duration(part, "video")
+            or probe_duration(part)
+            or 0.0
+        )
+        video_duration = max(0.05, float(video_duration))
+        filter_parts.append(f"[{index}:v]setpts=PTS-STARTPTS[v{index}]")
+        if has_audio_stream(part) is True:
+            filter_parts.append(
+                f"[{index}:a]asetpts=PTS-STARTPTS,"
+                f"apad=whole_dur={video_duration:.6f},"
+                f"atrim=0:{video_duration:.6f},"
+                f"asetpts=PTS-STARTPTS[a{index}]"
+            )
+            maps.append(f"[v{index}][a{index}]")
+        else:
+            # 無音軌時補靜音，避免 concat 因缺 a 失敗。
+            filter_parts.append(
+                f"anullsrc=channel_layout=stereo:sample_rate=48000,"
+                f"atrim=0:{video_duration:.6f},asetpts=PTS-STARTPTS[a{index}]"
+            )
+            maps.append(f"[v{index}][a{index}]")
+    filter_complex = (
+        ";".join(filter_parts)
+        + f";{''.join(maps)}concat=n={n}:v=1:a=1[outv][outa]"
+    )
+    cmd.extend(
+        [
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[outv]",
+            "-map",
+            "[outa]",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "18",
+            "-preset",
+            "fast",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(out_path),
+        ]
+    )
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+    if result.returncode != 0 or not out_path.exists():
+        raise RuntimeError(
+            f"片段拼接失敗：{(result.stderr or '')[-800:]}"
+        )
+    align_av_durations(out_path)
+    return out_path
+
+
 def concat_videos(parts: list[Path], out_path: Path) -> Path:
     if not parts:
         raise RuntimeError("沒有可拼接的片段")
@@ -1035,76 +1334,46 @@ def concat_videos(parts: list[Path], out_path: Path) -> Path:
         if parts[0].resolve() != out_path.resolve():
             out_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(parts[0]), str(out_path))
+        align_av_durations(out_path)
         return out_path
 
-    list_file = out_path.with_suffix(".concat.txt")
-    lines = []
-    for part in parts:
-        escaped = str(part.resolve()).replace("'", r"'\''")
-        lines.append(f"file '{escaped}'")
-    list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(list_file),
-        "-c",
-        "copy",
-        str(out_path),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-    list_file.unlink(missing_ok=True)
-    if result.returncode != 0 or not out_path.exists():
-        # copy 失敗時重編碼拼接
-        filter_parts = []
-        maps = []
-        cmd = ["ffmpeg", "-y"]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # 各段 A/V 已等長才允許 stream copy，否則接縫會釘最後一格。
+    if _parts_safe_for_stream_copy(parts):
+        list_file = out_path.with_suffix(".concat.txt")
+        lines = []
         for part in parts:
-            cmd.extend(["-i", str(part)])
-        n = len(parts)
-        for i in range(n):
-            filter_parts.append(
-                f"[{i}:v]setpts=PTS-STARTPTS[v{i}];"
-                f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]"
-            )
-            maps.append(f"[v{i}][a{i}]")
-        filter_complex = (
-            ";".join(filter_parts)
-            + f";{''.join(maps)}concat=n={n}:v=1:a=1[outv][outa]"
-        )
-        cmd.extend(
-            [
-                "-filter_complex",
-                filter_complex,
-                "-map",
-                "[outv]",
-                "-map",
-                "[outa]",
-                "-c:v",
-                "libx264",
-                "-crf",
-                "18",
-                "-preset",
-                "fast",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                str(out_path),
-            ]
-        )
+            escaped = str(part.resolve()).replace("'", r"'\''")
+            lines.append(f"file '{escaped}'")
+        list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_file),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(out_path),
+        ]
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=7200
+            cmd, capture_output=True, text=True, timeout=3600
         )
-        if result.returncode != 0 or not out_path.exists():
-            raise RuntimeError(
-                f"片段拼接失敗：{(result.stderr or '')[-800:]}"
-            )
-    return out_path
+        list_file.unlink(missing_ok=True)
+        if result.returncode == 0 and out_path.exists():
+            align_av_durations(out_path)
+            return out_path
+        out_path.unlink(missing_ok=True)
+        _log("  [Concat] stream copy 失敗，改重編碼串接")
+    else:
+        _log("  [Concat] 各段 A/V 時長不一，改重編碼串接以保持同步")
+
+    return _concat_videos_reencode(parts, out_path)
 
 
 def concat_videos_audio_crossfade(
@@ -1112,33 +1381,61 @@ def concat_videos_audio_crossfade(
     out_path: Path,
     fade_seconds: float = THREE_PHASE_AUDIO_CROSSFADE,
 ) -> Path:
-    """畫面直接切換，僅以 acrossfade 讓相鄰切塊音訊自然銜接。"""
+    """畫面硬切；各段音訊頭尾 afade 後等長 concat（不縮短時間軸）。
+
+    舊實作使用 acrossfade 會讓總音訊少 d×(N-1) 秒，再於尾端 pad 靜音，
+    造成越後面越搶拍。現改為段內淡入淡出 + concat，總長 = Σ 畫面時長。
+    """
     if len(parts) <= 1:
         return concat_videos(parts, out_path)
-    durations = [probe_duration(part) or 0.0 for part in parts]
-    if any(duration <= fade_seconds * 2 for duration in durations):
-        _log("  [Crossfade] 有過短片段，改用一般串接以保留內容")
+
+    if any(has_audio_stream(part) is not True for part in parts):
+        _log("  [Audio fade] 有片段沒有音軌，改用等長串接並補靜音")
         return concat_videos(parts, out_path)
-    filters: list[str] = []
-    for index in range(len(parts)):
-        filters.extend([
-            f"[{index}:v]setpts=PTS-STARTPTS[v{index}]",
-            f"[{index}:a]asetpts=PTS-STARTPTS[a{index}]",
-        ])
-    # concat 保留每段完整畫面時長；不使用 xfade，避免任何畫面混合或時間軸重疊。
-    video_inputs = "".join(f"[v{index}]" for index in range(len(parts)))
-    filters.append(f"{video_inputs}concat=n={len(parts)}:v=1:a=0[vout]")
-    audio_label = "a0"
-    for index in range(1, len(parts)):
-        next_audio = f"ax{index}"
-        filters.append(
-            f"[{audio_label}][a{index}]acrossfade=d={fade_seconds:.3f}[{next_audio}]"
+
+    fade_seconds = max(0.0, float(fade_seconds))
+    durations: list[float] = []
+    for part in parts:
+        video_duration = (
+            probe_stream_duration(part, "video")
+            or probe_duration(part)
+            or 0.0
         )
-        audio_label = next_audio
-    # acrossfade 讓音訊時間軸縮短；在尾端補靜音，使其與硬切畫面等長。
-    filters.append(
-        f"[{audio_label}]apad=pad_dur={fade_seconds * (len(parts) - 1):.3f}[aout]"
-    )
+        durations.append(max(0.0, float(video_duration)))
+
+    if fade_seconds <= 0 or any(
+        duration <= fade_seconds * 2 for duration in durations
+    ):
+        _log("  [Audio fade] 無柔化或有過短片段，改用等長硬切串接")
+        return concat_videos(parts, out_path)
+
+    n = len(parts)
+    filters: list[str] = []
+    for index, duration in enumerate(durations):
+        fade = min(fade_seconds, max(0.0, duration / 2.0 - 0.001))
+        filters.append(f"[{index}:v]setpts=PTS-STARTPTS[v{index}]")
+        audio_chain = [
+            f"[{index}:a]asetpts=PTS-STARTPTS",
+            f"apad=whole_dur={duration:.6f}",
+            f"atrim=0:{duration:.6f}",
+            "asetpts=PTS-STARTPTS",
+        ]
+        if fade > 0:
+            if index > 0:
+                audio_chain.append(f"afade=t=in:st=0:d={fade:.3f}")
+            if index < n - 1:
+                fade_out_at = max(0.0, duration - fade)
+                audio_chain.append(
+                    f"afade=t=out:st={fade_out_at:.3f}:d={fade:.3f}"
+                )
+        filters.append(",".join(audio_chain) + f"[a{index}]")
+
+    video_inputs = "".join(f"[v{index}]" for index in range(n))
+    audio_inputs = "".join(f"[a{index}]" for index in range(n))
+    filters.append(f"{video_inputs}concat=n={n}:v=1:a=0[vout]")
+    filters.append(f"{audio_inputs}concat=n={n}:v=0:a=1[aout]")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
     for part in parts:
         command.extend(["-i", str(part)])
@@ -1146,12 +1443,25 @@ def concat_videos_audio_crossfade(
         "-filter_complex", ";".join(filters),
         "-map", "[vout]", "-map", "[aout]",
         "-c:v", "libx264", "-crf", "18", "-preset", "fast",
-        "-c:a", "aac", "-movflags", "+faststart", str(out_path),
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart", str(out_path),
     ])
-    result = subprocess.run(command, capture_output=True, text=True, timeout=7200)
-    if result.returncode != 0 or not out_path.exists() or has_video_stream(out_path) is not True:
-        raise RuntimeError(f"音訊 crossfade 串接失敗：{(result.stderr or '')[-800:]}")
-    _log(f"  [Audio crossfade] 畫面硬切；音訊淡化 {fade_seconds:.2f}s，{len(parts)} 段")
+    result = subprocess.run(
+        command, capture_output=True, text=True, timeout=7200
+    )
+    if (
+        result.returncode != 0
+        or not out_path.exists()
+        or has_video_stream(out_path) is not True
+    ):
+        raise RuntimeError(
+            f"音訊柔接串接失敗：{(result.stderr or '')[-800:]}"
+        )
+    align_av_durations(out_path)
+    _log(
+        f"  [Audio fade] 畫面硬切；段內淡化 {fade_seconds:.2f}s，"
+        f"{n} 段（時間軸不壓縮）"
+    )
     return out_path
 
 
@@ -3784,7 +4094,8 @@ def process_full_video_from_grid(
             if enable_three_phase_selection:
                 _log(
                     "  [三段精選] 保留選段完整起訖；"
-                    f"僅音訊 crossfade {THREE_PHASE_AUDIO_CROSSFADE:.2f}s"
+                    f"僅音訊段內淡化 {THREE_PHASE_AUDIO_CROSSFADE:.2f}s"
+                    "（時間軸不壓縮）"
                 )
             for i, (s, e) in enumerate(segments, 1):
                 _log(f"    段 {i:02d}: {s:.2f} → {e:.2f} ({e - s:.2f}s)")
