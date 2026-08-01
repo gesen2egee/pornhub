@@ -149,17 +149,36 @@ def retime_subtitles(
     entries: list[dict],
     video_segments: list[tuple[float, float]],
     crossfade_seconds: float = 0.0,
+    output_durations: list[float] | None = None,
 ) -> list[dict]:
-    """依保留區段重排字幕；crossfade 會讓後段時間軸提前重疊秒數。"""
+    """依保留區段重排字幕；可用實際輸出時長避免影格量化偏移。
+
+    ``video_segments`` 是來源影片的請求範圍；編碼後的每段畫面時長可能因
+    影格率而略短或略長。若呼叫端提供 ``output_durations``，只用它建立新的
+    輸出時間軸，區段內的字幕時間仍維持來源時間基準，不會因重新縮放而變速。
+    """
     new_entries = []
+
+    if output_durations is not None and len(output_durations) != len(video_segments):
+        raise ValueError("output_durations 必須與 video_segments 數量相同")
 
     seg_timeline = []
     current_new_time = 0.0
     for index, (src_s, src_e) in enumerate(video_segments):
-        dur = src_e - src_s
+        requested_dur = float(src_e) - float(src_s)
+        dur = (
+            requested_dur
+            if output_durations is None
+            else float(output_durations[index])
+        )
+        if requested_dur <= 0 or dur <= 0:
+            continue
+        # 輸出畫面比請求範圍短時，尾端沒有可映射的畫面；輸出較長時，
+        # 多出的量化影格不屬於來源請求範圍，字幕仍不可延伸進去。
+        effective_src_end = min(float(src_e), float(src_s) + dur)
         seg_timeline.append({
-            'src_start': src_s,
-            'src_end': src_e,
+            'src_start': float(src_s),
+            'src_end': effective_src_end,
             'new_start': current_new_time,
             'new_end': current_new_time + dur
         })
@@ -196,18 +215,36 @@ def retime_subtitles(
 def restore_subtitles_to_source_timeline(
     entries: list[dict],
     video_segments: list[tuple[float, float]],
+    output_durations: list[float] | None = None,
 ) -> list[dict]:
-    """把剪輯後的相對字幕時間反向映射回來源影片的絕對時間。"""
+    """把剪輯後字幕反向映射回來源影片的絕對時間。
+
+    ``output_durations`` 用於描述實際輸出的每段畫面時長；未提供時維持
+    舊行為，以來源區段的請求時長建立時間軸。
+    """
     restored = []
+    if output_durations is not None and len(output_durations) != len(video_segments):
+        raise ValueError("output_durations 必須與 video_segments 數量相同")
+
     current_new_time = 0.0
     timeline = []
-    for src_start, src_end in video_segments:
-        duration = float(src_end) - float(src_start)
-        if duration <= 0:
+    for index, (src_start, src_end) in enumerate(video_segments):
+        source_duration = float(src_end) - float(src_start)
+        duration = (
+            source_duration
+            if output_durations is None
+            else float(output_durations[index])
+        )
+        if source_duration <= 0 or duration <= 0:
             continue
         timeline.append(
             {
                 "src_start": float(src_start),
+                "src_end": min(
+                    float(src_end), float(src_start) + duration
+                ),
+                "source_duration": source_duration,
+                "output_duration": duration,
                 "new_start": current_new_time,
                 "new_end": current_new_time + duration,
             }
@@ -222,14 +259,22 @@ def restore_subtitles_to_source_timeline(
             overlap_end = min(cap_end, segment["new_end"])
             if overlap_end <= overlap_start:
                 continue
+            source_offset_start = min(
+                overlap_start - segment["new_start"],
+                segment["source_duration"],
+            )
+            source_offset_end = min(
+                overlap_end - segment["new_start"],
+                segment["source_duration"],
+            )
+            if source_offset_end <= source_offset_start:
+                continue
             restored.append(
                 {
                     "start": segment["src_start"]
-                    + overlap_start
-                    - segment["new_start"],
+                    + source_offset_start,
                     "end": segment["src_start"]
-                    + overlap_end
-                    - segment["new_start"],
+                    + source_offset_end,
                     "text": entry["text"],
                 }
             )
@@ -250,10 +295,24 @@ def write_srt_file(entries: list[dict], out_srt_path: str | Path) -> None:
         f.write("\n".join(lines))
 
 
-def retime_video_meta(meta_dict: dict, video_segments: list[tuple[float, float]]) -> dict:
-    """同步調整影片 meta 中的時長紀錄與區段標記"""
+def retime_video_meta(
+    meta_dict: dict,
+    video_segments: list[tuple[float, float]],
+    output_durations: list[float] | None = None,
+) -> dict:
+    """同步調整影片 meta 中的時長紀錄與區段標記。"""
+    if output_durations is not None and len(output_durations) != len(video_segments):
+        raise ValueError("output_durations 必須與 video_segments 數量相同")
     new_meta = dict(meta_dict)
-    new_dur = sum(e - s for s, e in video_segments)
+    durations = [
+        float(e) - float(s)
+        if output_durations is None
+        else float(output_durations[index])
+        for index, (s, e) in enumerate(video_segments)
+    ]
+    new_dur = sum(durations)
     new_meta['duration'] = new_dur
     new_meta['trimmed_segments'] = video_segments
+    if output_durations is not None:
+        new_meta['trimmed_segment_durations'] = durations
     return new_meta

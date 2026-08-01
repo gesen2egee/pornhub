@@ -13,6 +13,7 @@
   "settings": {
     "asr": true,
     "demucs_asr": true,
+    "vocal_separator": "demucs",
     "asr_stream": false,
     "subtitles": true,
     "translation": true,

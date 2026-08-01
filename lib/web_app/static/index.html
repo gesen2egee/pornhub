@@ -305,7 +305,7 @@
           <h3>核心 Pipeline 開關</h3>
           <div class="switch-grid">
             <label class="switch-row"><span><strong>ASR</strong><small>語音辨識</small></span><input data-option="asr" type="checkbox" class="switch"></label>
-            <label class="switch-row"><span><strong>ASR 人聲分離</strong><small>預設 Mel-Band-RoFormer</small></span><input data-option="demucs_asr" type="checkbox" class="switch"></label>
+            <label class="switch-row"><span><strong>ASR 人聲分離</strong><small>預設 Demucs</small></span><input data-option="demucs_asr" type="checkbox" class="switch"></label>
             <label class="switch-row"><span><strong>ASR Stream</strong><small>分段下載與批次辨識</small></span><input data-option="asr_stream" type="checkbox" class="switch"></label>
             <label class="switch-row"><span><strong>輸出 SRT</strong><small>外掛軟字幕</small></span><input data-option="subtitles" type="checkbox" class="switch"></label>
             <label class="switch-row"><span><strong>翻譯</strong><small>使用 OpenRouter</small></span><input data-option="translation" type="checkbox" class="switch"></label>
@@ -327,8 +327,10 @@
           <div class="form-grid three">
             <label class="field"><span>Preview 每段秒數（180 = 3 分鐘）</span><input data-option="preview_seconds" type="number" min="1"></label>
             <label class="field"><span>Video 高度</span><input data-option="video_height" type="number" min="144"></label>
+            <label class="field"><span>Video 最高畫質門檻（秒）</span><input data-option="video_high_quality_max_seconds" type="number" min="1"></label>
             <label class="field"><span>Chosen 高度</span><input data-option="chosen_height" type="number" min="144"></label>
             <label class="field"><span>ASR Backend</span><select data-option="asr_backend"><option>moss</option><option>whisper</option><option>voxtral</option><option>grok-stt</option></select></label>
+            <label class="field"><span>人聲分離模型</span><select data-option="vocal_separator"><option value="demucs">Demucs</option><option value="roformer">Mel-Band-RoFormer</option></select></label>
             <label class="field wide-field"><span>翻譯 Model</span><input data-option="translation_model"></label>
             <label class="field"><span>Reasoning</span><select data-option="reasoning_effort"><option>none</option><option>minimal</option><option>low</option><option>medium</option><option>high</option></select></label>
             <label class="field"><span>啟動剪片門檻（秒）</span><input data-option="trim_threshold" type="number" min="0.1" step="0.1"></label>

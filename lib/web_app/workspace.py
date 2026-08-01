@@ -342,6 +342,7 @@ def _validate_options(options: dict[str, Any], mode: str) -> dict[str, Any]:
     positive_ints = {
         "preview_seconds",
         "video_height",
+        "video_high_quality_max_seconds",
         "chosen_height",
         "asr_chunk_seconds",
         "asr_batch_size",
@@ -393,6 +394,11 @@ def _validate_options(options: dict[str, Any], mode: str) -> dict[str, Any]:
                 )
             except (TypeError, ValueError):
                 result[name] = default
+        elif name == "vocal_separator":
+            normalized = str(value or default).strip().casefold()
+            result[name] = (
+                normalized if normalized in {"demucs", "roformer"} else default
+            )
         else:
             result[name] = str(value or default)
     if result["asr_backend"] not in {"whisper", "moss", "voxtral", "grok-stt"}:

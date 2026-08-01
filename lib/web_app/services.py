@@ -611,6 +611,7 @@ class TaskManager:
         for key, flag in boolean_options.items():
             command.append(f"--{flag}" if options.get(key) else f"--no-{flag}")
         common_values = {
+            "vocal_separator": "vocal-separator",
             "asr_backend": "asr-backend",
             "translation_model": "translation-model",
             "reasoning_effort": "reasoning-effort",
@@ -625,6 +626,10 @@ class TaskManager:
             command.extend(["--preview-seconds", str(options["preview_seconds"])])
         if mode == "video":
             command.extend(["--video-height", str(options["video_height"])])
+            command.extend([
+                "--video-high-quality-max-seconds",
+                str(options["video_high_quality_max_seconds"]),
+            ])
         if mode == "chosen":
             command.extend(["--chosen-height", str(options["chosen_height"])])
         return command

@@ -50,9 +50,9 @@ output/
 
 | 流程 | 放入 | 畫質 | 字幕 | enhance | 輸出 |
 |------|------|------|------|---------|------|
-| 預覽 | `02_preview_videos` 九宮格或含 URL 影片 | 一次下載 BS 段低畫質（預設 3×3 分鐘）；語音>30s 剪片否則全留 | Mel-Band-RoFormer 人聲 → 批次 MOSS → 一次 Grok 4.3 minimal（失敗改 Grok 4.5 minimal）精選翻譯 | 判斷 | 同目錄 |
+| 預覽 | `02_preview_videos` 九宮格或含 URL 影片 | 一次下載 BS 段低畫質（預設 3×3 分鐘）；語音>30s 剪片否則全留 | Demucs 人聲 → 批次 MOSS → 一次 Grok 4.3 minimal（失敗改 Grok 4.5 minimal）精選翻譯 | 判斷 | 同目錄 |
 | Shorts | `02_shorts` 九宮格或含 URL 影片 | 先分析前 9 分鐘 240P；純語音不足 30 秒保留前 9 分鐘，否則依三段精選抓來源最高畫質片段 | MOSS → GLM 5.2 minimal 三段精選 → Grok 4.3 minimal 一次翻譯（失敗改 Grok 4.5）；原字幕少於 7.5N 直接完整翻譯 | 判斷 | 同目錄 |
-| 標準全片 | `03_videos` 九宮格或含 URL 影片 | 240P 分析後依選段抓 480P | 240P/MOSS → **GLM 5.2 minimal 精選、Grok 4.3 minimal 一次翻譯（失敗改 Grok 4.5）30 秒三段** → enhance＋等長段內淡化 | 判斷 | `03_videos` |
+| 標準全片 | `03_videos` 九宮格或含 URL 影片 | 240P 分析後依選段下載；4 分鐘內來源最高畫質，超過 4 分鐘 480P | 240P/MOSS → **GLM 5.2 minimal 精選、Grok 4.3 minimal 一次翻譯（失敗改 Grok 4.5）30 秒三段** → enhance＋等長段內淡化 | 判斷 | `03_videos` |
 | 精選 | `05_chosen` 九宮格或影片 | 240P 分析後依選段抓 1080P | 240P/MOSS → **GLM 5.2 minimal 精選、Grok 4.3 minimal 一次翻譯（失敗改 Grok 4.5）30 秒三段** → enhance＋等長段內淡化 | 判斷 | `06_good` |
 | 歸檔 | （自動） | — | — | — | 九宮格→`04_downloaded`；chosen 來源影片刪除 |
 
@@ -77,13 +77,16 @@ output/
   "archive_dir": "04_downloaded",
   "settings": {
     "asr": true,
+    "demucs_asr": true,
+    "vocal_separator": "demucs",
     "subtitles": true,
     "translation": true,
     "dialogue_trim": true,
     "selective_download": true,
     "three_phase_selection": true,
     "metadata": true,
-    "video_height": 480
+    "video_height": 480,
+    "video_high_quality_max_seconds": 240
   }
 }
 ```
@@ -110,6 +113,7 @@ output/
 |------|-------------|------|------|
 | `asr` | Boolean | 執行語音辨識 | `true` |
 | `demucs_asr` | Boolean | ASR 前先做人聲分離 | `true` |
+| `vocal_separator` | `demucs`／`roformer` | ASR 前使用的人聲分離模型 | `demucs` |
 | `asr_stream` | Boolean | 使用分段下載／ASR 串流 | `false` |
 | `subtitles` | Boolean | 輸出外掛 SRT | `true` |
 | `translation` | Boolean | 翻譯辨識結果 | `true` |
@@ -125,6 +129,7 @@ output/
 | `force` | Boolean | 即使已有成品也強制重跑 | `false` |
 | `preview_seconds` | 大於 0 的整數 | Preview 下載秒數 | `180` |
 | `video_height` | 大於 0 的整數 | Video 成品高度 | `480` |
+| `video_high_quality_max_seconds` | 大於 0 的整數 | Video 不超過此秒數時使用來源最高畫質；超過時使用 `video_height` | `240` |
 | `chosen_height` | 大於 0 的整數 | Chosen 成品高度 | `1080` |
 | `asr_backend` | `whisper`／`moss`／`voxtral`／`grok-stt` | ASR Backend | `moss` |
 | `translation_model` | 非空字串 | OpenRouter 翻譯 Model | `x-ai/grok-4.3` |
@@ -136,7 +141,7 @@ output/
 
 未填的 setting 使用該 `pipeline` 的預設值；CLI 明確傳入的開關會暫時覆寫 JSON，但不改寫檔案。未知欄位、錯誤型別、重複順序／ID、相依設定衝突或兩個來源會寫到同一成品時，程式會在任何下載前停止並指出設定檔。
 
-`three_phase_selection=true` 需要同時開啟 `selective_download`、`dialogue_trim` 與 `translation`。來源與成品使用同一資料夾時必須保留 `metadata=true`，才能在下一輪分辨已發布成品；開啟 `archive` 時，`archive_dir` 不可等於 `source_dir`，避免宮格留在 Inbox 內反覆改名與重跑。資料夾之間依 JSON 前綴嚴格依序執行；同一 Video／Chosen 資料夾內預設仍可同時處理 2 個來源，若需要逐檔嚴格完成順序，可設定環境變數 `PIPELINE_SOURCE_WORKERS=1`。
+`three_phase_selection=true` 需要同時開啟 `selective_download`、`dialogue_trim` 與 `translation`。來源與成品使用同一資料夾時必須保留 `metadata=true`，才能在下一輪分辨已發布成品；開啟 `archive` 時，`archive_dir` 不可等於 `source_dir`，避免宮格留在 Inbox 內反覆改名與重跑。資料夾之間依 JSON 前綴嚴格依序執行；Video／Chosen 預設一次處理 1 個來源，若要提高並行數可設定環境變數 `PIPELINE_SOURCE_WORKERS`，最多 4 支。
 
 BAT、Muse 與多個 Muse 視窗共用跨程序 Pipeline 鎖；同一個 `output` 不會被兩個下載流程同時改寫，後啟動者會等待前一個流程完成。
 
@@ -213,7 +218,7 @@ output/01_preview_images/
 
 - `output/02_preview_videos/`：九宮格**或含 URL 的影片** → 每次下載 **3 分鐘低畫質**並以 **MOSS** 辨識；累計對話未達 30 秒就續抓下一段，影片結束仍不足則保留完整影片。達門檻後依字幕剪片、自動判斷 **enhance**，輸出軟 SRT。
 - `output/02_shorts/`：若影片已有內嵌翻譯字幕，會依 `preview_trimmed_segments`／`trimmed_segments` 將剪輯後字幕反向映射回原片時間，再下載來源最高畫質片段；只有 URL 時則先分析前 9 分鐘 240P。
-- `output/03_videos/`：九宮格**或含 URL 的影片** → **480P**，**MOSS** 字幕並據此剪片（對白淨長 >30s），高畫質切塊下載完成就排入自動 **enhance**，輸出同名軟 SRT。
+- `output/03_videos/`：九宮格**或含 URL 的影片** → **4 分鐘內使用來源最高畫質，超過 4 分鐘使用 480P**，以 **MOSS** 字幕剪片（對白淨長 >30s），高畫質切塊下載完成就排入自動 **enhance**，輸出同名軟 SRT。
 - `output/05_chosen/`：九宮格**或含 URL 的影片**（影片只作 URL 載體）→ **1080P + MOSS + GLM 5.2 minimal 精選 + Grok 4.3 minimal 一次翻譯（失敗改 Grok 4.5）**，**判斷 enhance**；先用低畫質分析，再只下載需要的高畫質區段，完成進 `06_good`；九宮格歸檔 `04_downloaded`，來源影片刪除。
 
 ### 3. 下載與字幕
@@ -224,11 +229,11 @@ output/01_preview_images/
 
 暫存位於 `output/00_temp/pipeline/`。Video 與 Chosen 預設分成兩個階段：
 
-1. 預設先完整下載一次 240P，再以 FireRed VAD/AED 找出人聲與唱歌區段；每個 VAD 人聲段前後各保留 0.5 秒上下文，先合併成最多 180 秒的 VAD 後音檔，再對整個合併音檔做一次 Mel-Band-RoFormer 人聲分離並送 MOSS。最終字幕仍採 MOSS 實際辨識的起訖，再映回原片時間軸；在精選前只合併連續重複句，短句完整保留。VAD/AED、RoFormer、MOSS 使用同一把跨程序 GPU 鎖，前一個模型完成即清除 VRAM 才載入下一個。完成完整時間軸後先送 GLM 5.2 minimal 精選；若失敗（含不合法 ID）會改送 Grok 4.5 minimal。翻譯使用 Grok 4.3 minimal，失敗一次改用 Grok 4.5。需要邊下載邊辨識時才顯式開啟 `--asr-stream`。
+1. 預設先完整下載一次 240P，再以 FireRed VAD/AED 掃描整片；VAD 完成後釋放 GPU，將人聲範圍合併成最多 180 秒音檔。預設 Demucs 會先完成所有三分鐘音檔的人聲分離，再釋放 GPU，最後進入一次 MOSS ASR 階段；字幕仍會映回原片時間軸。`vocal_separator` 可在 JSON 改成 `roformer`。在精選前只合併連續重複句，短句完整保留。完成完整時間軸後先送 GLM 5.2 minimal 精選；若失敗（含不合法 ID）會改送 Grok 4.5 minimal。翻譯使用 Grok 4.3 minimal，失敗一次改用 Grok 4.5。需要邊下載邊辨識時才顯式開啟 `--asr-stream`。
 2. Shorts／Video／Chosen 預設啟用 30 秒三段：所有 MOSS 字幕（包含短句）都送進三段精選，以完整字幕的平均句長算 `N=ceil(30 秒／平均語音句長)`，固定選出情節 `N-1`、中段 `2N`、高潮 `3N`、可選結尾 `0.5N` 句（總上限 `6N-1+0.5N`）。30 秒門檻只計「字幕與 AED 唱歌範圍不重疊」的純對話；MV／純唱歌不會因歌詞字幕而觸發剪片。先以完整原始 ASR 判斷：純對話不足 30 秒時，Shorts 保留前 9 分鐘分析範圍；原始字幕句數少於總上限時，完整翻譯對話、不精選；只有兩者都不符合才進行三段精選。每段完整保留模型選出的起訖，才按原片時間下載高畫質切塊。
 3. 高畫質切塊在全管線固定維持最多 5 個並行下載請求，新請求每秒錯開啟動；同一時間只會有一支影片處於高畫質下載階段。範圍下載優先選直接 HTTPS MP4，避開 HLS 分片名稱造成的 FFmpeg 錯誤；每段會先多抓 5 秒前置緩衝，再由本機精確重編碼，讓成品從新的關鍵影格開始，並完整解碼驗證；個別切塊失敗時會改為單線補下載，最後同步進行音訊判斷／`enhance` 與 0.08 秒**僅音訊段內淡化**（等長硬接，不壓縮時間軸）；畫面直接切換，字幕依畫面時間軸 retime。每段與成品會對齊 A/V 時長，避免尾端釘格。
 
-Shorts／Video／Chosen 預設可同時跑 2 支來源管線：前一支進入高畫質下載時，下一支可繼續 240P→人聲分離→MOSS→GLM／Grok；但抵達高畫質階段會等待前一支下載完成。240P 切塊完成就立刻排入人聲分離，不等待 MOSS；MOSS 推理全程序嚴格一次一筆。可用環境變數 `PIPELINE_SOURCE_WORKERS=1` 改回單支，最多可設為 4。
+Shorts／Video／Chosen 預設一次只跑 1 支來源管線，避免 VAD、Demucs、MOSS 同時佔用 GPU；可用環境變數 `PIPELINE_SOURCE_WORKERS` 主動提高並行數，最多 4 支。高畫質切塊本身仍可維持最多 5 個下載請求。
 
 高畫質切塊並行數預設為 5，可用 `HIGH_SEGMENT_DOWNLOAD_WORKERS=1` 暫時改回單線；為避免來源站點限流，最高仍固定為 5。新請求預設每 1 秒啟動，可用 `HIGH_SEGMENT_DOWNLOAD_START_INTERVAL_SECONDS=0` 取消錯開。範圍下載每條預設只有 1 個 yt-dlp fragment；若來源穩定才可用 `HIGH_RANGE_CONCURRENT_FRAGMENTS` 增加。
 
@@ -262,7 +267,7 @@ Preview 每段預設 180 秒，一次先下載 `--asr-batch-size` 段（預設 3
 02_run_download.bat --stages video --no-three-phase-selection --no-selective-download --no-translation --no-dialogue-trim
 02_run_download.bat --stages chosen --subtitles --enhance --metadata --archive
 02_run_download.bat --stages preview --preview-seconds 90 --no-keep-work
-02_run_download.bat --stages video --video-height 480 --asr-backend moss
+02_run_download.bat --stages video --video-height 480 --video-high-quality-max-seconds 240 --vocal-separator demucs --asr-backend moss
 02_run_download.bat --stages video --asr-stream --asr-chunk-seconds 180 --asr-batch-size 3
 02_run_download.bat --stages chosen --no-asr-stream
 02_run_download.bat --stages chosen --chosen-height 1080 --translation-model x-ai/grok-4.3 --reasoning-effort minimal
@@ -283,7 +288,7 @@ Chosen 有 URL 時不會拿既有高畫質成品接續，會重新下載規劃�
 若連 ASR 字幕快取也要重做，請加上 `--no-reuse-cache`。
 每支發布完成的影片 Metadata 都會寫入 `published_stage`（`preview`、`shorts`、`video` 或 `chosen`）。下次掃描同一層資料夾時，標示同層已發布的影片會列為既有成品、不再處理；需要明確重跑時使用 `--force`。
 剪片門檻與區段合併間隔可分別用 `--trim-threshold`、`--segment-gap` 調整；`--preview-seconds` 是 Preview 每次下載與 ASR 的片段長度，不再是總長度。
-`asr-stream` 預設關閉，因此 Video／Chosen 會先完整下載一次 240P 代理檔，再開始 ASR；不會按 180 秒重複分段請求。正式 MOSS 流程預設啟用 FireRed VAD/AED，並以 VAD 後的人聲時長切成最多三分鐘的 MOSS 音檔；這三分鐘不是原片牆鐘時間。ASR 人聲分離預設使用已安裝的 Mel-Band-RoFormer；若因相容性要改回 Demucs，可設定 `ASR_VOCAL_SEPARATOR=demucs`，或以 `ENABLE_FIRERED_VAD=0` 關閉 VAD/AED。若明確加上 `--asr-stream`，才會每 180 秒分段下載，並累計滿 `--asr-batch-size`（預設 3）段才執行一次 MOSS BS ASR；影片尾端不足 BS 的批次仍會送出。
+`asr-stream` 預設關閉，因此 Video／Chosen 會先完整下載一次 240P 代理檔，再開始 ASR；不會按 180 秒重複分段請求。正式 MOSS 流程預設啟用 FireRed VAD/AED，先掃描整片並在 GPU offload 後合成最多三分鐘音檔；預設 `vocal_separator=demucs` 會在所有音檔分離完成、再次 offload 後進入 MOSS。若要使用 Mel-Band-RoFormer，可在 JSON 設定 `"vocal_separator": "roformer"`，或用 `--vocal-separator roformer` 暫時覆寫；也可用 `ENABLE_FIRERED_VAD=0` 關閉 VAD/AED。Video 的 `video_high_quality_max_seconds=240` 代表 4 分鐘內使用來源最高畫質，超過時回到 `video_height=480`。若明確加上 `--asr-stream`，才會每 180 秒分段下載，並累計滿 `--asr-batch-size`（預設 3）段才執行一次 MOSS BS ASR；影片尾端不足 BS 的批次仍會送出。
 目前剪片規則是：停頓小於門檻時完整保留；停頓大於或等於門檻時切段，預設前後延伸為 0 秒。
 若需回到一般精選翻譯，對 Shorts、Video 或 Chosen 加上 `--no-three-phase-selection`。
 
@@ -296,7 +301,7 @@ Chosen 有 URL 時不會拿既有高畫質成品接續，會重新下載規劃�
 
 ## MOSS 與字幕輸出
 
-長影片預設以 **3 分鐘（180 秒）**下載 240P 片段；每片段先經 Demucs，再獨立辨識，合併成完整時間軸後才一次送到 OpenRouter。若單段發生 CUDA OOM，ASR 仍會自動二分到最低 90 秒。
+Video／Chosen 預設先完整下載一次 240P；FireRed VAD/AED 掃描整片後合成最多 **3 分鐘（180 秒）**音檔，所有 Demucs 分離完成並釋放 GPU 後才進入 MOSS 批次 ASR，最後才送 OpenRouter。若明確開啟 `--asr-stream`，才會改成 180 秒一段的串流下載流程。
 
 - `output/03_videos/`：保留原始畫面，輸出 UTF-8 BOM、CRLF、移除 `[Sxx]` 標籤的播放器相容 SRT。
 - `output/02_preview_videos/`：保留原始畫面並輸出同名軟 SRT。

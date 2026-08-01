@@ -54,11 +54,15 @@ def cut_local_segments(
 
     if not segments:
         raise RuntimeError("沒有可剪的語音區段")
+    import full_video_pipeline as fvp
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.unlink(missing_ok=True)
+    actual_durations = fvp.probe_trimmed_video_durations(source, segments)
     filters: list[str] = []
     maps: list[str] = []
     for index, (start, end) in enumerate(segments):
+        duration = actual_durations[index]
         filters.extend(
             [
                 (
@@ -67,6 +71,9 @@ def cut_local_segments(
                 ),
                 (
                     f"[0:a]atrim=start={start:.3f}:end={end:.3f},"
+                    "asetpts=PTS-STARTPTS,"
+                    f"apad=whole_dur={duration:.6f},"
+                    f"atrim=0:{duration:.6f},"
                     f"asetpts=PTS-STARTPTS[a{index}]"
                 ),
             ]
@@ -101,6 +108,9 @@ def cut_local_segments(
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
     if proc.returncode != 0 or not out_path.exists():
         raise RuntimeError(f"預覽剪片失敗：{(proc.stderr or '')[-500:]}")
+    # AAC 幀長與影格量化可能讓兩條流的時長略有差異；Preview 也要沿用
+    # 正式管線的畫面主時間軸，避免剪完後尾端或接縫出現音畫偏移。
+    fvp.align_av_durations(out_path)
     return out_path
 
 
@@ -516,17 +526,29 @@ def process_preview_from_grid(
             f"（約 {trimmed:.1f}s）"
         )
         cut_local_segments(clip_path, segments, cut_path)
+        actual_segment_durations = fvp.probe_trimmed_video_durations(
+            clip_path,
+            segments,
+        )
         publish_src = cut_path
         # retime 字幕
         if original_srt.strip():
             orig_e = fvp.srt_text_to_entries(original_srt)
             original_srt = fvp._entries_to_srt(
-                segment_cutter.retime_subtitles(orig_e, segments)
+                segment_cutter.retime_subtitles(
+                    orig_e,
+                    segments,
+                    output_durations=actual_segment_durations,
+                )
             )
         if translated_srt.strip():
             tr_e = fvp.srt_text_to_entries(translated_srt)
             translated_srt = fvp._entries_to_srt(
-                segment_cutter.retime_subtitles(tr_e, segments)
+                segment_cutter.retime_subtitles(
+                    tr_e,
+                    segments,
+                    output_durations=actual_segment_durations,
+                )
             )
     else:
         if asr.get("preview_source_ended") and entries:
@@ -581,6 +603,9 @@ def process_preview_from_grid(
             if segments is not None:
                 web_meta["preview_trimmed_segments"] = [
                     [round(s, 3), round(e, 3)] for s, e in segments
+                ]
+                web_meta["preview_trimmed_segment_durations"] = [
+                    round(value, 6) for value in actual_segment_durations
                 ]
                 web_meta["preview_net_speech_seconds"] = round(net_dur, 3)
             video_meta.merge_write_mp4_meta(

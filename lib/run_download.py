@@ -199,7 +199,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _boolean_switch(parser, "translation", "開啟或關閉 OpenRouter 翻譯")
     _boolean_switch(parser, "asr", "開啟或關閉語音辨識")
-    _boolean_switch(parser, "demucs-asr", "開啟或關閉 ASR 前 Demucs 人聲分離")
+    _boolean_switch(parser, "demucs-asr", "開啟或關閉 ASR 前人聲分離")
+    parser.add_argument(
+        "--vocal-separator",
+        choices=("demucs", "roformer"),
+        help="覆寫 ASR 人聲分離模型，預設 Demucs",
+    )
     _boolean_switch(parser, "asr-stream", "開啟或關閉 240P 分段下載與 ASR 串流")
     _boolean_switch(parser, "subtitles", "開啟或關閉外掛 SRT 輸出")
     _boolean_switch(parser, "dialogue-trim", "開啟或關閉依對白剪片")
@@ -233,6 +238,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--video-height", type=int, metavar="P", help="Video 解析度高度，預設 480"
+    )
+    parser.add_argument(
+        "--video-high-quality-max-seconds",
+        type=int,
+        metavar="SECONDS",
+        help="Video 不超過此秒數時使用來源最高畫質，預設 240",
     )
     parser.add_argument(
         "--chosen-height", type=int, metavar="P", help="Chosen 解析度高度，預設 1080"
@@ -306,6 +317,7 @@ def run_maintenance(args: argparse.Namespace) -> int | None:
             FeatureSwitches(
                 asr=args.asr,
                 demucs_asr=args.demucs_asr,
+                vocal_separator=args.vocal_separator,
                 asr_stream=args.asr_stream,
                 subtitles=args.subtitles,
                 translation=args.translation,
@@ -320,6 +332,7 @@ def run_maintenance(args: argparse.Namespace) -> int | None:
                 reuse_cache=args.reuse_cache,
                 force=args.force,
                 video_height=args.video_height,
+                video_high_quality_max_seconds=args.video_high_quality_max_seconds,
                 asr_backend=args.asr_backend,
                 translation_model=args.translation_model,
                 reasoning_effort=args.reasoning_effort,
@@ -349,6 +362,9 @@ def run_maintenance(args: argparse.Namespace) -> int | None:
                         archive_dir=DOWNLOADED_DIR,
                         keep_proxy=args.keep_proxy or options.keep_work,
                         max_height=options.video_height,
+                        video_high_quality_max_seconds=(
+                            options.video_high_quality_max_seconds
+                        ),
                         enable_enhance=options.enhance,
                         enable_asr=options.asr,
                         export_subtitles=options.subtitles,
@@ -411,6 +427,11 @@ def _validate_scoped_overrides(
         parser.error("--preview-seconds 只能用於 preview Pipeline")
     if args.video_height is not None and "video" not in selected_stages:
         parser.error("--video-height 只能用於 video Pipeline")
+    if (
+        args.video_high_quality_max_seconds is not None
+        and "video" not in selected_stages
+    ):
+        parser.error("--video-high-quality-max-seconds 只能用於 video Pipeline")
     if args.chosen_height is not None and "chosen" not in selected_stages:
         parser.error("--chosen-height 只能用於 chosen Pipeline")
 
@@ -421,6 +442,7 @@ def main(argv: list[str] | None = None) -> int:
     for name in (
         "preview_seconds",
         "video_height",
+        "video_high_quality_max_seconds",
         "chosen_height",
         "trim_threshold",
         "asr_chunk_seconds",
@@ -458,6 +480,7 @@ def main(argv: list[str] | None = None) -> int:
         for name in (
             "asr",
             "demucs_asr",
+            "vocal_separator",
             "asr_stream",
             "subtitles",
             "translation",
@@ -473,6 +496,7 @@ def main(argv: list[str] | None = None) -> int:
             "force",
             "preview_seconds",
             "video_height",
+            "video_high_quality_max_seconds",
             "chosen_height",
             "asr_backend",
             "translation_model",
@@ -498,6 +522,7 @@ def main(argv: list[str] | None = None) -> int:
             for name in (
                 "asr",
                 "demucs_asr",
+                "vocal_separator",
                 "asr_stream",
                 "subtitles",
                 "translation",
@@ -513,6 +538,7 @@ def main(argv: list[str] | None = None) -> int:
                 "force",
                 "preview_seconds",
                 "video_height",
+                "video_high_quality_max_seconds",
                 "chosen_height",
                 "asr_backend",
                 "translation_model",
@@ -560,6 +586,7 @@ def main(argv: list[str] | None = None) -> int:
     options = FeatureSwitches(
         asr=args.asr,
         demucs_asr=args.demucs_asr,
+        vocal_separator=args.vocal_separator,
         asr_stream=args.asr_stream,
         subtitles=args.subtitles,
         translation=args.translation,
@@ -575,6 +602,7 @@ def main(argv: list[str] | None = None) -> int:
         force=args.force,
         preview_seconds=args.preview_seconds,
         video_height=args.video_height,
+        video_high_quality_max_seconds=args.video_high_quality_max_seconds,
         chosen_height=args.chosen_height,
         asr_backend=args.asr_backend,
         translation_model=args.translation_model,

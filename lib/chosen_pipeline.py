@@ -123,6 +123,7 @@ def _retime_chosen_subtitles(
     original: str,
     translated: str,
     segments: list[tuple[float, float]],
+    output_durations: list[float] | None = None,
 ) -> tuple[str, str]:
     """把 Chosen 字幕重排到高畫質分段串接後的時間軸。"""
     import full_video_pipeline as fvp
@@ -131,13 +132,17 @@ def _retime_chosen_subtitles(
     if original.strip():
         original = fvp._entries_to_srt(
             segment_cutter.retime_subtitles(
-                fvp.srt_text_to_entries(original), segments
+                fvp.srt_text_to_entries(original),
+                segments,
+                output_durations=output_durations,
             )
         )
     if translated.strip():
         translated = fvp._entries_to_srt(
             segment_cutter.retime_subtitles(
-                fvp.srt_text_to_entries(translated), segments
+                fvp.srt_text_to_entries(translated),
+                segments,
+                output_durations=output_durations,
             )
         )
     return original, translated

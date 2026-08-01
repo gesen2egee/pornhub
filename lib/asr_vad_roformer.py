@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""FireRed VAD/AED → Mel-Band-RoFormer → 最多三分鐘 ASR 音檔。
+"""FireRed VAD/AED 與可選的 Mel-Band-RoFormer → 最多三分鐘 ASR 音檔。
 
 每個人聲段在壓縮音檔中的位置都保留映射表，MOSS 的字幕可回寫為原始
 影片時間軸。GPU 以跨程序鎖保護，階段結束即釋放模型與 CUDA 快取。
@@ -30,7 +30,18 @@ _THREAD_LOCK = Lock()
 
 
 @dataclass(frozen=True)
+class VadAudioChunks:
+    """整片 VAD 後合成的三分鐘音檔與原片時間映射。"""
+
+    chunks: list[dict[str, Any]]
+    singing_ranges: list[tuple[float, float]]
+    speech_ranges: list[tuple[float, float]]
+
+
+@dataclass(frozen=True)
 class VadRoformerAudio:
+    """完成 Mel-Band-RoFormer 後的三分鐘人聲音檔與時間映射。"""
+
     chunks: list[dict[str, Any]]
     singing_ranges: list[tuple[float, float]]
     speech_ranges: list[tuple[float, float]]
@@ -159,6 +170,7 @@ def _detect_events(source: Path, work_dir: Path) -> tuple[list[tuple[float, floa
         aed_result, _ = aed.detect(str(audio))
         del aed
         _release_cuda()
+    print("  [GPU Offload] FireRed VAD/AED 完成，已釋放 GPU 記憶體", flush=True)
     speech = _extend_ranges(
         _merge_ranges(list(vad_result.get("timestamps") or [])),
         source_duration,
@@ -178,11 +190,141 @@ def _time_map(compact_start: float, compact_end: float, start: float, end: float
     }
 
 
+def prepare_vad_chunks(source: Path, work_dir: Path) -> VadAudioChunks:
+    """完整執行 VAD/AED，再把人聲範圍合成最多三分鐘的音檔。"""
+    import soundfile as sf
+
+    source = Path(source).resolve()
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = work_dir / "vad_chunks_manifest.json"
+    expected_padding = _vad_edge_padding_seconds()
+    try:
+        chunk_seconds = float(os.getenv("MOSS_CHUNK_SECONDS", DEFAULT_CHUNK_SECONDS))
+        gap_seconds = float(os.getenv("VAD_COMPACT_GAP_SECONDS", DEFAULT_GAP_SECONDS))
+    except ValueError as exc:
+        raise ValueError(
+            "MOSS_CHUNK_SECONDS 或 VAD_COMPACT_GAP_SECONDS 格式錯誤"
+        ) from exc
+    if chunk_seconds <= 0 or gap_seconds < 0:
+        raise ValueError(
+            "MOSS_CHUNK_SECONDS 必須為正數，VAD_COMPACT_GAP_SECONDS 不可小於 0"
+        )
+
+    if cache_path.is_file():
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            cached_chunks = list(payload.get("chunks") or [])
+            paths = [Path(item["path"]) for item in cached_chunks]
+            same_settings = (
+                payload.get("schema") == "vad_chunks_v1"
+                and float(payload.get("edge_padding_seconds", -1)) == expected_padding
+                and abs(float(payload.get("chunk_seconds", -1)) - chunk_seconds) < 0.01
+                and abs(float(payload.get("gap_seconds", -1)) - gap_seconds) < 0.01
+            )
+            if same_settings and all(
+                path.is_file() and path.stat().st_size > 0 for path in paths
+            ):
+                return VadAudioChunks(
+                    chunks=cached_chunks,
+                    singing_ranges=[
+                        tuple(item) for item in payload.get("singing_ranges") or []
+                    ],
+                    speech_ranges=[
+                        tuple(item) for item in payload.get("speech_ranges") or []
+                    ],
+                )
+        except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+            pass
+
+    speech_ranges, singing_ranges = _detect_events(source, work_dir)
+    output_dir = work_dir / "vad-roformer-moss"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    raw_chunks: list[dict[str, Any]] = []
+    if speech_ranges:
+        audio_path = _extract_mono_16k(source, work_dir)
+        audio, sample_rate = sf.read(audio_path, dtype="float32")
+        if sample_rate != SAMPLE_RATE:
+            raise RuntimeError(f"FireRed 音檔採樣率不符：{sample_rate}")
+        parts: list[np.ndarray] = []
+        mapping: list[dict[str, float]] = []
+        compact_duration = 0.0
+
+        def flush() -> None:
+            nonlocal parts, mapping, compact_duration
+            if not parts:
+                return
+            path = output_dir / f"compact-{len(raw_chunks) + 1:03d}.source.wav"
+            merged = np.concatenate(parts)
+            sf.write(path, merged, SAMPLE_RATE, subtype="PCM_16")
+            raw_chunks.append({
+                "path": str(path),
+                "duration": round(len(merged) / SAMPLE_RATE, 6),
+                "mapping": mapping,
+            })
+            parts, mapping, compact_duration = [], [], 0.0
+
+        # VAD 已先完整掃描全片；此處只負責把人聲範圍合成三分鐘音檔，
+        # 不載入人聲分離模型，確保下一階段能從乾淨的 VRAM 開始。
+        for speech_start, speech_end in speech_ranges:
+            start = speech_start
+            while start < speech_end - 0.001:
+                gap = gap_seconds if parts else 0.0
+                capacity = chunk_seconds - compact_duration - gap
+                if capacity <= 0.01:
+                    flush()
+                    continue
+                end = min(speech_end, start + capacity)
+                source_piece = audio[
+                    round(start * SAMPLE_RATE):round(end * SAMPLE_RATE)
+                ]
+                if not len(source_piece):
+                    start = end
+                    continue
+                if gap:
+                    parts.append(
+                        np.zeros(round(gap * SAMPLE_RATE), dtype=np.float32)
+                    )
+                    compact_duration += gap
+                compact_start = compact_duration
+                parts.append(source_piece)
+                compact_duration += len(source_piece) / SAMPLE_RATE
+                mapping.append(_time_map(compact_start, compact_duration, start, end))
+                start = end
+        flush()
+
+    _release_cuda()
+    print(
+        f"  [VAD] 整片完成；已合成 {len(raw_chunks)} 個最多 "
+        f"{chunk_seconds / 60:.1f} 分鐘音檔，等待人聲分離",
+        flush=True,
+    )
+    payload = {
+        "schema": "vad_chunks_v1",
+        "edge_padding_seconds": expected_padding,
+        "chunk_seconds": chunk_seconds,
+        "gap_seconds": gap_seconds,
+        "chunks": raw_chunks,
+        "singing_ranges": singing_ranges,
+        "speech_ranges": speech_ranges,
+    }
+    cache_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return VadAudioChunks(raw_chunks, singing_ranges, speech_ranges)
+
+
 def prepare_vad_roformer_audio(source: Path, work_dir: Path) -> VadRoformerAudio:
-    """先合併 VAD 人聲，再對每個最多三分鐘音檔做一次 RoFormer 分離。"""
+    """先完整 VAD，再對每個最多三分鐘音檔做一次 RoFormer 分離。"""
     import librosa
     import soundfile as sf
-    from mel_band_roformer_vocal import SAMPLE_RATE as ROFORMER_RATE, _load_model, _resolve_device, _separate
+    from mel_band_roformer_vocal import (
+        SAMPLE_RATE as ROFORMER_RATE,
+        _load_model,
+        _resolve_device,
+        _separate,
+    )
 
     source = Path(source).resolve()
     work_dir = Path(work_dir)
@@ -200,75 +342,28 @@ def prepare_vad_roformer_audio(source: Path, work_dir: Path) -> VadRoformerAudio
         ):
             return VadRoformerAudio(
                 chunks=list(payload["chunks"]),
-                singing_ranges=[tuple(item) for item in payload.get("singing_ranges") or []],
-                speech_ranges=[tuple(item) for item in payload.get("speech_ranges") or []],
+                singing_ranges=[
+                    tuple(item) for item in payload.get("singing_ranges") or []
+                ],
+                speech_ranges=[
+                    tuple(item) for item in payload.get("speech_ranges") or []
+                ],
             )
 
-    speech_ranges, singing_ranges = _detect_events(source, work_dir)
-    if not speech_ranges:
-        return VadRoformerAudio([], singing_ranges, [])
-    audio_path = _extract_mono_16k(source, work_dir)
-    audio, sample_rate = sf.read(audio_path, dtype="float32")
-    if sample_rate != SAMPLE_RATE:
-        raise RuntimeError(f"FireRed 音檔採樣率不符：{sample_rate}")
-    chunk_seconds = float(os.getenv("MOSS_CHUNK_SECONDS", DEFAULT_CHUNK_SECONDS))
-    gap_seconds = float(os.getenv("VAD_COMPACT_GAP_SECONDS", DEFAULT_GAP_SECONDS))
-    if chunk_seconds <= 0 or gap_seconds < 0:
-        raise ValueError("MOSS_CHUNK_SECONDS 必須為正數，VAD_COMPACT_GAP_SECONDS 不可小於 0")
+    prepared = prepare_vad_chunks(source, work_dir)
+    if not prepared.chunks:
+        return VadRoformerAudio(
+            [], prepared.singing_ranges, prepared.speech_ranges
+        )
     output_dir = work_dir / "vad-roformer-moss"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    raw_chunks: list[dict[str, Any]] = []
-    parts: list[np.ndarray] = []
-    mapping: list[dict[str, float]] = []
-    compact_duration = 0.0
-
-    def flush() -> None:
-        nonlocal parts, mapping, compact_duration
-        if not parts:
-            return
-        path = output_dir / f"compact-{len(raw_chunks) + 1:03d}.source.wav"
-        merged = np.concatenate(parts)
-        sf.write(path, merged, SAMPLE_RATE, subtype="PCM_16")
-        raw_chunks.append({
-            "source_path": path,
-            "duration": round(len(merged) / SAMPLE_RATE, 6),
-            "mapping": mapping,
-        })
-        parts, mapping, compact_duration = [], [], 0.0
-
-    # 先按 VAD 後時長組成最多三分鐘的原始人聲範圍；RoFormer 不在此階段
-    # 逐小段載入，避免小段邊界讓分離結果與 MOSS 上下文破碎。
-    for speech_start, speech_end in speech_ranges:
-        start = speech_start
-        while start < speech_end - 0.001:
-            gap = gap_seconds if parts else 0.0
-            capacity = chunk_seconds - compact_duration - gap
-            if capacity <= 0.01:
-                flush()
-                continue
-            end = min(speech_end, start + capacity)
-            source_piece = audio[round(start * SAMPLE_RATE):round(end * SAMPLE_RATE)]
-            if not len(source_piece):
-                start = end
-                continue
-            if gap:
-                parts.append(np.zeros(round(gap * SAMPLE_RATE), dtype=np.float32))
-                compact_duration += gap
-            compact_start = compact_duration
-            parts.append(source_piece)
-            compact_duration += len(source_piece) / SAMPLE_RATE
-            mapping.append(_time_map(compact_start, compact_duration, start, end))
-            start = end
-    flush()
-
     chunks: list[dict[str, Any]] = []
     device = _resolve_device(os.getenv("ROFORMER_DEVICE", "auto").strip() or "auto")
     overlap = int(os.getenv("ROFORMER_OVERLAP", "2"))
     with gpu_inference_lock("Mel-Band-RoFormer"):
         model = _load_model(device)
         try:
-            for raw_chunk in raw_chunks:
-                compact, source_rate = sf.read(raw_chunk["source_path"], dtype="float32")
+            for raw_chunk in prepared.chunks:
+                compact, source_rate = sf.read(raw_chunk["path"], dtype="float32")
                 if source_rate != SAMPLE_RATE:
                     raise RuntimeError(f"VAD 合併音檔採樣率不符：{source_rate}")
                 stereo = librosa.resample(
@@ -277,7 +372,9 @@ def prepare_vad_roformer_audio(source: Path, work_dir: Path) -> VadRoformerAudio
                 ).astype(np.float32, copy=False)
                 vocals = _separate(model, stereo, device, overlap=overlap)
                 vocals_16k = librosa.resample(
-                    vocals.mean(axis=0), orig_sr=ROFORMER_RATE, target_sr=SAMPLE_RATE,
+                    vocals.mean(axis=0),
+                    orig_sr=ROFORMER_RATE,
+                    target_sr=SAMPLE_RATE,
                 ).astype(np.float32, copy=False)
                 path = output_dir / f"speech-{len(chunks) + 1:03d}.wav"
                 sf.write(path, vocals_16k, SAMPLE_RATE, subtype="PCM_16")
@@ -289,22 +386,47 @@ def prepare_vad_roformer_audio(source: Path, work_dir: Path) -> VadRoformerAudio
         finally:
             del model
             _release_cuda()
+    print("  [GPU Offload] RoFormer 人聲分離完成，已釋放 GPU 記憶體", flush=True)
 
     payload = {
         "schema": "vad_roformer_v3",
         "edge_padding_seconds": expected_padding,
         "chunks": chunks,
-        "singing_ranges": singing_ranges,
-        "speech_ranges": speech_ranges,
+        "singing_ranges": prepared.singing_ranges,
+        "speech_ranges": prepared.speech_ranges,
     }
-    cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return VadRoformerAudio(chunks, singing_ranges, speech_ranges)
+    cache_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return VadRoformerAudio(
+        chunks, prepared.singing_ranges, prepared.speech_ranges
+    )
 
 
 def map_compact_time(value: float, mapping: list[dict[str, float]]) -> float:
-    for item in mapping:
-        if item["compact_start"] - 0.05 <= value <= item["compact_end"] + 0.05:
-            ratio = (value - item["compact_start"]) / max(item["compact_end"] - item["compact_start"], 0.001)
-            return item["original_start"] + ratio * (item["original_end"] - item["original_start"])
-    previous = [item for item in mapping if item["compact_end"] <= value]
-    return previous[-1]["original_end"] if previous else mapping[0]["original_start"]
+    """把壓縮音檔時間映射回原片，且不外推出來源區段。"""
+    if not mapping:
+        return max(0.0, float(value))
+
+    ordered = sorted(mapping, key=lambda item: item["compact_start"])
+    tolerance = 0.05
+    for item in ordered:
+        compact_start = float(item["compact_start"])
+        compact_end = float(item["compact_end"])
+        if compact_start - tolerance <= value <= compact_end + tolerance:
+            # 容許值只用來吸收 ASR 的邊界量化，不允許比例計算把時間
+            # 外推到原始語音區段之外；插入靜音會落在前後端點。
+            clamped_value = min(max(float(value), compact_start), compact_end)
+            compact_duration = compact_end - compact_start
+            if compact_duration <= 0:
+                return float(item["original_start"])
+            ratio = (clamped_value - compact_start) / compact_duration
+            original_start = float(item["original_start"])
+            original_end = float(item["original_end"])
+            return original_start + ratio * (original_end - original_start)
+
+    previous = [item for item in ordered if item["compact_end"] <= value]
+    if previous:
+        return float(previous[-1]["original_end"])
+    return float(ordered[0]["original_start"])

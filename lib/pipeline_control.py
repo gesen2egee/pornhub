@@ -31,7 +31,8 @@ from project_paths import (
 STAGE_ORDER = ("preview", "shorts", "video", "chosen")
 GRID_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm", ".m4v"}
-DEFAULT_SOURCE_PIPELINE_WORKERS = 2
+# 影音分離、MOSS 與音訊增強都會使用 GPU；預設一次只處理一支來源影片。
+DEFAULT_SOURCE_PIPELINE_WORKERS = 1
 _PIPELINE_PROCESS_THREAD_LOCK = Lock()
 FOLDER_CONFIG_VERSION = 1
 FOLDER_CONFIG_PATTERN = re.compile(
@@ -112,6 +113,7 @@ class FeatureSwitches:
 
     asr: bool | None = None
     demucs_asr: bool | None = None
+    vocal_separator: str | None = None
     asr_stream: bool | None = None
     subtitles: bool | None = None
     translation: bool | None = None
@@ -127,6 +129,7 @@ class FeatureSwitches:
     force: bool | None = None
     preview_seconds: int | None = None
     video_height: int | None = None
+    video_high_quality_max_seconds: int | None = None
     chosen_height: int | None = None
     asr_backend: str | None = None
     translation_model: str | None = None
@@ -195,6 +198,7 @@ FOLDER_CONFIG_TOP_LEVEL_KEYS = {
 FOLDER_CONFIG_SETTING_TO_OPTION = {
     "asr": "asr",
     "demucs_asr": "demucs_asr",
+    "vocal_separator": "vocal_separator",
     "asr_stream": "asr_stream",
     "subtitles": "subtitles",
     "translation": "translation",
@@ -210,6 +214,7 @@ FOLDER_CONFIG_SETTING_TO_OPTION = {
     "force": "force",
     "preview_seconds": "preview_seconds",
     "video_height": "video_height",
+    "video_high_quality_max_seconds": "video_high_quality_max_seconds",
     "chosen_height": "chosen_height",
     "asr_backend": "asr_backend",
     "translation_model": "translation_model",
@@ -239,6 +244,7 @@ BOOLEAN_CONFIG_SETTINGS = {
 POSITIVE_INTEGER_CONFIG_SETTINGS = {
     "preview_seconds",
     "video_height",
+    "video_high_quality_max_seconds",
     "chosen_height",
     "asr_chunk_seconds",
     "asr_batch_size",
@@ -259,7 +265,7 @@ STAGES = {
         "第三層：Video",
         VIDEOS_DIR,
         "$$ 中預算",
-        "240P/MOSS 串流→GLM 5.2 minimal 精選、Grok 4.3 minimal 一次翻譯（失敗改 Grok 4.5）30秒三段→關鍵格安全高畫質切塊、音訊判斷 enhance＋等長段內淡化",
+        "240P/MOSS→GLM 5.2 minimal 精選、Grok 4.3 minimal 一次翻譯（失敗改 Grok 4.5）30秒三段→4分鐘內來源最高畫質、超過4分鐘480P→音訊判斷 enhance＋等長段內淡化",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
     "shorts": StageDefinition(
@@ -275,7 +281,7 @@ STAGES = {
         "第四層：Chosen",
         CHOSEN_DIR,
         "$$$ 高預算",
-        "240P/MOSS 串流→GLM 5.2 minimal 精選、Grok 4.3 minimal 一次翻譯（失敗改 Grok 4.5）30秒三段→關鍵格安全 1080P 切塊、音訊判斷 enhance＋等長段內淡化",
+        "240P/MOSS→GLM 5.2 minimal 精選、Grok 4.3 minimal 一次翻譯（失敗改 Grok 4.5）30秒三段→關鍵格安全 1080P 切塊、音訊判斷 enhance＋等長段內淡化",
         frozenset(GRID_EXTENSIONS | VIDEO_EXTENSIONS),
     ),
 }
@@ -316,6 +322,16 @@ def _parse_folder_settings(raw: Any, path: Path) -> FeatureSwitches:
         elif config_name in POSITIVE_INTEGER_CONFIG_SETTINGS:
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise _config_error(path, f"settings.{config_name} 必須是大於 0 的整數")
+        elif config_name == "vocal_separator":
+            if not isinstance(value, str) or value.casefold() not in {
+                "demucs",
+                "roformer",
+            }:
+                raise _config_error(
+                    path,
+                    "settings.vocal_separator 必須是 demucs 或 roformer",
+                )
+            value = value.casefold()
         elif config_name == "trim_threshold":
             if (
                 isinstance(value, bool)
@@ -856,6 +872,8 @@ def apply_feature_switches(options: FeatureSwitches) -> None:
         os.environ["ASR_STREAM_CHUNK_SECONDS"] = str(options.asr_chunk_seconds)
     if options.asr_batch_size is not None:
         os.environ["MOSS_ASR_BATCH_SIZE"] = str(options.asr_batch_size)
+    if options.vocal_separator:
+        os.environ["ASR_VOCAL_SEPARATOR"] = options.vocal_separator
     if options.asr_backend:
         os.environ["ASR_BACKEND"] = options.asr_backend
         os.environ["CHOSEN_ASR_BACKEND"] = options.asr_backend
@@ -881,6 +899,7 @@ def resolve_stage_options(
     defaults = {
         "asr": True,
         "demucs_asr": True,
+        "vocal_separator": "demucs",
         "asr_stream": False,
         "subtitles": True,
         "translation": True,
@@ -898,6 +917,9 @@ def resolve_stage_options(
         "force": False,
         "preview_seconds": 180,
         "video_height": 480,
+        "video_high_quality_max_seconds": (
+            240 if stage_name == "video" else None
+        ),
         "chosen_height": 1080,
         "asr_backend": "moss",
         "translation_model": "x-ai/grok-4.3",
@@ -980,6 +1002,7 @@ def print_effective_options(stage_name: str, options: FeatureSwitches) -> None:
     print(
         "實際設定："
         f"ASR={state(options.asr)}｜Demucs={state(options.demucs_asr)}｜"
+        f"人聲模型={options.vocal_separator}｜"
         f"ASR串流={state(options.asr_stream)}｜"
         f"SRT={state(options.subtitles)}｜"
         f"翻譯={state(options.translation)}｜剪片={state(options.dialogue_trim)}｜"
@@ -1005,6 +1028,7 @@ def feature_environment(options: FeatureSwitches):
     names = (
         "ENABLE_ASR",
         "ENABLE_DEMUCS_ASR",
+        "ASR_VOCAL_SEPARATOR",
         "ENABLE_ASR_STREAM",
         "EXPORT_SUBTITLES",
         "ENABLE_TRANSLATION",
@@ -1227,6 +1251,9 @@ def _execute_stage(
                 archive_dir=Path(archive_dir or DOWNLOADED_DIR),
                 keep_proxy=bool(options.keep_work),
                 max_height=options.video_height or 480,
+                video_high_quality_max_seconds=(
+                    options.video_high_quality_max_seconds
+                ),
                 enable_enhance=options.enhance,
                 enable_asr=options.asr,
                 export_subtitles=options.subtitles,

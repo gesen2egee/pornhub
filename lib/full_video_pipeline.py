@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""正式影片（03_videos）管線：240P 分段下載與 Demucs/ASR 串流重疊，
+"""正式影片（03_videos）管線：完整 240P 分析與 Demucs/ASR，
 完成後平行執行翻譯、高畫質切塊下載與分段 enhance。
 
 預覽影片（02_preview_videos）不走此模組，維持原下載＋背景字幕流程。
@@ -51,6 +51,8 @@ HIGH_FORMAT = (
     "bestvideo*+bestaudio/best"
 )
 HIGH_FORMAT_SORT = ["res:720"]
+# Video 層的短片門檻：不超過四分鐘時使用來源可用最高畫質。
+DEFAULT_VIDEO_HIGH_QUALITY_MAX_SECONDS = 240.0
 # yt-dlp --concurrent-fragments（分片並行下載）
 HIGH_CONCURRENT_FRAGMENTS = 8
 DIALOGUE_TRIM_THRESHOLD = 30.0
@@ -266,8 +268,39 @@ def _source_asr_payload(
         "cues": cues,
         "source_duration": source_duration,
         "singing_ranges": list(asr.get("singing_ranges") or []),
+        "asr_audio_mode": asr.get("asr_audio_mode"),
         "moss_cue_merge_version": asr.get("moss_cue_merge_version"),
     }
+
+
+def _expected_vad_asr_mode(*, force_stream: bool = False) -> str | None:
+    """回傳目前 MOSS 流程應使用的 VAD／人聲分離模式。"""
+    from asr_audio import demucs_asr_enabled
+    from asr_backends import selected_asr_backend_name
+
+    if selected_asr_backend_name() != "moss":
+        return None
+    stream_enabled = os.getenv("ENABLE_ASR_STREAM", "0").strip().casefold() in {
+        "1", "true", "yes", "on",
+    }
+    separator = os.getenv("ASR_VOCAL_SEPARATOR", "demucs").strip().casefold()
+    if stream_enabled or force_stream:
+        if not demucs_asr_enabled():
+            return "stream_raw"
+        if separator in {"roformer", "mel-band-roformer", "melbandroformer"}:
+            return "stream_roformer"
+        if separator == "demucs":
+            return "stream_demucs"
+        return None
+    if os.getenv("ENABLE_FIRERED_VAD", "1").strip().casefold() in {
+        "0", "false", "no", "off",
+    } or not demucs_asr_enabled():
+        return None
+    if separator in {"roformer", "mel-band-roformer", "melbandroformer"}:
+        return "firered_vad_roformer_3min"
+    if separator == "demucs":
+        return "firered_vad_demucs_3min"
+    return None
 
 
 def set_pipeline_metrics(metrics: Any | None) -> None:
@@ -494,7 +527,13 @@ def load_embedded_translation(
         or web_meta.get("trimmed_segments")
         or []
     )
+    raw_output_durations = (
+        web_meta.get("preview_trimmed_segment_durations")
+        or web_meta.get("trimmed_segment_durations")
+        or []
+    )
     source_segments: list[tuple[float, float]] = []
+    output_durations: list[float] | None = None
     try:
         source_segments = [
             (float(item[0]), float(item[1]))
@@ -505,11 +544,25 @@ def load_embedded_translation(
         ]
     except (TypeError, ValueError):
         source_segments = []
+    try:
+        parsed_durations = [
+            float(value)
+            for value in raw_output_durations
+            if float(value) > 0
+        ]
+    except (TypeError, ValueError):
+        parsed_durations = []
+    if len(parsed_durations) == len(source_segments):
+        output_durations = parsed_durations
 
     timeline_restored = False
     if source_segments:
         translated_entries = srt_text_to_entries(translated)
-        trimmed_duration = sum(end - start for start, end in source_segments)
+        trimmed_duration = sum(
+            output_durations
+            if output_durations is not None
+            else [end - start for start, end in source_segments]
+        )
         latest_subtitle_end = max(
             (entry["end"] for entry in translated_entries),
             default=0.0,
@@ -520,6 +573,7 @@ def load_embedded_translation(
                 segment_cutter.restore_subtitles_to_source_timeline(
                     translated_entries,
                     source_segments,
+                    output_durations=output_durations,
                 )
             )
             if original.strip():
@@ -527,6 +581,7 @@ def load_embedded_translation(
                     segment_cutter.restore_subtitles_to_source_timeline(
                         srt_text_to_entries(original),
                         source_segments,
+                        output_durations=output_durations,
                     )
                 )
             timeline_restored = True
@@ -624,6 +679,105 @@ def probe_stream_start_time(path: Path, codec_type: str) -> float | None:
     except (FileNotFoundError, subprocess.SubprocessError, ValueError):
         pass
     return None
+
+
+def probe_trimmed_video_durations(
+    path: Path,
+    segments: list[tuple[float, float]],
+) -> list[float]:
+    """依來源實際影格 PTS，估算 trim 後每段畫面輸出時長。
+
+    FFmpeg 的 ``trim`` 不會把來源秒數拉伸成固定長度；起訖會落在實際
+    影格邊界。這個函式使用同一份來源影格時間戳計算每段會保留的影格
+    時長，讓字幕與串接後的畫面時間軸使用同一個量化結果。探測失敗時
+    回退到請求時長，維持舊呼叫端的容錯行為。
+    """
+    requested = [
+        max(0.0, float(end) - float(start))
+        for start, end in segments
+    ]
+    if not segments or not path.is_file():
+        return requested
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "frame=best_effort_timestamp_time,pkt_duration_time",
+                "-of",
+                "csv=p=0",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return requested
+    if result.returncode != 0:
+        return requested
+
+    frame_records: list[tuple[float, float | None]] = []
+    for raw_line in result.stdout.splitlines():
+        fields = raw_line.strip().split(",")
+        try:
+            timestamp = float(fields[0])
+        except ValueError:
+            continue
+        if math.isfinite(timestamp):
+            packet_duration = None
+            if len(fields) > 1 and fields[1].strip():
+                try:
+                    candidate = float(fields[1])
+                except ValueError:
+                    candidate = 0.0
+                if math.isfinite(candidate) and candidate > 0:
+                    packet_duration = candidate
+            frame_records.append((timestamp, packet_duration))
+    if not frame_records:
+        return requested
+    frame_records.sort(key=lambda item: item[0])
+    frame_times = [item[0] for item in frame_records]
+    frame_durations = [item[1] for item in frame_records]
+
+    steps = [
+        right - left
+        for left, right in zip(frame_times, frame_times[1:])
+        if 0.000001 < right - left < 10.0
+    ]
+    if steps:
+        ordered_steps = sorted(steps)
+        default_step = ordered_steps[len(ordered_steps) // 2]
+    else:
+        default_step = 0.0
+
+    measured: list[float] = []
+    for (start, end), fallback in zip(segments, requested, strict=True):
+        start = float(start)
+        end = float(end)
+        selected = [
+            index
+            for index, timestamp in enumerate(frame_times)
+            if timestamp >= start - 1e-7 and timestamp < end - 1e-7
+        ]
+        if not selected:
+            measured.append(fallback)
+            continue
+        duration = 0.0
+        for index in selected:
+            frame_duration = frame_durations[index]
+            if frame_duration is None and index + 1 < len(frame_times):
+                frame_duration = frame_times[index + 1] - frame_times[index]
+            if frame_duration is None:
+                frame_duration = default_step
+            if frame_duration > 0:
+                duration += frame_duration
+        measured.append(duration if duration > 0 else fallback)
+    return measured
 
 
 def has_audio_stream(path: Path) -> bool | None:
@@ -1080,7 +1234,7 @@ def _high_range_format_opts() -> tuple[str, list[str], int]:
     except ValueError:
         height = 720
     direct = (
-        "best[protocol=https]"
+        "bestvideo[protocol=https]+bestaudio[protocol=https]/best[protocol=https]"
         if unlimited
         else f"best[protocol=https][height<={height}]/best[protocol=https]"
     )
@@ -1109,7 +1263,10 @@ def download_high_full(video_url: str, out_path: Path) -> Path:
         ydl.download([video_url])
     if not out_path.exists() or has_video_stream(out_path) is not True:
         raise RuntimeError(f"高畫質全片下載失敗：{out_path}")
-    if is_within_1080p(out_path) is False:
+    unlimited = os.getenv("HIGH_VIDEO_UNLIMITED", "0").strip().casefold() in {
+        "1", "true", "yes", "on",
+    }
+    if not unlimited and is_within_1080p(out_path) is False:
         out_path.unlink(missing_ok=True)
         raise RuntimeError("高畫質影片超過等效 1080P，已捨棄")
     return out_path
@@ -2375,26 +2532,56 @@ def run_asr_only_local(proxy_path: Path) -> dict[str, Any]:
     }
 
 
-def run_asr_only(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
-    """先分離人聲後 ASR，不在此階段呼叫 OpenRouter。"""
-    from asr_audio import prepare_asr_audio
+def run_asr_only(
+    proxy_path: Path,
+    work_dir: Path,
+    moss_worker: MossAsrWorker | None = None,
+) -> dict[str, Any]:
+    """先完成 VAD／人聲分離後再做 MOSS ASR，不在此階段呼叫 OpenRouter。"""
+    from asr_audio import demucs_asr_enabled, prepare_asr_audio
     from asr_backends import selected_asr_backend_name
 
     backend_name = selected_asr_backend_name()
-    use_vad_roformer = (
+    separator_kind = os.getenv(
+        "ASR_VOCAL_SEPARATOR", "demucs"
+    ).strip().casefold()
+    use_vad_moss = (
         backend_name == "moss"
         and os.getenv("ENABLE_FIRERED_VAD", "1").strip().casefold()
         not in {"0", "false", "no", "off"}
-        and os.getenv("ASR_VOCAL_SEPARATOR", "roformer").strip().casefold()
-        in {"roformer", "mel-band-roformer", "melbandroformer"}
+        and demucs_asr_enabled()
+        and separator_kind in {
+            "demucs",
+            "roformer",
+            "mel-band-roformer",
+            "melbandroformer",
+        }
     )
-    if use_vad_roformer:
-        return _run_vad_roformer_moss(proxy_path, work_dir)
+    if use_vad_moss:
+        if separator_kind in {"roformer", "mel-band-roformer", "melbandroformer"}:
+            return _run_vad_roformer_moss(
+                proxy_path,
+                work_dir,
+                moss_worker=moss_worker,
+            )
+        return _run_vad_demucs_moss(
+            proxy_path,
+            work_dir,
+            moss_worker=moss_worker,
+        )
 
     asr_audio = prepare_asr_audio(proxy_path, work_dir)
     current = Path(sys.executable).resolve()
     if backend_name in {"voxtral", "grok-stt", "whisper"}:
         return run_asr_only_local(asr_audio)
+    if moss_worker is not None:
+        results = run_asr_audio_batch(
+            [asr_audio],
+            work_dir / "moss-full",
+            moss_worker=moss_worker,
+        )
+        _release_moss_worker(moss_worker)
+        return results[0]
     if "moss" in str(current).casefold() and current.exists():
         payload = run_asr_only_local(asr_audio)
         payload["cues"] = merge_moss_cues(payload.get("cues") or [])
@@ -2437,8 +2624,13 @@ def run_asr_only(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
     return payload
 
 
-def _run_vad_roformer_moss(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
-    """將 VAD 人聲段分離後，按最多三分鐘送 MOSS 並回映原時間軸。"""
+def _run_vad_roformer_moss(
+    proxy_path: Path,
+    work_dir: Path,
+    *,
+    moss_worker: MossAsrWorker | None = None,
+) -> dict[str, Any]:
+    """將完整 VAD 後的人聲段分離，再按最多三分鐘送 MOSS 並回映時間軸。"""
     from asr_backends import asr_batch_size
     from asr_vad_roformer import map_compact_time, prepare_vad_roformer_audio
     from translate_srt_openrouter import format_srt
@@ -2453,6 +2645,7 @@ def _run_vad_roformer_moss(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
             "cues": [],
             "singing_ranges": [list(item) for item in prepared.singing_ranges],
             "speech_ranges": [list(item) for item in prepared.speech_ranges],
+            "asr_audio_mode": "firered_vad_roformer_3min",
         }
     raw_results: list[dict[str, Any]] = []
     chunk_size = asr_batch_size()
@@ -2466,8 +2659,10 @@ def _run_vad_roformer_moss(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
             run_asr_audio_batch(
                 [Path(item["path"]) for item in group],
                 work_dir / f"moss-vad-{start + 1:03d}",
+                moss_worker=moss_worker,
             )
         )
+    _release_moss_worker(moss_worker)
     cues: list[dict[str, Any]] = []
     languages: list[str] = []
     for chunk, result in zip(prepared.chunks, raw_results, strict=True):
@@ -2503,6 +2698,108 @@ def _run_vad_roformer_moss(proxy_path: Path, work_dir: Path) -> dict[str, Any]:
         "singing_ranges": [list(item) for item in prepared.singing_ranges],
         "speech_ranges": [list(item) for item in prepared.speech_ranges],
         "asr_audio_mode": "firered_vad_roformer_3min",
+        "asr_chunk_count": len(prepared.chunks),
+        "moss_cue_merge_version": MOSS_CUE_MERGE_VERSION,
+    }
+
+
+def _run_vad_demucs_moss(
+    proxy_path: Path,
+    work_dir: Path,
+    *,
+    moss_worker: MossAsrWorker | None = None,
+) -> dict[str, Any]:
+    """完整 VAD 後合成三分鐘音檔，全部 Demucs 完成後才進入 MOSS。"""
+    from asr_audio import prepare_demucs_audio_batch
+    from asr_backends import asr_batch_size
+    from asr_vad_roformer import (
+        map_compact_time,
+        prepare_vad_chunks,
+    )
+    from translate_srt_openrouter import format_srt
+
+    prepared = prepare_vad_chunks(proxy_path, work_dir)
+    if not prepared.chunks:
+        return {
+            "language": "multilingual",
+            "original_srt": "",
+            "translated_srt": "",
+            "outcome": "empty",
+            "cues": [],
+            "singing_ranges": [list(item) for item in prepared.singing_ranges],
+            "speech_ranges": [list(item) for item in prepared.speech_ranges],
+            "asr_audio_mode": "firered_vad_demucs_3min",
+            "asr_chunk_count": 0,
+        }
+
+    source_paths = [Path(chunk["path"]) for chunk in prepared.chunks]
+    for index, source_path in enumerate(source_paths, 1):
+        _log(
+            f"  [人聲分離] Demucs 排程第 {index}/{len(source_paths)} 段"
+            f"（{source_path.name}）"
+        )
+    separated = prepare_demucs_audio_batch(
+        source_paths,
+        work_dir / "demucs-vad",
+    )
+
+    _log(
+        f"  [人聲分離] Demucs 已完成全部 {len(separated)} 段；"
+        "已完成 GPU offload"
+    )
+    _log("  [MOSS] 開始一次 MOSS ASR 階段")
+    raw_results: list[dict[str, Any]] = []
+    batch_size = asr_batch_size()
+    for start in range(0, len(separated), batch_size):
+        group = separated[start:start + batch_size]
+        _log(
+            f"  [MOSS] 已完成全部人聲分離，處理第 {start + 1}-"
+            f"{start + len(group)}/{len(separated)} 段"
+        )
+        raw_results.extend(
+            run_asr_audio_batch(
+                group,
+                work_dir / f"moss-vad-demucs-{start + 1:03d}",
+                moss_worker=moss_worker,
+            )
+        )
+    _release_moss_worker(moss_worker)
+
+    cues: list[dict[str, Any]] = []
+    languages: list[str] = []
+    for chunk, result in zip(prepared.chunks, raw_results, strict=True):
+        language = str(result.get("language") or "").strip()
+        if language and language not in languages:
+            languages.append(language)
+        for cue in result.get("cues") or []:
+            try:
+                start_text, end_text = str(cue["time"]).split("-->", 1)
+                compact_start = segment_cutter.parse_srt_time(start_text.strip())
+                compact_end = segment_cutter.parse_srt_time(end_text.strip())
+                original_start = map_compact_time(compact_start, chunk["mapping"])
+                original_end = map_compact_time(compact_end, chunk["mapping"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if original_end <= original_start:
+                continue
+            cues.append({
+                "id": len(cues) + 1,
+                "time": (
+                    f"{segment_cutter.format_srt_time(original_start)} --> "
+                    f"{segment_cutter.format_srt_time(original_end)}"
+                ),
+                "text": str(cue.get("text") or ""),
+            })
+    cues = merge_moss_cues(cues)
+    return {
+        "language": ",".join(languages) or "multilingual",
+        "original_srt": format_srt(cues) if cues else "",
+        "translated_srt": "",
+        "outcome": "transcribed" if cues else "empty",
+        "cues": cues,
+        "singing_ranges": [list(item) for item in prepared.singing_ranges],
+        "speech_ranges": [list(item) for item in prepared.speech_ranges],
+        "asr_audio_mode": "firered_vad_demucs_3min",
         "asr_chunk_count": len(prepared.chunks),
         "moss_cue_merge_version": MOSS_CUE_MERGE_VERSION,
     }
@@ -2565,7 +2862,7 @@ def _uses_external_moss() -> bool:
 
 
 class MossAsrWorker:
-    """一次管線執行常駐的 MOSS 子程序，避免每個片段或影片重載權重。"""
+    """延遲載入且可主動 offload 的 MOSS 常駐子程序。"""
 
     def __init__(self) -> None:
         moss_python = Path(os.getenv("MOSS_PYTHON", str(DEFAULT_MOSS_PYTHON)))
@@ -2573,12 +2870,23 @@ class MossAsrWorker:
             raise RuntimeError(
                 f"找不到 MOSS 環境：{moss_python}。請先執行 00_setup_or_update.bat。"
             )
+        self._moss_python = moss_python
+        self._process = None
+        self._closed = False
+        self._lock = Lock()
+        _log("  [MOSS 常駐] 已建立；等人聲分離完成後才載入權重")
+
+    def _ensure_started(self) -> None:
+        if self._closed:
+            raise RuntimeError("MOSS 常駐程序已關閉")
+        if self._process is not None and self._process.poll() is None:
+            return
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
         env["ENABLE_TRANSLATION"] = "0"
         env.setdefault("ASR_BACKEND", "moss")
         self._process = subprocess.Popen(
-            [str(moss_python), str(Path(__file__).resolve()), "--asr-worker"],
+            [str(self._moss_python), str(Path(__file__).resolve()), "--asr-worker"],
             cwd=str(ROOT),
             env=env,
             stdin=subprocess.PIPE,
@@ -2588,28 +2896,30 @@ class MossAsrWorker:
             encoding="utf-8",
             bufsize=1,
         )
-        self._closed = False
-        self._lock = Lock()
         _log("  [MOSS 常駐] 已啟動；後續 ASR 片段不會重載權重")
 
     def transcribe(self, audio_paths: list[Path]) -> list[dict[str, Any]]:
         from asr_vad_roformer import gpu_inference_lock
 
-        if self._closed or self._process.stdin is None or self._process.stdout is None:
+        if self._closed:
             raise RuntimeError("MOSS 常駐程序已關閉")
         request = {"audio": [str(Path(path).resolve()) for path in audio_paths]}
         # self._lock 保護同一常駐程序的 stdin/stdout；全域鎖保證多支影片、
         # 甚至意外建立多個 worker 時，仍只會有一筆 MOSS 推理在執行。
         with gpu_inference_lock("MOSS"), _MOSS_INFERENCE_LOCK, self._lock:
+            self._ensure_started()
+            process = self._process
+            if process is None or process.stdin is None or process.stdout is None:
+                raise RuntimeError("MOSS 常駐程序無法建立通訊管道")
             try:
-                self._process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
-                self._process.stdin.flush()
-                line = self._process.stdout.readline()
+                process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+                process.stdin.flush()
+                line = process.stdout.readline()
             except OSError as exc:
                 raise RuntimeError("MOSS 常駐程序通訊失敗") from exc
         if not line:
             raise RuntimeError(
-                f"MOSS 常駐程序提早結束，ExitCode={self._process.poll()}"
+                f"MOSS 常駐程序提早結束，ExitCode={process.poll()}"
             )
         try:
             reply = json.loads(line)
@@ -2622,19 +2932,50 @@ class MossAsrWorker:
             raise RuntimeError("MOSS 常駐程序回傳格式或數量不符。")
         return payload
 
+    def release(self) -> None:
+        """卸載 MOSS 權重但保留常駐程序，下一次辨識時再載入。"""
+        from asr_vad_roformer import gpu_inference_lock
+
+        if self._closed or self._process is None or self._process.poll() is not None:
+            return
+        with gpu_inference_lock("MOSS Offload"), _MOSS_INFERENCE_LOCK, self._lock:
+            process = self._process
+            if process.stdin is None or process.stdout is None:
+                raise RuntimeError("MOSS 常駐程序無法建立通訊管道")
+            try:
+                process.stdin.write('{"command":"release"}\n')
+                process.stdin.flush()
+                line = process.stdout.readline()
+            except OSError as exc:
+                raise RuntimeError("MOSS offload 通訊失敗") from exc
+        if not line:
+            raise RuntimeError(
+                f"MOSS offload 失敗，ExitCode={process.poll()}"
+            )
+        try:
+            reply = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"MOSS offload 回傳無效 JSON：{line[:160]}") from exc
+        if reply.get("error"):
+            raise RuntimeError(f"MOSS offload 失敗：{reply['error']}")
+        _log("  [GPU Offload] MOSS 權重已釋放，保留常駐程序")
+
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        process = self._process
+        if process is None:
+            return
         try:
-            if self._process.stdin is not None and self._process.poll() is None:
-                self._process.stdin.write('{"command":"shutdown"}\n')
-                self._process.stdin.flush()
-                self._process.stdin.close()
-            self._process.wait(timeout=10)
+            if process.stdin is not None and process.poll() is None:
+                process.stdin.write('{"command":"shutdown"}\n')
+                process.stdin.flush()
+                process.stdin.close()
+            process.wait(timeout=10)
         except (OSError, subprocess.TimeoutExpired):
-            self._process.kill()
-            self._process.wait(timeout=10)
+            process.kill()
+            process.wait(timeout=10)
 
 
 @contextmanager
@@ -2647,6 +2988,17 @@ def moss_asr_session() -> Iterator[MossAsrWorker | None]:
     try:
         yield worker
     finally:
+        worker.close()
+
+
+def _release_moss_worker(worker: MossAsrWorker | None) -> None:
+    """單支影片的 MOSS 完成後釋放權重，避免下一支影片搶 VRAM。"""
+    if worker is None:
+        return
+    try:
+        worker.release()
+    except RuntimeError as exc:
+        _log(f"  [!] MOSS offload 失敗，關閉常駐程序：{exc}")
         worker.close()
 
 
@@ -2672,19 +3024,41 @@ def run_moss_asr_worker() -> int:
 
     protocol_stdout = sys.stdout
     # transformers／ModelScope 的進度輸出不可混入協定 stdout，全部改送終端 stderr。
-    with redirect_stdout(sys.stderr):
-        backend = create_backend().load()
-        _log("[MOSS 常駐] 權重已載入，等待 ASR 工作")
+    backend = None
     for raw in sys.stdin:
         try:
             request = json.loads(raw)
             if request.get("command") == "shutdown":
                 return 0
+            if request.get("command") == "release":
+                with redirect_stdout(sys.stderr):
+                    if backend is not None:
+                        release = getattr(backend, "release_transient_memory", None)
+                        if callable(release):
+                            release()
+                        del backend
+                        backend = None
+                        try:
+                            import gc
+                            import torch
+
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                reply = {"released": True}
+                protocol_stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
+                protocol_stdout.flush()
+                continue
             audio = request.get("audio")
             if not isinstance(audio, list) or not audio:
                 raise ValueError("audio 必須是非空陣列")
             paths = [Path(item).resolve() for item in audio]
             with redirect_stdout(sys.stderr):
+                if backend is None:
+                    backend = create_backend().load()
+                    _log("[MOSS 常駐] 權重已載入，等待 ASR 工作")
                 results = _run_asr_batch_with_backend(paths, backend)
             reply: dict[str, Any] = {
                 "results": [_safe_asr_payload(item) for item in results]
@@ -2718,7 +3092,7 @@ def run_asr_audio_batch(
     work_dir: Path,
     moss_worker: MossAsrWorker | None = None,
 ) -> list[dict[str, Any]]:
-    """對已完成人聲分離的音檔做 ASR；讓 Demucs 與 MOSS 可用佇列重疊。"""
+    """對已完成人聲分離的音檔做 ASR；串流模式仍可使用佇列。"""
     from asr_backends import selected_asr_backend_name
 
     if not asr_audio:
@@ -2816,7 +3190,11 @@ def run_streamed_asr(
         proxy_path = work_dir / f"{video_stem}.proxy.mp4"
         _log("  [ASR 串流] 無法取得時長或已關閉，改用完整 240P 代理")
         download_proxy_low(video_url, proxy_path)
-        result = run_asr_only(proxy_path, work_dir)
+        result = run_asr_only(
+            proxy_path,
+            work_dir,
+            moss_worker=moss_worker,
+        )
         return result, probe_duration(proxy_path) or 0.0
 
     chunk_seconds = asr_stream_chunk_seconds()
@@ -2888,6 +3266,7 @@ def run_streamed_asr(
             "total_chunks": len(ranges),
             "completed_chunks": sorted(completed),
             "chunks": chunks,
+            "asr_audio_mode": _expected_vad_asr_mode(force_stream=True),
             "moss_cue_merge_version": MOSS_CUE_MERGE_VERSION,
         }
 
@@ -3018,6 +3397,7 @@ def run_streamed_asr(
         demucs_queue.put(None)
         demucs_worker.join()
         moss_queue_worker.join()
+    _release_moss_worker(moss_worker)
     if worker_errors:
         raise RuntimeError(f"ASR 佇列失敗：{worker_errors[0]}") from worker_errors[0]
     if len(completed) != len(ranges):
@@ -3196,6 +3576,7 @@ def run_parallel_delivery_phase(
     high_path = work_dir / f"{video_stem}.high.mp4"
     original_srt = asr.get("original_srt") or ""
     translated_srt = asr.get("translated_srt") or ""
+    actual_segment_durations: list[float] | None = None
 
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="translate") as translator, ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="enhance"
@@ -3234,6 +3615,9 @@ def run_parallel_delivery_phase(
             )
             if enhance_future is not None:
                 high_path, enhanced = enhance_future.result()
+            # 全片路徑沒有經過 concat；即使未啟用 Enhance，也要在發布前
+            # 以畫面時長檢查並修正音訊尾端與 stream start-time。
+            align_av_durations(high_path)
         else:
             download_workers = segment_download_workers()
             _log(
@@ -3441,6 +3825,29 @@ def run_parallel_delivery_phase(
                     f"{len(still_failed)} 個高畫質區段多次重試仍失敗："
                     f"{failed_text}；已完成區段會保留供下次續跑。"
                 ) from still_failed[0][4]
+            actual_segment_durations = []
+            for index, part in enumerate(parts):
+                requested_duration = (
+                    float(segments[index][1]) - float(segments[index][0])
+                )
+                measured_duration = (
+                    probe_stream_duration(part, "video")
+                    or probe_duration(part)
+                )
+                duration = (
+                    measured_duration
+                    if measured_duration is not None and measured_duration > 0
+                    else requested_duration
+                )
+                actual_segment_durations.append(duration)
+                if abs(duration - requested_duration) > AV_DURATION_TOLERANCE_SECONDS:
+                    _log(
+                        f"  [影格邊界] 第 {index + 1} 段："
+                        f"請求 {requested_duration:.6f}s → 實際畫面 {duration:.6f}s"
+                    )
+            asr["output_segment_durations"] = [
+                round(value, 6) for value in actual_segment_durations
+            ]
             if audio_crossfade_seconds > 0:
                 concat_videos_audio_crossfade(
                     parts,
@@ -3471,6 +3878,7 @@ def run_parallel_delivery_phase(
                     srt_text_to_entries(original_srt),
                     segments,
                     crossfade_seconds=0.0,
+                    output_durations=actual_segment_durations,
                 )
             )
         if translated_srt.strip():
@@ -3479,6 +3887,7 @@ def run_parallel_delivery_phase(
                     srt_text_to_entries(translated_srt),
                     segments,
                     crossfade_seconds=0.0,
+                    output_durations=actual_segment_durations,
                 )
             )
         _log("  [第二階段] 翻譯、切塊下載與 Enhance 已全部完成；字幕已 retime")
@@ -3548,6 +3957,7 @@ def process_full_video_from_grid(
     keep_proxy: bool = False,
     *,
     max_height: int | None = None,
+    video_high_quality_max_seconds: float | None = None,
     enable_enhance: bool | None = None,
     enable_asr: bool | None = None,
     export_subtitles: bool | None = None,
@@ -3576,6 +3986,8 @@ def process_full_video_from_grid(
     高畫質 →（可）enhance → 發布。
 
     max_height：高畫質上限（預設讀 HIGH_VIDEO_HEIGHT，否則 720）
+    video_high_quality_max_seconds：Video 層不超過此秒數時改用來源最高畫質，
+        預設 240 秒；其他 Pipeline 不受影響。
     enable_enhance：是否允許音訊增強（預設讀 AUDIO_AUTO_ENHANCE）
     enable_dialogue_trim：是否依停頓門檻移除長停頓並分段下載
     enable_selective_download：精選下載——先劇情+選擇性翻譯，再只下載保留對白
@@ -3648,7 +4060,17 @@ def process_full_video_from_grid(
     if enable_edge_padding is None:
         enable_edge_padding = edge_padding_enabled()
     edge_pad = resolve_edge_padding_seconds(enable_edge_padding)
-    # 下載高度寫入 env，供 _high_format_opts 使用
+    if video_high_quality_max_seconds is None:
+        video_high_quality_max_seconds = (
+            DEFAULT_VIDEO_HIGH_QUALITY_MAX_SECONDS
+            if pipeline_stage == "video"
+            else None
+        )
+    elif video_high_quality_max_seconds <= 0:
+        raise ValueError("video_high_quality_max_seconds 必須大於 0")
+
+    # 下載高度寫入 env，供 _high_format_opts 使用；Video 短片在取得 240P
+    # 實際時長後會再切換為來源最高畫質。
     os.environ["HIGH_VIDEO_HEIGHT"] = str(max_height)
     os.environ["HIGH_VIDEO_UNLIMITED"] = "1" if unlimited_high_quality else "0"
     os.environ["ENABLE_TRANSLATION"] = "1" if enable_translation else "0"
@@ -3741,7 +4163,8 @@ def process_full_video_from_grid(
     _log(f"URL：{video_url}")
     _log("=" * 60)
 
-    # 第一階段：每下載完 3 分鐘 240P 區段，就立即排入 Demucs + ASR。
+    # 第一階段預設完整下載 240P，再整片 VAD、合成三分鐘音檔、完成所有
+    # Demucs 後才進入 MOSS；只有明確開啟 asr-stream 才按 180 秒佇列處理。
     # OpenRouter 會留到所有 ASR 就緒後的第二階段，避免阻塞下載佇列。
     with _stage("01_stream_proxy_and_asr"):
         if embedded_asr is not None:
@@ -3761,7 +4184,33 @@ def process_full_video_from_grid(
         ):
             try:
                 asr = _read_json_dict(asr_source_path)
-                if asr.get("moss_cue_merge_version") != MOSS_CUE_MERGE_VERSION:
+                expected_audio_mode = _expected_vad_asr_mode(
+                    force_stream=analysis_limit_seconds is not None,
+                )
+                audio_mode_changed = (
+                    expected_audio_mode is not None
+                    and asr.get("asr_audio_mode") != expected_audio_mode
+                )
+                if audio_mode_changed:
+                    _log(
+                        "  [ASR] 人聲分離流程設定已變更，重新執行整片 VAD／"
+                        f"{expected_audio_mode.removeprefix('firered_vad_').removesuffix('_3min')}"
+                    )
+                    asr, duration = run_streamed_asr(
+                        video_url,
+                        work_dir,
+                        video_stem,
+                        moss_worker=moss_worker,
+                        max_duration=analysis_limit_seconds,
+                        checkpoint_path=asr_source_path,
+                        state_path=state_path,
+                    )
+                    asr["source_duration"] = duration
+                    _atomic_write_json(
+                        asr_source_path,
+                        _source_asr_payload(asr, duration),
+                    )
+                elif asr.get("moss_cue_merge_version") != MOSS_CUE_MERGE_VERSION:
                     previous_merge = asr.get("moss_cue_merge_version")
                     if previous_merge is not None:
                         # v1 已把短句併入其他字幕，無法由其輸出還原；必須從
@@ -3845,6 +4294,28 @@ def process_full_video_from_grid(
                 )
             except Exception:
                 pass
+
+    short_video_high_quality = (
+        pipeline_stage == "video"
+        and video_high_quality_max_seconds is not None
+        and duration > 0
+        and duration <= float(video_high_quality_max_seconds)
+    )
+    use_unlimited_high_quality = unlimited_high_quality or short_video_high_quality
+    os.environ["HIGH_VIDEO_UNLIMITED"] = (
+        "1" if use_unlimited_high_quality else "0"
+    )
+    if pipeline_stage == "video":
+        threshold_text = (
+            f"≤{float(video_high_quality_max_seconds):g}s 使用來源最高畫質；"
+            if video_high_quality_max_seconds is not None
+            else ""
+        )
+        _log(
+            f"  [Video 畫質] 來源 {duration:.1f}s；"
+            f"{threshold_text}"
+            f"本片={'來源最高' if short_video_high_quality else f'{max_height}P'}"
+        )
 
     original_srt = asr.get("original_srt") or ""
     translated_srt = asr.get("translated_srt") or ""
@@ -4052,7 +4523,7 @@ def process_full_video_from_grid(
             f"trim={'on' if enable_dialogue_trim else 'off'}；"
             f"selective={'on' if enable_selective_download else 'off'}；"
             f"enhance={'on' if enable_enhance else 'off'}；"
-            f"畫質={'來源最高' if unlimited_high_quality else f'{max_height}P 上限'}"
+            f"畫質={'來源最高' if use_unlimited_high_quality else f'{max_height}P 上限'}"
         )
 
         any_enhanced = False
@@ -4169,6 +4640,17 @@ def process_full_video_from_grid(
                     web_meta["trimmed_segments"] = [
                         [round(s, 3), round(e, 3)] for s, e in segments
                     ]
+                    output_segment_durations = asr.get(
+                        "output_segment_durations"
+                    )
+                    if (
+                        isinstance(output_segment_durations, list)
+                        and len(output_segment_durations) == len(segments)
+                    ):
+                        web_meta["trimmed_segment_durations"] = [
+                            round(float(value), 6)
+                            for value in output_segment_durations
+                        ]
                     web_meta["net_dialogue_seconds"] = round(net_dur, 3)
                 base_comment = ""
                 if any_enhanced:
